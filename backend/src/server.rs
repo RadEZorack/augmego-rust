@@ -1,11 +1,12 @@
 use crate::net::{is_disconnect, read_message, write_message};
 use crate::persistence::PersistenceService;
 use anyhow::{Context, Result, anyhow};
+use futures_util::{SinkExt, StreamExt};
 use shared_content::block_definitions;
 use shared_math::{CHUNK_HEIGHT, ChunkPos, WorldPos};
 use shared_protocol::{
-    BlockActionResult, ChunkUnload, ClientHello, ClientMessage, InventorySnapshot, InventoryStack,
-    LoginResponse, PROTOCOL_VERSION, PlayerStateSnapshot, ServerHello, ServerMessage,
+    BlockActionResult, ChunkUnload, ClientHello, ClientMessage, InventorySnapshot, InventoryStack, LoginResponse,
+    PROTOCOL_VERSION, PlayerStateSnapshot, ServerHello, ServerMessage, decode, encode,
     SubscribeChunks,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
@@ -16,10 +17,12 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::yield_now;
+use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind_addr: String,
+    pub ws_bind_addr: String,
     pub world_seed: u64,
     pub save_path: PathBuf,
     pub view_radius: u8,
@@ -29,6 +32,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:4000".to_string(),
+            ws_bind_addr: "127.0.0.1:4001".to_string(),
             world_seed: 0xA66D_E601,
             save_path: PathBuf::from("world"),
             view_radius: 12,
@@ -216,6 +220,48 @@ impl ChunkStreamingService {
 
         Ok(())
     }
+
+    pub async fn update_subscription_ws(
+        &self,
+        socket: &mut WebSocketStream<TcpStream>,
+        player_service: &PlayerService,
+        player_id: u64,
+        request: Option<SubscribeChunks>,
+    ) -> Result<()> {
+        let request = request.unwrap_or(SubscribeChunks {
+            center: ChunkPos { x: 0, z: 0 },
+            radius: self.default_radius,
+        });
+
+        let desired = desired_chunk_set(request.center, request.radius);
+        let previous = player_service.swap_subscriptions(player_id, desired.clone()).await;
+        let removals = previous.difference(&desired).copied().collect::<Vec<_>>();
+        let additions = ordered_chunk_positions(request.center, request.radius)
+            .into_iter()
+            .filter(|position| !previous.contains(position))
+            .collect::<Vec<_>>();
+
+        if !removals.is_empty() {
+            write_ws_message(
+                socket,
+                &ServerMessage::ChunkUnload(ChunkUnload {
+                    positions: removals,
+                }),
+            )
+            .await?;
+        }
+
+        for (index, position) in additions.into_iter().enumerate() {
+            let chunk = self.world.chunk(position).await?;
+            write_ws_message(socket, &ServerMessage::ChunkData(chunk)).await?;
+
+            if index > 0 && index % 8 == 0 {
+                yield_now().await;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 fn ordered_chunk_positions(center: ChunkPos, radius: u8) -> Vec<ChunkPos> {
@@ -264,9 +310,28 @@ impl ConnectionService {
     }
 }
 
+#[derive(Clone)]
+pub struct WebSocketConnectionService {
+    listener: Arc<TcpListener>,
+}
+
+impl WebSocketConnectionService {
+    pub async fn bind(addr: &str) -> Result<Self> {
+        let listener = TcpListener::bind(addr).await.context("bind websocket server socket")?;
+        Ok(Self {
+            listener: Arc::new(listener),
+        })
+    }
+
+    pub async fn accept(&self) -> Result<(TcpStream, SocketAddr)> {
+        self.listener.accept().await.context("accept websocket connection")
+    }
+}
+
 pub struct VoxelServer {
     config: ServerConfig,
     connection_service: ConnectionService,
+    websocket_connection_service: WebSocketConnectionService,
     chunk_streaming: ChunkStreamingService,
     player_service: PlayerService,
     world_service: WorldService,
@@ -278,6 +343,7 @@ impl VoxelServer {
         let world_service = WorldService::new(config.world_seed, persistence);
         let chunk_streaming = ChunkStreamingService::new(world_service.clone(), config.view_radius);
         let connection_service = ConnectionService::bind(&config.bind_addr).await?;
+        let websocket_connection_service = WebSocketConnectionService::bind(&config.ws_bind_addr).await?;
         let player_service = PlayerService::new();
 
         tracing::info!(blocks = block_definitions().len(), "loaded content definitions");
@@ -285,6 +351,7 @@ impl VoxelServer {
         Ok(Self {
             config,
             connection_service,
+            websocket_connection_service,
             chunk_streaming,
             player_service,
             world_service,
@@ -292,7 +359,18 @@ impl VoxelServer {
     }
 
     pub async fn run(self) -> Result<()> {
-        tracing::info!(addr = %self.config.bind_addr, "voxel backend listening");
+        tracing::info!(tcp_addr = %self.config.bind_addr, ws_addr = %self.config.ws_bind_addr, "voxel backend listening");
+        let websocket_server = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = websocket_server.run_websocket_loop().await {
+                tracing::error!(?error, "websocket accept loop failed");
+            }
+        });
+
+        self.run_tcp_loop().await
+    }
+
+    async fn run_tcp_loop(self) -> Result<()> {
         loop {
             let (stream, address) = self.connection_service.accept().await?;
             let server = self.clone();
@@ -300,6 +378,25 @@ impl VoxelServer {
                 if let Err(error) = server.handle_client(stream).await {
                     if !is_disconnect(&error) {
                         tracing::error!(?error, %address, "client session ended with error");
+                    }
+                }
+            });
+        }
+    }
+
+    async fn run_websocket_loop(self) -> Result<()> {
+        loop {
+            let (stream, address) = self.websocket_connection_service.accept().await?;
+            let server = self.clone();
+            tokio::spawn(async move {
+                match accept_async(stream).await {
+                    Ok(socket) => {
+                        if let Err(error) = server.handle_websocket_client(socket).await {
+                            tracing::error!(?error, %address, "websocket client session ended with error");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(?error, %address, "failed websocket handshake");
                     }
                 }
             });
@@ -386,6 +483,86 @@ impl VoxelServer {
         Ok(())
     }
 
+    async fn handle_websocket_client(&self, mut socket: WebSocketStream<TcpStream>) -> Result<()> {
+        let hello = read_ws_message::<ClientMessage>(&mut socket).await?;
+        match hello {
+            ClientMessage::ClientHello(ClientHello { protocol_version, .. }) if protocol_version == PROTOCOL_VERSION => {}
+            _ => return Err(anyhow!("invalid or unsupported websocket client hello")),
+        }
+
+        write_ws_message(
+            &mut socket,
+            &ServerMessage::ServerHello(ServerHello {
+                protocol_version: PROTOCOL_VERSION,
+                motd: "Augmego voxel frontier".to_string(),
+                world_seed: self.config.world_seed,
+            }),
+        )
+        .await?;
+
+        let login = match read_ws_message(&mut socket).await? {
+            ClientMessage::LoginRequest(login) => login,
+            _ => return Err(anyhow!("expected websocket login request")),
+        };
+
+        let spawn_position = self.world_service.safe_spawn_position();
+        let player = self.player_service.login(login.name, spawn_position).await;
+        tracing::info!(player_id = player.id, name = %player.name, "websocket player joined");
+
+        write_ws_message(
+            &mut socket,
+            &ServerMessage::LoginResponse(LoginResponse {
+                accepted: true,
+                player_id: player.id,
+                spawn_position,
+                message: format!("Welcome, {}", player.name),
+            }),
+        )
+        .await?;
+
+        write_ws_message(
+            &mut socket,
+            &ServerMessage::InventorySnapshot(InventorySnapshot {
+                slots: vec![
+                    InventoryStack { block: BlockId::Grass, count: 64 },
+                    InventoryStack { block: BlockId::Stone, count: 64 },
+                    InventoryStack { block: BlockId::Planks, count: 32 },
+                ],
+            }),
+        )
+        .await?;
+
+        let subscribe = match read_ws_message::<ClientMessage>(&mut socket).await? {
+            ClientMessage::SubscribeChunks(request) => Some(request),
+            other => {
+                self.handle_websocket_message(player.id, &mut socket, other).await?;
+                None
+            }
+        };
+
+        self.chunk_streaming
+            .update_subscription_ws(&mut socket, &self.player_service, player.id, subscribe)
+            .await?;
+
+        write_ws_message(
+            &mut socket,
+            &ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
+                player_id: player.id,
+                tick: 0,
+                position: player.position,
+                velocity: player.velocity,
+            }),
+        )
+        .await?;
+
+        while let Ok(message) = read_ws_message::<ClientMessage>(&mut socket).await {
+            self.handle_websocket_message(player.id, &mut socket, message).await?;
+        }
+
+        self.player_service.remove(player.id).await;
+        Ok(())
+    }
+
     async fn handle_message(&self, player_id: u64, stream: &mut TcpStream, message: ClientMessage) -> Result<()> {
         match message {
             ClientMessage::SubscribeChunks(request) => {
@@ -453,6 +630,79 @@ impl VoxelServer {
 
         Ok(())
     }
+
+    async fn handle_websocket_message(
+        &self,
+        player_id: u64,
+        socket: &mut WebSocketStream<TcpStream>,
+        message: ClientMessage,
+    ) -> Result<()> {
+        match message {
+            ClientMessage::SubscribeChunks(request) => {
+                self.chunk_streaming
+                    .update_subscription_ws(socket, &self.player_service, player_id, Some(request))
+                    .await?;
+            }
+            ClientMessage::PlayerInputTick(input) => {
+                if let Some(player) = self.player_service.update(player_id, input.movement).await {
+                    write_ws_message(
+                        socket,
+                        &ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
+                            player_id,
+                            tick: input.tick,
+                            position: player.position,
+                            velocity: player.velocity,
+                        }),
+                    )
+                    .await?;
+                }
+            }
+            ClientMessage::PlaceBlockRequest(request) => {
+                let Some(player) = self.player_service.player(player_id).await else {
+                    return Ok(());
+                };
+
+                if !within_reach(player.position, request.position) {
+                    write_ws_message(
+                        socket,
+                        &ServerMessage::BlockActionResult(BlockActionResult {
+                            accepted: false,
+                            reason: "target outside placement reach".to_string(),
+                        }),
+                    )
+                    .await?;
+                } else {
+                    let result = self.world_service.apply_block_edit(request.position, request.block).await?;
+                    write_ws_message(socket, &ServerMessage::BlockActionResult(result)).await?;
+                }
+            }
+            ClientMessage::BreakBlockRequest(request) => {
+                let Some(player) = self.player_service.player(player_id).await else {
+                    return Ok(());
+                };
+
+                if !within_reach(player.position, request.position) {
+                    write_ws_message(
+                        socket,
+                        &ServerMessage::BlockActionResult(BlockActionResult {
+                            accepted: false,
+                            reason: "target outside break reach".to_string(),
+                        }),
+                    )
+                    .await?;
+                } else {
+                    let result = self.world_service.apply_block_edit(request.position, BlockId::Air).await?;
+                    write_ws_message(socket, &ServerMessage::BlockActionResult(result)).await?;
+                }
+            }
+            ClientMessage::ChatMessage(message) => {
+                write_ws_message(socket, &ServerMessage::ChatMessage(message)).await?;
+            }
+            ClientMessage::LoginRequest(_) | ClientMessage::ClientHello(_) => {}
+        }
+
+        Ok(())
+    }
 }
 
 impl Clone for VoxelServer {
@@ -460,6 +710,7 @@ impl Clone for VoxelServer {
         Self {
             config: self.config.clone(),
             connection_service: self.connection_service.clone(),
+            websocket_connection_service: self.websocket_connection_service.clone(),
             chunk_streaming: self.chunk_streaming.clone(),
             player_service: self.player_service.clone(),
             world_service: self.world_service.clone(),
@@ -474,6 +725,31 @@ fn within_reach(player_position: [f32; 3], target: WorldPos) -> bool {
     let dz = target.z as f32 + 0.5 - origin[2];
     let distance_squared = dx * dx + dy * dy + dz * dz;
     distance_squared <= 8.0_f32.powi(2)
+}
+
+async fn read_ws_message<T: for<'de> serde::Deserialize<'de>>(
+    socket: &mut WebSocketStream<TcpStream>,
+) -> Result<T> {
+    while let Some(message) = socket.next().await {
+        match message.context("read websocket frame")? {
+            Message::Binary(bytes) => return Ok(decode(&bytes)?),
+            Message::Close(_) => anyhow::bail!("websocket closed"),
+            Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_) => continue,
+        }
+    }
+
+    anyhow::bail!("websocket closed")
+}
+
+async fn write_ws_message<T: serde::Serialize>(
+    socket: &mut WebSocketStream<TcpStream>,
+    message: &T,
+) -> Result<()> {
+    let bytes = encode(message)?;
+    socket
+        .send(Message::Binary(bytes))
+        .await
+        .context("write websocket frame")
 }
 
 #[cfg(test)]

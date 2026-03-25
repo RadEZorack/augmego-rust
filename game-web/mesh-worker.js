@@ -5,14 +5,22 @@ const CHUNK_WORLD_RADIUS = CHUNK_WIDTH * 0.5;
 
 self.onmessage = (event) => {
   const data = event.data;
-  if (!data || data.kind !== "build") {
+  if (!data) {
     return;
   }
 
-  const { x, z } = data;
+  const { x, z, kind } = data;
 
   try {
-    const mesh = buildChunkMesh(x, z, Array.isArray(data.edits) ? data.edits : []);
+    let mesh;
+    if (kind === "build") {
+      mesh = buildChunkMesh(x, z, Array.isArray(data.edits) ? data.edits : []);
+    } else if (kind === "mesh_chunk") {
+      mesh = buildChunkMeshFromVoxels(x, z, new Uint16Array(data.voxels));
+    } else {
+      return;
+    }
+
     self.postMessage(
       {
         kind: "mesh",
@@ -38,6 +46,13 @@ self.onmessage = (event) => {
 function buildChunkMesh(chunkX, chunkZ, edits) {
   const { voxels, heights } = generateChunk(chunkX, chunkZ);
   applyEdits(voxels, heights, edits);
+  return buildChunkMeshFromVoxels(chunkX, chunkZ, voxels);
+}
+
+function buildChunkMeshFromVoxels(chunkX, chunkZ, voxelsInput) {
+  const voxels = voxelsInput instanceof Uint16Array ? voxelsInput : new Uint16Array(voxelsInput);
+  const heights = new Uint16Array(CHUNK_WIDTH * CHUNK_DEPTH);
+  recomputeHeights(voxels, heights);
   const vertices = [];
   const indices = [];
   const originX = chunkX * CHUNK_WIDTH;

@@ -3,6 +3,10 @@
 use anyhow::Result;
 use glam::{Mat4, Vec3};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
+use shared_protocol::{
+    BreakBlockRequest, ClientHello, ClientMessage, InventorySnapshot, LoginRequest, PROTOCOL_VERSION,
+    PlaceBlockRequest, PlayerInputTick, ServerMessage, SubscribeChunks, decode, encode,
+};
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver};
@@ -12,7 +16,10 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_time::Instant;
-use web_sys::{Document, Element, HtmlCanvasElement, MessageEvent, Worker};
+use web_sys::{
+    BinaryType, CloseEvent, Document, Element, ErrorEvent, Event as WebEvent, HtmlCanvasElement,
+    MessageEvent, WebSocket, Worker,
+};
 use wgpu_lite::{Mesh, Renderer, Vertex};
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, WindowEvent};
@@ -22,6 +29,7 @@ use winit::platform::web::WindowExtWebSys;
 use winit::window::WindowBuilder;
 
 const WEB_RADIUS: i32 = 6;
+#[allow(dead_code)]
 const INITIAL_WEB_RADIUS: i32 = 1;
 const CHUNK_WORLD_RADIUS: f32 = (CHUNK_WIDTH as f32) * 0.5;
 const DRAW_DISTANCE_CHUNKS: f32 = 14.0;
@@ -70,7 +78,17 @@ async fn run() -> Result<()> {
 
     let renderer = Renderer::new(window).await?;
     let (mesh_result_rx, workers, worker_onmessage) = start_mesh_worker_pool(MESH_WORKER_COUNT)?;
-    let mut app = WebApp::new(renderer.size(), canvas, workers, worker_onmessage, mesh_result_rx);
+    let (network_rx, websocket, websocket_handlers) = start_websocket_client()?;
+    let mut app = WebApp::new(
+        renderer.size(),
+        canvas,
+        workers,
+        worker_onmessage,
+        mesh_result_rx,
+        network_rx,
+        websocket,
+        websocket_handlers,
+    );
     let mut renderer = renderer;
     let mut chunk_meshes = HashMap::new();
 
@@ -132,6 +150,7 @@ async fn run() -> Result<()> {
 struct WebApp {
     canvas: HtmlCanvasElement,
     camera: Camera,
+    authoritative_chunks: HashMap<ChunkPos, ChunkData>,
     collision_voxels: HashMap<ChunkPos, Vec<u16>>,
     pressed: HashSet<KeyCode>,
     last_tick: Instant,
@@ -149,6 +168,12 @@ struct WebApp {
     hotbar_slots: Vec<Element>,
     hotbar_blocks: Vec<BlockId>,
     selected_hotbar: usize,
+    tick_counter: u64,
+    transport_open: bool,
+    logged_in: bool,
+    network_rx: Receiver<NetworkEvent>,
+    websocket: WebSocket,
+    _websocket_bindings: WebSocketBindings,
     mesh_result_rx: Receiver<MeshBuildResult>,
     workers: Vec<Worker>,
     next_worker_index: usize,
@@ -162,11 +187,12 @@ impl WebApp {
         workers: Vec<Worker>,
         worker_onmessages: Vec<Closure<dyn FnMut(MessageEvent)>>,
         mesh_result_rx: Receiver<MeshBuildResult>,
+        network_rx: Receiver<NetworkEvent>,
+        websocket: WebSocket,
+        websocket_bindings: WebSocketBindings,
     ) -> Self {
-        let terrain = TerrainGenerator::new(0xA66D_E601);
         let mut camera = Camera::default();
-        camera.position = find_safe_spawn_position(&terrain);
-        camera.on_ground = true;
+        camera.position = Vec3::new(0.5, PLAYER_EYE_HEIGHT + 96.0, 0.5);
         let link_panel = LinkPanel::near_spawn(camera.position);
         let hotbar_blocks = vec![
             BlockId::Grass,
@@ -178,13 +204,13 @@ impl WebApp {
         let hotbar_slots = create_hotbar(&hotbar_blocks);
         update_hotbar_ui(&hotbar_slots, &hotbar_blocks, 0);
         let current_chunk = chunk_from_world_position(camera.position);
-        let desired_chunks = desired_chunk_set(current_chunk, WEB_RADIUS);
-        let pending_generation =
-            prioritize_chunks(desired_chunks.iter().copied().collect(), current_chunk, camera.position, camera.forward());
+        let desired_chunks = HashSet::new();
+        let pending_generation = VecDeque::new();
 
         Self {
             canvas,
             camera,
+            authoritative_chunks: HashMap::new(),
             collision_voxels: HashMap::new(),
             pressed: HashSet::new(),
             last_tick: Instant::now(),
@@ -202,6 +228,12 @@ impl WebApp {
             hotbar_slots,
             hotbar_blocks,
             selected_hotbar: 0,
+            tick_counter: 0,
+            transport_open: false,
+            logged_in: false,
+            network_rx,
+            websocket,
+            _websocket_bindings: websocket_bindings,
             mesh_result_rx,
             workers,
             next_worker_index: 0,
@@ -277,6 +309,10 @@ impl WebApp {
             return;
         }
 
+        if !self.logged_in {
+            return;
+        }
+
         let Some(target) = self.current_interaction_target() else {
             return;
         };
@@ -309,8 +345,110 @@ impl WebApp {
         }
     }
 
+    fn drain_network(&mut self) {
+        while let Ok(event) = self.network_rx.try_recv() {
+            match event {
+                NetworkEvent::Opened => {
+                    self.transport_open = true;
+                    self.send_client_message(&ClientMessage::ClientHello(ClientHello {
+                        protocol_version: PROTOCOL_VERSION,
+                        client_name: "game-web".to_string(),
+                    }));
+                }
+                NetworkEvent::Server(message) => match message {
+                    ServerMessage::ServerHello(_) => {
+                        self.send_client_message(&ClientMessage::LoginRequest(LoginRequest {
+                            name: "Web Player".to_string(),
+                        }));
+                    }
+                    ServerMessage::LoginResponse(response) => {
+                        if response.accepted {
+                            self.logged_in = true;
+                            self.camera.position = Vec3::new(
+                                response.spawn_position.x as f32 + 0.5,
+                                response.spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
+                                response.spawn_position.z as f32 + 0.5,
+                            );
+                            self.camera.vertical_velocity = 0.0;
+                            self.camera.on_ground = false;
+                            self.spawn_settled = false;
+                            self.current_chunk = chunk_from_world_position(self.camera.position);
+                            self.desired_chunks = desired_chunk_set(self.current_chunk, WEB_RADIUS);
+                            self.send_chunk_subscription(self.current_chunk);
+                            self.link_panel = LinkPanel::near_spawn(self.camera.position);
+                        }
+                    }
+                    ServerMessage::ChunkData(chunk) => {
+                        let position = chunk.position;
+                        self.authoritative_chunks.insert(position, chunk);
+                        if self.desired_chunks.contains(&position) {
+                            self.schedule_chunk_rebuild(position);
+                        }
+                    }
+                    ServerMessage::ChunkUnload(unload) => {
+                        for position in unload.positions {
+                            self.authoritative_chunks.remove(&position);
+                            self.collision_voxels.remove(&position);
+                            self.chunk_edits.remove(&position);
+                            self.pending_generation.retain(|pending| *pending != position);
+                            self.inflight_generation.remove(&position);
+                            self.dirty_generation.remove(&position);
+                        }
+                    }
+                    ServerMessage::InventorySnapshot(InventorySnapshot { slots }) => {
+                        self.hotbar_blocks = slots.into_iter().map(|slot| slot.block).collect();
+                        if self.hotbar_blocks.is_empty() {
+                            self.hotbar_blocks = vec![BlockId::Grass, BlockId::Stone, BlockId::Planks];
+                        }
+                        if self.selected_hotbar >= self.hotbar_blocks.len() {
+                            self.selected_hotbar = self.hotbar_blocks.len().saturating_sub(1);
+                        }
+                        update_hotbar_ui(&self.hotbar_slots, &self.hotbar_blocks, self.selected_hotbar);
+                    }
+                    ServerMessage::PlayerStateSnapshot(_) => {}
+                    ServerMessage::BlockActionResult(result) => {
+                        if !result.accepted {
+                            web_sys::console::warn_1(&JsValue::from_str(&result.reason));
+                        }
+                    }
+                    ServerMessage::ChunkDelta(_) | ServerMessage::ChatMessage(_) => {}
+                },
+                NetworkEvent::Disconnected(reason) => {
+                    self.transport_open = false;
+                    self.logged_in = false;
+                    web_sys::console::error_1(&JsValue::from_str(&format!("multiplayer disconnected: {reason}")));
+                }
+            }
+        }
+    }
+
+    fn send_client_message(&self, message: &ClientMessage) {
+        if !self.transport_open {
+            return;
+        }
+        match encode(message) {
+            Ok(bytes) => {
+                let _ = self.websocket.send_with_u8_array(&bytes);
+            }
+            Err(error) => {
+                web_sys::console::error_1(&JsValue::from_str(&format!("encode client message: {error}")));
+            }
+        }
+    }
+
+    fn send_chunk_subscription(&self, center: ChunkPos) {
+        if !self.logged_in {
+            return;
+        }
+        self.send_client_message(&ClientMessage::SubscribeChunks(SubscribeChunks {
+            center,
+            radius: WEB_RADIUS as u8,
+        }));
+    }
+
     fn tick(&mut self) {
         self.mouse_captured = pointer_is_locked(&self.canvas);
+        self.drain_network();
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
@@ -337,6 +475,15 @@ impl WebApp {
 
         self.movement_active = movement != Vec3::ZERO;
         self.update_camera_physics(dt, movement, jump, sprint);
+        if !self.logged_in {
+            return;
+        }
+        self.tick_counter = self.tick_counter.wrapping_add(1);
+        self.send_client_message(&ClientMessage::PlayerInputTick(PlayerInputTick {
+            tick: self.tick_counter,
+            movement: [movement.x, 0.0, movement.z],
+            jump,
+        }));
     }
 
     fn camera_matrix(&self) -> Mat4 {
@@ -495,9 +642,11 @@ impl WebApp {
                 continue;
             }
 
+            let Some(chunk) = self.authoritative_chunks.get(&position).cloned() else {
+                continue;
+            };
             let worker_index = self.next_worker_index % self.workers.len();
-            let edits = self.chunk_edits.get(&position);
-            dispatch_mesh_job(&self.workers[worker_index], position, edits);
+            dispatch_chunk_mesh_job(&self.workers[worker_index], &chunk);
             self.next_worker_index = (self.next_worker_index + 1) % self.workers.len();
             self.inflight_generation.insert(position);
         }
@@ -523,7 +672,10 @@ impl WebApp {
 
         self.current_chunk = next_chunk;
         self.desired_chunks = desired_chunk_set(self.current_chunk, WEB_RADIUS);
+        self.send_chunk_subscription(self.current_chunk);
         chunk_meshes.retain(|position, _| self.desired_chunks.contains(position));
+        self.authoritative_chunks
+            .retain(|position, _| self.desired_chunks.contains(position));
         self.collision_voxels
             .retain(|position, _| self.desired_chunks.contains(position));
         self.chunk_edits
@@ -536,18 +688,7 @@ impl WebApp {
             .retain(|position| self.desired_chunks.contains(position));
     }
 
-    fn reprioritize_pending_generation(&mut self, chunk_meshes: &HashMap<ChunkPos, Mesh>) {
-        for position in &self.desired_chunks {
-            if chunk_meshes.contains_key(position)
-                || self.inflight_generation.contains(position)
-                || self.pending_generation.contains(position)
-            {
-                continue;
-            }
-
-            self.pending_generation.push_back(*position);
-        }
-
+    fn reprioritize_pending_generation(&mut self, _chunk_meshes: &HashMap<ChunkPos, Mesh>) {
         if self.pending_generation.len() <= 1 {
             return;
         }
@@ -795,11 +936,20 @@ impl WebApp {
             return;
         };
 
-        self.chunk_edits
-            .entry(chunk_pos)
-            .or_default()
-            .insert((local.x, local.y, local.z), block);
+        if let Some(chunk) = self.authoritative_chunks.get_mut(&chunk_pos) {
+            chunk.set_voxel(local, shared_world::Voxel { block });
+        }
         self.schedule_chunk_rebuild(chunk_pos);
+
+        match block {
+            BlockId::Air => self.send_client_message(&ClientMessage::BreakBlockRequest(BreakBlockRequest {
+                position,
+            })),
+            _ => self.send_client_message(&ClientMessage::PlaceBlockRequest(PlaceBlockRequest {
+                position,
+                block,
+            })),
+        }
     }
 
     fn schedule_chunk_rebuild(&mut self, position: ChunkPos) {
@@ -976,6 +1126,7 @@ fn open_url(url: &str) {
     }
 }
 
+#[allow(dead_code)]
 fn find_safe_spawn_position(terrain: &TerrainGenerator) -> Vec3 {
     let mut chunks = HashMap::<ChunkPos, ChunkData>::new();
     let spawn_offsets = [
@@ -1017,6 +1168,7 @@ fn find_safe_spawn_position(terrain: &TerrainGenerator) -> Vec3 {
     Vec3::new(0.5, terrain.surface_height(0, 0) as f32 + 3.0 + PLAYER_EYE_HEIGHT, 0.5)
 }
 
+#[allow(dead_code)]
 fn generated_player_collides(
     terrain: &TerrainGenerator,
     chunks: &mut HashMap<ChunkPos, ChunkData>,
@@ -1053,6 +1205,7 @@ fn generated_player_collides(
     false
 }
 
+#[allow(dead_code)]
 fn generated_world_block_is_solid(
     terrain: &TerrainGenerator,
     chunks: &mut HashMap<ChunkPos, ChunkData>,
@@ -1168,6 +1321,61 @@ fn start_mesh_worker_pool(
     Ok((rx, workers, onmessages))
 }
 
+fn start_websocket_client() -> Result<(Receiver<NetworkEvent>, WebSocket, WebSocketBindings)> {
+    let url = websocket_url()?;
+    let websocket = WebSocket::new(&url).map_err(|error| anyhow::anyhow!("create websocket: {error:?}"))?;
+    websocket.set_binary_type(BinaryType::Arraybuffer);
+
+    let (tx, rx) = mpsc::channel::<NetworkEvent>();
+
+    let open_tx = tx.clone();
+    let onopen = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let _ = open_tx.send(NetworkEvent::Opened);
+    }) as Box<dyn FnMut(WebEvent)>);
+    websocket.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+
+    let message_tx = tx.clone();
+    let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let bytes = js_sys::Uint8Array::new(&event.data()).to_vec();
+        match decode::<ServerMessage>(&bytes) {
+            Ok(message) => {
+                let _ = message_tx.send(NetworkEvent::Server(message));
+            }
+            Err(error) => {
+                let _ = message_tx.send(NetworkEvent::Disconnected(format!("decode websocket message: {error}")));
+            }
+        }
+    }) as Box<dyn FnMut(MessageEvent)>);
+    websocket.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+
+    let error_tx = tx.clone();
+    let onerror = Closure::wrap(Box::new(move |_event: ErrorEvent| {
+        let _ = error_tx.send(NetworkEvent::Disconnected("websocket error".to_string()));
+    }) as Box<dyn FnMut(ErrorEvent)>);
+    websocket.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+
+    let close_tx = tx;
+    let onclose = Closure::wrap(Box::new(move |event: CloseEvent| {
+        let _ = close_tx.send(NetworkEvent::Disconnected(format!(
+            "websocket closed ({})",
+            event.code()
+        )));
+    }) as Box<dyn FnMut(CloseEvent)>);
+    websocket.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+
+    Ok((
+        rx,
+        websocket,
+        WebSocketBindings {
+            _onopen: onopen,
+            _onmessage: onmessage,
+            _onerror: onerror,
+            _onclose: onclose,
+        },
+    ))
+}
+
+#[allow(dead_code)]
 fn dispatch_mesh_job(
     worker: &Worker,
     position: ChunkPos,
@@ -1190,6 +1398,49 @@ fn dispatch_mesh_job(
     }
     let _ = js_sys::Reflect::set(&job, &JsValue::from_str("edits"), &edits_array);
     let _ = worker.post_message(&job);
+}
+
+fn dispatch_chunk_mesh_job(worker: &Worker, chunk: &ChunkData) {
+    let job = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&job, &JsValue::from_str("kind"), &JsValue::from_str("mesh_chunk"));
+    let _ = js_sys::Reflect::set(
+        &job,
+        &JsValue::from_str("x"),
+        &JsValue::from_f64(f64::from(chunk.position.x)),
+    );
+    let _ = js_sys::Reflect::set(
+        &job,
+        &JsValue::from_str("z"),
+        &JsValue::from_f64(f64::from(chunk.position.z)),
+    );
+    let voxels = expand_chunk_voxels(chunk);
+    let voxels_array = js_sys::Uint16Array::from(voxels.as_slice());
+    let _ = js_sys::Reflect::set(&job, &JsValue::from_str("voxels"), &voxels_array);
+    let _ = worker.post_message(&job);
+}
+
+fn expand_chunk_voxels(chunk: &ChunkData) -> Vec<u16> {
+    let mut voxels = Vec::with_capacity(CHUNK_WIDTH as usize * CHUNK_HEIGHT as usize * CHUNK_DEPTH as usize);
+    for y in 0..CHUNK_HEIGHT {
+        for z in 0..CHUNK_DEPTH {
+            for x in 0..CHUNK_WIDTH {
+                let voxel = chunk.voxel(LocalVoxelPos {
+                    x: x as u8,
+                    y: y as u8,
+                    z: z as u8,
+                });
+                voxels.push(voxel.block as u16);
+            }
+        }
+    }
+    voxels
+}
+
+fn websocket_url() -> Result<String> {
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window"))?;
+    let location = window.location();
+    let host = location.hostname().unwrap_or_else(|_| "127.0.0.1".to_string());
+    Ok(format!("ws://{host}:4001"))
 }
 
 fn ordered_chunk_positions(radius: i32) -> Vec<ChunkPos> {
@@ -1228,6 +1479,7 @@ fn desired_chunk_set(center: ChunkPos, radius: i32) -> HashSet<ChunkPos> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn prioritize_chunks(
     positions: Vec<ChunkPos>,
     current_chunk: ChunkPos,
@@ -1275,6 +1527,20 @@ struct MeshBuildResult {
     indices: Vec<u32>,
     voxels: Vec<u16>,
     failed: bool,
+}
+
+#[allow(dead_code)]
+struct WebSocketBindings {
+    _onopen: Closure<dyn FnMut(WebEvent)>,
+    _onmessage: Closure<dyn FnMut(MessageEvent)>,
+    _onerror: Closure<dyn FnMut(ErrorEvent)>,
+    _onclose: Closure<dyn FnMut(CloseEvent)>,
+}
+
+enum NetworkEvent {
+    Opened,
+    Server(ServerMessage),
+    Disconnected(String),
 }
 
 #[derive(Clone, Copy, Debug)]

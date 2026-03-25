@@ -24,7 +24,8 @@ const WEB_RADIUS: i32 = 6;
 const INITIAL_WEB_RADIUS: i32 = 1;
 const CHUNK_WORLD_RADIUS: f32 = (CHUNK_WIDTH as f32) * 0.5;
 const DRAW_DISTANCE_CHUNKS: f32 = 14.0;
-const DEFAULT_GENERATION_BUDGET_PER_UPDATE: usize = 2;
+const MESH_WORKER_COUNT: usize = 3;
+const DEFAULT_GENERATION_BUDGET_PER_UPDATE: usize = 6;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -47,9 +48,8 @@ async fn run() -> Result<()> {
     attach_canvas(window.canvas().expect("winit web canvas"));
 
     let renderer = Renderer::new(window).await?;
-    let (mesh_result_rx, worker, worker_onmessage) = start_mesh_worker_bridge()?;
-    let pending_generation = initial_generation_queue();
-    let mut app = WebApp::new(renderer.size(), pending_generation, worker, worker_onmessage, mesh_result_rx);
+    let (mesh_result_rx, workers, worker_onmessage) = start_mesh_worker_pool(MESH_WORKER_COUNT)?;
+    let mut app = WebApp::new(renderer.size(), workers, worker_onmessage, mesh_result_rx);
     let mut renderer = renderer;
     let mut chunk_meshes = HashMap::new();
 
@@ -95,36 +95,45 @@ struct WebApp {
     pressed: HashSet<KeyCode>,
     last_tick: Instant,
     size: PhysicalSize<u32>,
+    current_chunk: ChunkPos,
+    desired_chunks: HashSet<ChunkPos>,
     pending_generation: VecDeque<ChunkPos>,
     inflight_generation: HashSet<ChunkPos>,
     movement_active: bool,
     mesh_result_rx: Receiver<MeshBuildResult>,
-    _worker: Worker,
-    _worker_onmessage: Closure<dyn FnMut(MessageEvent)>,
+    workers: Vec<Worker>,
+    next_worker_index: usize,
+    _worker_onmessages: Vec<Closure<dyn FnMut(MessageEvent)>>,
 }
 
 impl WebApp {
     fn new(
         size: PhysicalSize<u32>,
-        pending_generation: VecDeque<ChunkPos>,
-        worker: Worker,
-        worker_onmessage: Closure<dyn FnMut(MessageEvent)>,
+        workers: Vec<Worker>,
+        worker_onmessages: Vec<Closure<dyn FnMut(MessageEvent)>>,
         mesh_result_rx: Receiver<MeshBuildResult>,
     ) -> Self {
         let mut camera = Camera::default();
         camera.position = Vec3::new(8.0, 98.0, 16.0);
+        let current_chunk = chunk_from_world_position(camera.position);
+        let desired_chunks = desired_chunk_set(current_chunk, WEB_RADIUS);
+        let pending_generation =
+            prioritize_chunks(desired_chunks.iter().copied().collect(), current_chunk, camera.position, camera.forward());
 
         Self {
             camera,
             pressed: HashSet::new(),
             last_tick: Instant::now(),
             size,
+            current_chunk,
+            desired_chunks,
             pending_generation,
             inflight_generation: HashSet::new(),
             movement_active: false,
             mesh_result_rx,
-            _worker: worker,
-            _worker_onmessage: worker_onmessage,
+            workers,
+            next_worker_index: 0,
+            _worker_onmessages: worker_onmessages,
         }
     }
 
@@ -216,15 +225,23 @@ impl WebApp {
         chunk_meshes: &mut HashMap<ChunkPos, Mesh>,
         default_budget: usize,
     ) {
+        self.update_streaming_window(chunk_meshes);
+
         while let Ok(result) = self.mesh_result_rx.try_recv() {
             self.inflight_generation.remove(&result.position);
             if result.failed {
-                self.pending_generation.push_back(result.position);
+                if self.desired_chunks.contains(&result.position) {
+                    self.pending_generation.push_back(result.position);
+                }
                 continue;
             }
 
-            chunk_meshes.insert(result.position, renderer.create_mesh(&result.vertices, &result.indices));
+            if self.desired_chunks.contains(&result.position) {
+                chunk_meshes.insert(result.position, renderer.create_mesh(&result.vertices, &result.indices));
+            }
         }
+
+        self.reprioritize_pending_generation(chunk_meshes);
 
         let budget = self.generation_budget(default_budget);
         for _ in 0..budget {
@@ -236,7 +253,9 @@ impl WebApp {
                 continue;
             }
 
-            dispatch_mesh_job(&self._worker, position);
+            let worker_index = self.next_worker_index % self.workers.len();
+            dispatch_mesh_job(&self.workers[worker_index], position);
+            self.next_worker_index = (self.next_worker_index + 1) % self.workers.len();
             self.inflight_generation.insert(position);
         }
     }
@@ -247,10 +266,50 @@ impl WebApp {
         }
 
         if self.movement_active {
-            return 0;
+            return default_budget.saturating_div(2).max(1);
         }
 
         default_budget
+    }
+
+    fn update_streaming_window(&mut self, chunk_meshes: &mut HashMap<ChunkPos, Mesh>) {
+        let next_chunk = chunk_from_world_position(self.camera.position);
+        if next_chunk == self.current_chunk {
+            return;
+        }
+
+        self.current_chunk = next_chunk;
+        self.desired_chunks = desired_chunk_set(self.current_chunk, WEB_RADIUS);
+        chunk_meshes.retain(|position, _| self.desired_chunks.contains(position));
+        self.pending_generation
+            .retain(|position| self.desired_chunks.contains(position));
+        self.inflight_generation
+            .retain(|position| self.desired_chunks.contains(position));
+    }
+
+    fn reprioritize_pending_generation(&mut self, chunk_meshes: &HashMap<ChunkPos, Mesh>) {
+        for position in &self.desired_chunks {
+            if chunk_meshes.contains_key(position)
+                || self.inflight_generation.contains(position)
+                || self.pending_generation.contains(position)
+            {
+                continue;
+            }
+
+            self.pending_generation.push_back(*position);
+        }
+
+        if self.pending_generation.len() <= 1 {
+            return;
+        }
+
+        let forward = self.camera.forward();
+        let mut pending = self.pending_generation.drain(..).collect::<Vec<_>>();
+        pending.sort_by(|a, b| {
+            chunk_priority(*a, self.current_chunk, self.camera.position, forward)
+                .total_cmp(&chunk_priority(*b, self.current_chunk, self.camera.position, forward))
+        });
+        self.pending_generation = pending.into();
     }
 }
 
@@ -293,81 +352,77 @@ fn attach_canvas(canvas: HtmlCanvasElement) {
     let _ = body.append_child(&canvas);
 }
 
-fn initial_generation_queue() -> VecDeque<ChunkPos> {
-    let mut pending = VecDeque::new();
-    for position in ordered_chunk_positions(WEB_RADIUS) {
-        if position.x.abs() > INITIAL_WEB_RADIUS || position.z.abs() > INITIAL_WEB_RADIUS {
-            pending.push_back(position);
-            continue;
-        }
-
-        pending.push_front(position);
-    }
-
-    pending
-}
-
-fn start_mesh_worker_bridge() -> Result<(Receiver<MeshBuildResult>, Worker, Closure<dyn FnMut(MessageEvent)>)> {
-    let worker = Worker::new("mesh-worker.js")
-        .map_err(|error| anyhow::anyhow!("create mesh worker: {error:?}"))?;
+fn start_mesh_worker_pool(
+    worker_count: usize,
+) -> Result<(Receiver<MeshBuildResult>, Vec<Worker>, Vec<Closure<dyn FnMut(MessageEvent)>>)> {
     let (tx, rx) = mpsc::channel::<MeshBuildResult>();
+    let mut workers = Vec::with_capacity(worker_count);
+    let mut onmessages = Vec::with_capacity(worker_count);
 
-    let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
-        let data = event.data();
-        let object = js_sys::Object::from(data);
-        let kind = js_sys::Reflect::get(&object, &JsValue::from_str("kind"))
-            .ok()
-            .and_then(|value| value.as_string())
-            .unwrap_or_default();
-        let x = js_sys::Reflect::get(&object, &JsValue::from_str("x"))
-            .ok()
-            .and_then(|value| value.as_f64())
-            .unwrap_or_default() as i32;
-        let z = js_sys::Reflect::get(&object, &JsValue::from_str("z"))
-            .ok()
-            .and_then(|value| value.as_f64())
-            .unwrap_or_default() as i32;
-
-        if kind == "error" {
-            let message = js_sys::Reflect::get(&object, &JsValue::from_str("message"))
+    for _ in 0..worker_count {
+        let worker = Worker::new("mesh-worker.js")
+            .map_err(|error| anyhow::anyhow!("create mesh worker: {error:?}"))?;
+        let tx = tx.clone();
+        let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
+            let data = event.data();
+            let object = js_sys::Object::from(data);
+            let kind = js_sys::Reflect::get(&object, &JsValue::from_str("kind"))
                 .ok()
                 .and_then(|value| value.as_string())
-                .unwrap_or_else(|| "unknown worker error".to_string());
-            web_sys::console::error_1(&JsValue::from_str(&format!(
-                "mesh worker failed for chunk ({x}, {z}): {message}"
-            )));
+                .unwrap_or_default();
+            let x = js_sys::Reflect::get(&object, &JsValue::from_str("x"))
+                .ok()
+                .and_then(|value| value.as_f64())
+                .unwrap_or_default() as i32;
+            let z = js_sys::Reflect::get(&object, &JsValue::from_str("z"))
+                .ok()
+                .and_then(|value| value.as_f64())
+                .unwrap_or_default() as i32;
+
+            if kind == "error" {
+                let message = js_sys::Reflect::get(&object, &JsValue::from_str("message"))
+                    .ok()
+                    .and_then(|value| value.as_string())
+                    .unwrap_or_else(|| "unknown worker error".to_string());
+                web_sys::console::error_1(&JsValue::from_str(&format!(
+                    "mesh worker failed for chunk ({x}, {z}): {message}"
+                )));
+                let _ = tx.send(MeshBuildResult {
+                    position: ChunkPos { x, z },
+                    vertices: Vec::new(),
+                    indices: Vec::new(),
+                    failed: true,
+                });
+                return;
+            }
+
+            let vertices_value = js_sys::Reflect::get(&object, &JsValue::from_str("vertices")).unwrap();
+            let indices_value = js_sys::Reflect::get(&object, &JsValue::from_str("indices")).unwrap();
+            let vertex_floats = js_sys::Float32Array::new(&vertices_value).to_vec();
+            let indices = js_sys::Uint32Array::new(&indices_value).to_vec();
+            let vertices = vertex_floats
+                .chunks_exact(8)
+                .map(|values| Vertex {
+                    position: [values[0], values[1], values[2]],
+                    color: [values[3], values[4], values[5]],
+                    uv: [values[6], values[7]],
+                })
+                .collect::<Vec<_>>();
+
             let _ = tx.send(MeshBuildResult {
                 position: ChunkPos { x, z },
-                vertices: Vec::new(),
-                indices: Vec::new(),
-                failed: true,
+                vertices,
+                indices,
+                failed: false,
             });
-            return;
-        }
+        }) as Box<dyn FnMut(MessageEvent)>);
 
-        let vertices_value = js_sys::Reflect::get(&object, &JsValue::from_str("vertices")).unwrap();
-        let indices_value = js_sys::Reflect::get(&object, &JsValue::from_str("indices")).unwrap();
-        let vertex_floats = js_sys::Float32Array::new(&vertices_value).to_vec();
-        let indices = js_sys::Uint32Array::new(&indices_value).to_vec();
-        let vertices = vertex_floats
-            .chunks_exact(8)
-            .map(|values| Vertex {
-                position: [values[0], values[1], values[2]],
-                color: [values[3], values[4], values[5]],
-                uv: [values[6], values[7]],
-            })
-            .collect::<Vec<_>>();
+        worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        workers.push(worker);
+        onmessages.push(onmessage);
+    }
 
-        let _ = tx.send(MeshBuildResult {
-            position: ChunkPos { x, z },
-            vertices,
-            indices,
-            failed: false,
-        });
-    }) as Box<dyn FnMut(MessageEvent)>);
-
-    worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-    Ok((rx, worker, onmessage))
+    Ok((rx, workers, onmessages))
 }
 
 fn dispatch_mesh_job(worker: &Worker, position: ChunkPos) {
@@ -395,6 +450,64 @@ fn ordered_chunk_positions(radius: i32) -> Vec<ChunkPos> {
     }
 
     positions
+}
+
+fn chunk_from_world_position(position: Vec3) -> ChunkPos {
+    ChunkPos {
+        x: (position.x / CHUNK_WIDTH as f32).floor() as i32,
+        z: (position.z / CHUNK_DEPTH as f32).floor() as i32,
+    }
+}
+
+fn desired_chunk_set(center: ChunkPos, radius: i32) -> HashSet<ChunkPos> {
+    ordered_chunk_positions(radius)
+        .into_iter()
+        .map(|offset| ChunkPos {
+            x: center.x + offset.x,
+            z: center.z + offset.z,
+        })
+        .collect()
+}
+
+fn prioritize_chunks(
+    positions: Vec<ChunkPos>,
+    current_chunk: ChunkPos,
+    camera_position: Vec3,
+    forward: Vec3,
+) -> VecDeque<ChunkPos> {
+    let mut positions = positions;
+    positions.sort_by(|a, b| {
+        chunk_priority(*a, current_chunk, camera_position, forward)
+            .total_cmp(&chunk_priority(*b, current_chunk, camera_position, forward))
+    });
+
+    let mut pending = VecDeque::new();
+    for position in positions {
+        if (position.x - current_chunk.x).abs() <= INITIAL_WEB_RADIUS
+            && (position.z - current_chunk.z).abs() <= INITIAL_WEB_RADIUS
+        {
+            pending.push_front(position);
+        } else {
+            pending.push_back(position);
+        }
+    }
+
+    pending
+}
+
+fn chunk_priority(position: ChunkPos, camera_chunk: ChunkPos, camera_position: Vec3, forward: Vec3) -> f32 {
+    let dx = (position.x - camera_chunk.x) as f32;
+    let dz = (position.z - camera_chunk.z) as f32;
+    let distance_sq = dx * dx + dz * dz;
+    let center = Vec3::new(
+        position.x as f32 * CHUNK_WIDTH as f32 + CHUNK_WORLD_RADIUS,
+        camera_position.y,
+        position.z as f32 * CHUNK_DEPTH as f32 + CHUNK_WORLD_RADIUS,
+    );
+    let to_chunk = (center - camera_position).normalize_or_zero();
+    let forward_bias = 1.0 - forward.dot(to_chunk);
+
+    distance_sq + forward_bias * 2.5
 }
 
 struct MeshBuildResult {

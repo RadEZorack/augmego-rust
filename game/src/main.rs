@@ -275,7 +275,7 @@ fn network_main(events: Sender<NetworkEvent>, commands: Receiver<ClientCommand>)
         &mut stream,
         &ClientMessage::SubscribeChunks(SubscribeChunks {
             center: ChunkPos { x: 0, z: 0 },
-            radius: 3,
+            radius: 8,
         }),
     )?;
 
@@ -397,13 +397,14 @@ fn emit_block_faces(
     z: i32,
     block: BlockId,
 ) {
+    let base_color = [1.0, 1.0, 1.0];
     let neighbors = [
-        ((0, 0, -1), face_vertices(world, Face::North, color_for_block(block))),
-        ((0, 0, 1), face_vertices(world, Face::South, color_for_block(block))),
-        ((-1, 0, 0), face_vertices(world, Face::West, color_for_block(block))),
-        ((1, 0, 0), face_vertices(world, Face::East, color_for_block(block))),
-        ((0, 1, 0), face_vertices(world, Face::Up, brighten(color_for_block(block), 0.15))),
-        ((0, -1, 0), face_vertices(world, Face::Down, darken(color_for_block(block), 0.2))),
+        ((0, 0, -1), face_vertices(world, Face::North, base_color, tile_uvs(block, Face::North))),
+        ((0, 0, 1), face_vertices(world, Face::South, base_color, tile_uvs(block, Face::South))),
+        ((-1, 0, 0), face_vertices(world, Face::West, base_color, tile_uvs(block, Face::West))),
+        ((1, 0, 0), face_vertices(world, Face::East, base_color, tile_uvs(block, Face::East))),
+        ((0, 1, 0), face_vertices(world, Face::Up, brighten(base_color, 0.08), tile_uvs(block, Face::Up))),
+        ((0, -1, 0), face_vertices(world, Face::Down, darken(base_color, 0.16), tile_uvs(block, Face::Down))),
     ];
 
     for (offset, face) in neighbors {
@@ -438,70 +439,99 @@ enum Face {
     Down,
 }
 
-fn face_vertices(origin: [f32; 3], face: Face, color: [f32; 3]) -> [Vertex; 4] {
+fn face_vertices(origin: [f32; 3], face: Face, color: [f32; 3], uvs: [[f32; 2]; 4]) -> [Vertex; 4] {
     let [x, y, z] = origin;
     match face {
         Face::North => [
-            v(x, y + 1.0, z, color),
-            v(x + 1.0, y + 1.0, z, color),
-            v(x + 1.0, y, z, color),
-            v(x, y, z, color),
+            v(x, y + 1.0, z, color, uvs[0]),
+            v(x + 1.0, y + 1.0, z, color, uvs[1]),
+            v(x + 1.0, y, z, color, uvs[2]),
+            v(x, y, z, color, uvs[3]),
         ],
         Face::South => [
-            v(x + 1.0, y + 1.0, z + 1.0, color),
-            v(x, y + 1.0, z + 1.0, color),
-            v(x, y, z + 1.0, color),
-            v(x + 1.0, y, z + 1.0, color),
+            v(x + 1.0, y + 1.0, z + 1.0, color, uvs[0]),
+            v(x, y + 1.0, z + 1.0, color, uvs[1]),
+            v(x, y, z + 1.0, color, uvs[2]),
+            v(x + 1.0, y, z + 1.0, color, uvs[3]),
         ],
         Face::East => [
-            v(x + 1.0, y + 1.0, z, color),
-            v(x + 1.0, y + 1.0, z + 1.0, color),
-            v(x + 1.0, y, z + 1.0, color),
-            v(x + 1.0, y, z, color),
+            v(x + 1.0, y + 1.0, z, color, uvs[0]),
+            v(x + 1.0, y + 1.0, z + 1.0, color, uvs[1]),
+            v(x + 1.0, y, z + 1.0, color, uvs[2]),
+            v(x + 1.0, y, z, color, uvs[3]),
         ],
         Face::West => [
-            v(x, y + 1.0, z + 1.0, color),
-            v(x, y + 1.0, z, color),
-            v(x, y, z, color),
-            v(x, y, z + 1.0, color),
+            v(x, y + 1.0, z + 1.0, color, uvs[0]),
+            v(x, y + 1.0, z, color, uvs[1]),
+            v(x, y, z, color, uvs[2]),
+            v(x, y, z + 1.0, color, uvs[3]),
         ],
         Face::Up => [
-            v(x, y + 1.0, z, color),
-            v(x, y + 1.0, z + 1.0, color),
-            v(x + 1.0, y + 1.0, z + 1.0, color),
-            v(x + 1.0, y + 1.0, z, color),
+            v(x, y + 1.0, z, color, uvs[0]),
+            v(x, y + 1.0, z + 1.0, color, uvs[1]),
+            v(x + 1.0, y + 1.0, z + 1.0, color, uvs[2]),
+            v(x + 1.0, y + 1.0, z, color, uvs[3]),
         ],
         Face::Down => [
-            v(x, y, z, color),
-            v(x + 1.0, y, z, color),
-            v(x + 1.0, y, z + 1.0, color),
-            v(x, y, z + 1.0, color),
+            v(x, y, z, color, uvs[0]),
+            v(x + 1.0, y, z, color, uvs[1]),
+            v(x + 1.0, y, z + 1.0, color, uvs[2]),
+            v(x, y, z + 1.0, color, uvs[3]),
         ],
     }
 }
 
-fn v(x: f32, y: f32, z: f32, color: [f32; 3]) -> Vertex {
+fn v(x: f32, y: f32, z: f32, color: [f32; 3], uv: [f32; 2]) -> Vertex {
     Vertex {
         position: [x, y, z],
         color,
+        uv,
     }
 }
 
-fn color_for_block(block: BlockId) -> [f32; 3] {
+fn tile_uvs(block: BlockId, face: Face) -> [[f32; 2]; 4] {
+    atlas_quad(tile_for(block, face))
+}
+
+fn tile_for(block: BlockId, face: Face) -> (u32, u32) {
     match block {
-        BlockId::Grass => [0.35, 0.75, 0.28],
-        BlockId::Dirt => [0.48, 0.32, 0.18],
-        BlockId::Stone => [0.52, 0.54, 0.58],
-        BlockId::Sand => [0.86, 0.79, 0.51],
-        BlockId::Water => [0.15, 0.42, 0.87],
-        BlockId::Log => [0.55, 0.34, 0.16],
-        BlockId::Leaves => [0.20, 0.52, 0.16],
-        BlockId::Planks => [0.73, 0.58, 0.29],
-        BlockId::Glass => [0.71, 0.88, 0.93],
-        BlockId::Lantern => [0.95, 0.81, 0.29],
-        BlockId::Storage => [0.58, 0.40, 0.18],
-        BlockId::Air => [1.0, 1.0, 1.0],
+        BlockId::Grass => match face {
+            Face::Up => (1, 0),
+            Face::Down => (0, 0),
+            _ => (1, 1),
+        },
+        BlockId::Dirt => (0, 0),
+        BlockId::Stone => (2, 0),
+        BlockId::Sand => (3, 0),
+        BlockId::Water => (2, 1),
+        BlockId::Log => match face {
+            Face::Up | Face::Down => (3, 1),
+            _ => (0, 1),
+        },
+        BlockId::Leaves => (1, 1),
+        BlockId::Planks => (3, 1),
+        BlockId::Glass => (2, 1),
+        BlockId::Lantern => (3, 1),
+        BlockId::Storage => (0, 1),
+        BlockId::Air => (0, 0),
     }
+}
+
+fn atlas_quad(tile: (u32, u32)) -> [[f32; 2]; 4] {
+    const TILE_COUNT: f32 = 4.0;
+    const EPS: f32 = 0.001;
+
+    let min_u = tile.0 as f32 / TILE_COUNT + EPS;
+    let max_u = (tile.0 + 1) as f32 / TILE_COUNT - EPS;
+    let min_v = tile.1 as f32 / TILE_COUNT + EPS;
+    let max_v = (tile.1 + 1) as f32 / TILE_COUNT - EPS;
+
+    [
+        [min_u, min_v],
+        [max_u, min_v],
+        [max_u, max_v],
+        [min_u, max_v],
+    ]
 }
 
 fn darken(color: [f32; 3], amount: f32) -> [f32; 3] {

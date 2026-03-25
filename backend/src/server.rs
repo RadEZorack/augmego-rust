@@ -29,7 +29,7 @@ impl Default for ServerConfig {
             bind_addr: "127.0.0.1:4000".to_string(),
             world_seed: 0xA66D_E601,
             save_path: PathBuf::from("world"),
-            view_radius: 4,
+            view_radius: 8,
         }
     }
 }

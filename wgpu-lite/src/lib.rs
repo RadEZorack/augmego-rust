@@ -10,6 +10,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 pub struct Vertex {
     pub position: [f32; 3],
     pub color: [f32; 3],
+    pub uv: [f32; 2],
 }
 
 impl Vertex {
@@ -27,6 +28,11 @@ impl Vertex {
                     offset: mem::size_of::<[f32; 3]>() as u64,
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 6]>() as u64,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x2,
                 },
             ],
         }
@@ -72,6 +78,112 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
+struct MaterialTarget {
+    layout: wgpu::BindGroupLayout,
+    bind_group: wgpu::BindGroup,
+}
+
+impl MaterialTarget {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        const TILE_SIZE: u32 = 16;
+        const ATLAS_TILES: u32 = 4;
+        let atlas_size = TILE_SIZE * ATLAS_TILES;
+        let mut pixels = vec![0_u8; (atlas_size * atlas_size * 4) as usize];
+
+        for tile_y in 0..ATLAS_TILES {
+            for tile_x in 0..ATLAS_TILES {
+                fill_tile(&mut pixels, atlas_size, tile_x, tile_y, tile_color(tile_x, tile_y));
+            }
+        }
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("material-atlas"),
+            size: wgpu::Extent3d {
+                width: atlas_size,
+                height: atlas_size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * atlas_size),
+                rows_per_image: Some(atlas_size),
+            },
+            wgpu::Extent3d {
+                width: atlas_size,
+                height: atlas_size,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("material-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("material-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("material-bind-group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        Self { layout, bind_group }
+    }
+}
+
 pub struct Renderer<'a> {
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
@@ -81,6 +193,7 @@ pub struct Renderer<'a> {
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    material: MaterialTarget,
     depth: DepthTarget,
 }
 
@@ -172,9 +285,11 @@ impl<'a> Renderer<'a> {
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
+        let material = MaterialTarget::new(&device, &queue);
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline-layout"),
-            bind_group_layouts: &[&camera_layout],
+            bind_group_layouts: &[&camera_layout, &material.layout],
             push_constant_ranges: &[],
         });
 
@@ -228,6 +343,7 @@ impl<'a> Renderer<'a> {
             pipeline,
             camera_buffer,
             camera_bind_group,
+            material,
             depth,
         })
     }
@@ -317,6 +433,7 @@ impl<'a> Renderer<'a> {
 
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(1, &self.material.bind_group, &[]);
             for mesh in meshes {
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -332,4 +449,44 @@ impl<'a> Renderer<'a> {
     pub fn size(&self) -> PhysicalSize<u32> {
         self.size
     }
+}
+
+fn fill_tile(pixels: &mut [u8], atlas_size: u32, tile_x: u32, tile_y: u32, base: [u8; 4]) {
+    const TILE_SIZE: u32 = 16;
+    let start_x = tile_x * TILE_SIZE;
+    let start_y = tile_y * TILE_SIZE;
+
+    for y in 0..TILE_SIZE {
+        for x in 0..TILE_SIZE {
+            let px = start_x + x;
+            let py = start_y + y;
+            let offset = ((py * atlas_size + px) * 4) as usize;
+            let checker = ((x / 4) + (y / 4)) % 2;
+            let shade = if checker == 0 { 12_i16 } else { -10_i16 };
+            pixels[offset..offset + 4].copy_from_slice(&shade_color(base, shade));
+        }
+    }
+}
+
+fn tile_color(tile_x: u32, tile_y: u32) -> [u8; 4] {
+    match (tile_x, tile_y) {
+        (0, 0) => [110, 76, 45, 255],
+        (1, 0) => [104, 168, 72, 255],
+        (2, 0) => [128, 132, 140, 255],
+        (3, 0) => [219, 201, 132, 255],
+        (0, 1) => [112, 78, 53, 255],
+        (1, 1) => [68, 130, 58, 255],
+        (2, 1) => [192, 228, 240, 255],
+        (3, 1) => [228, 189, 90, 255],
+        _ => [255, 0, 255, 255],
+    }
+}
+
+fn shade_color(base: [u8; 4], delta: i16) -> [u8; 4] {
+    [
+        (i16::from(base[0]) + delta).clamp(0, 255) as u8,
+        (i16::from(base[1]) + delta).clamp(0, 255) as u8,
+        (i16::from(base[2]) + delta).clamp(0, 255) as u8,
+        base[3],
+    ]
 }

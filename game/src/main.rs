@@ -282,6 +282,10 @@ impl GameApp {
                             spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
                             spawn_position.z as f32 + 0.5,
                         );
+                        self.camera.vertical_velocity = 0.0;
+                        self.camera.on_ground = false;
+                        self.spawned = true;
+                        self.physics_ready = false;
                     }
                 }
                 NetworkEvent::Inventory(snapshot) => {

@@ -192,26 +192,29 @@ impl TerrainGenerator {
     }
 
     pub fn generate_chunk(&self, position: ChunkPos) -> ChunkData {
-        let biome = self.biome_at(position);
-        let mut voxels = vec![Voxel::default(); CHUNK_VOLUME];
         let base = position.min_world_block();
+        let center_x = base.x + i64::from(CHUNK_WIDTH / 2);
+        let center_z = base.z + i64::from(CHUNK_DEPTH / 2);
+        let biome = self.biome_at_world(center_x, center_z);
+        let mut voxels = vec![Voxel::default(); CHUNK_VOLUME];
 
         for x in 0..CHUNK_WIDTH {
             for z in 0..CHUNK_DEPTH {
                 let world_x = base.x + i64::from(x);
                 let world_z = base.z + i64::from(z);
-                let surface = self.height_at(world_x, world_z, biome);
+                let column_biome = self.biome_at_world(world_x, world_z);
+                let surface = self.height_at(world_x, world_z, column_biome);
 
                 for y in 0..=surface.min(CHUNK_HEIGHT - 1) {
                     let local = LocalVoxelPos { x: x as u8, y: y as u8, z: z as u8 };
                     let block = if y == surface {
-                        match biome {
+                        match column_biome {
                             BiomeId::Desert => BlockId::Sand,
                             BiomeId::Alpine => BlockId::Stone,
                             _ => BlockId::Grass,
                         }
                     } else if y > surface - 4 {
-                        match biome {
+                        match column_biome {
                             BiomeId::Desert => BlockId::Sand,
                             _ => BlockId::Dirt,
                         }
@@ -222,7 +225,7 @@ impl TerrainGenerator {
                     voxels[index] = Voxel { block };
                 }
 
-                if matches!(biome, BiomeId::Forest) && self.hash(world_x, world_z, 99) % 19 == 0 {
+                if matches!(column_biome, BiomeId::Forest) && self.hash(world_x, world_z, 99) % 23 == 0 {
                     self.place_tree(&mut voxels, x as u8, (surface + 1) as u8, z as u8);
                 }
             }
@@ -232,31 +235,68 @@ impl TerrainGenerator {
     }
 
     pub fn surface_height(&self, x: i64, z: i64) -> i32 {
-        let chunk = ChunkPos::from_world(shared_math::WorldPos { x, y: 0, z });
-        let biome = self.biome_at(chunk);
+        let biome = self.biome_at_world(x, z);
         self.height_at(x, z, biome)
     }
 
-    fn biome_at(&self, position: ChunkPos) -> BiomeId {
-        match self.hash(i64::from(position.x), i64::from(position.z), 7) % 4 {
-            0 => BiomeId::Plains,
-            1 => BiomeId::Forest,
-            2 => BiomeId::Desert,
-            _ => BiomeId::Alpine,
+    fn biome_at_world(&self, x: i64, z: i64) -> BiomeId {
+        let temperature = self.value_noise(x as f32, z as f32, 144.0, 7);
+        let moisture = self.value_noise(x as f32, z as f32, 144.0, 17);
+        let elevation = self.value_noise(x as f32, z as f32, 220.0, 23);
+
+        if elevation > 0.7 {
+            BiomeId::Alpine
+        } else if temperature > 0.58 && moisture < 0.42 {
+            BiomeId::Desert
+        } else if moisture > 0.57 {
+            BiomeId::Forest
+        } else {
+            BiomeId::Plains
         }
     }
 
     fn height_at(&self, x: i64, z: i64, biome: BiomeId) -> i32 {
-        let coarse = (self.hash(x / 8, z / 8, 13) % 16) as i32;
-        let fine = (self.hash(x, z, 29) % 7) as i32;
+        let broad = self.value_noise(x as f32, z as f32, 96.0, 13);
+        let rolling = self.value_noise(x as f32, z as f32, 42.0, 29);
+        let detail = self.value_noise(x as f32, z as f32, 18.0, 41);
         let biome_offset = match biome {
-            BiomeId::Plains => 58,
-            BiomeId::Forest => 62,
-            BiomeId::Desert => 54,
-            BiomeId::Alpine => 78,
+            BiomeId::Plains => 60.0,
+            BiomeId::Forest => 63.0,
+            BiomeId::Desert => 58.0,
+            BiomeId::Alpine => 70.0,
+        };
+        let biome_scale = match biome {
+            BiomeId::Plains => 7.0,
+            BiomeId::Forest => 9.0,
+            BiomeId::Desert => 6.0,
+            BiomeId::Alpine => 14.0,
         };
 
-        biome_offset + coarse + fine
+        (biome_offset + broad * biome_scale + rolling * 5.0 + detail * 2.0).round() as i32
+    }
+
+    fn value_noise(&self, x: f32, z: f32, scale: f32, salt: u64) -> f32 {
+        let gx = (x / scale).floor();
+        let gz = (z / scale).floor();
+        let fx = smoothstep((x / scale) - gx);
+        let fz = smoothstep((z / scale) - gz);
+
+        let x0 = gx as i64;
+        let z0 = gz as i64;
+        let x1 = x0 + 1;
+        let z1 = z0 + 1;
+
+        let n00 = self.noise_value(x0, z0, salt);
+        let n10 = self.noise_value(x1, z0, salt);
+        let n01 = self.noise_value(x0, z1, salt);
+        let n11 = self.noise_value(x1, z1, salt);
+        let nx0 = lerp(n00, n10, fx);
+        let nx1 = lerp(n01, n11, fx);
+        lerp(nx0, nx1, fz)
+    }
+
+    fn noise_value(&self, x: i64, z: i64, salt: u64) -> f32 {
+        (self.hash(x, z, salt) as f64 / u64::MAX as f64) as f32
     }
 
     fn place_tree(&self, voxels: &mut [Voxel], x: u8, y: u8, z: u8) {
@@ -300,6 +340,15 @@ impl TerrainGenerator {
         value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
         value ^ (value >> 30)
     }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn linear_index(local: LocalVoxelPos) -> usize {

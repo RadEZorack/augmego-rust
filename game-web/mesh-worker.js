@@ -63,20 +63,23 @@ function generateChunk(chunkX, chunkZ) {
   const voxels = new Uint16Array(CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_DEPTH);
   const baseX = chunkX * CHUNK_WIDTH;
   const baseZ = chunkZ * CHUNK_DEPTH;
-  const biome = biomeAt(chunkX, chunkZ);
+  const chunkCenterX = baseX + CHUNK_WIDTH / 2;
+  const chunkCenterZ = baseZ + CHUNK_DEPTH / 2;
+  const biome = biomeAt(chunkCenterX, chunkCenterZ);
 
   for (let x = 0; x < CHUNK_WIDTH; x++) {
     for (let z = 0; z < CHUNK_DEPTH; z++) {
       const worldX = baseX + x;
       const worldZ = baseZ + z;
-      const surface = heightAt(worldX, worldZ, biome);
+      const columnBiome = biomeAt(worldX, worldZ);
+      const surface = heightAt(worldX, worldZ, columnBiome);
 
       for (let y = 0; y <= Math.min(surface, CHUNK_HEIGHT - 1); y++) {
         let block;
         if (y === surface) {
-          block = biome === 2 ? 4 : biome === 3 ? 3 : 1;
+          block = columnBiome === 2 ? 4 : columnBiome === 3 ? 3 : 1;
         } else if (y > surface - 4) {
-          block = biome === 2 ? 4 : 2;
+          block = columnBiome === 2 ? 4 : 2;
         } else {
           block = 3;
         }
@@ -84,7 +87,7 @@ function generateChunk(chunkX, chunkZ) {
         voxels[linearIndex(x, y, z)] = block;
       }
 
-      if (biome === 1 && hash(worldX, worldZ, 99) % 19n === 0n) {
+      if (columnBiome === 1 && hash(worldX, worldZ, 99) % 23n === 0n) {
         placeTree(voxels, x, surface + 1, z);
       }
     }
@@ -93,15 +96,59 @@ function generateChunk(chunkX, chunkZ) {
   return voxels;
 }
 
-function biomeAt(chunkX, chunkZ) {
-  return Number(hash(chunkX, chunkZ, 7) % 4n);
+function biomeAt(x, z) {
+  const temperature = valueNoise(x, z, 144, 7);
+  const moisture = valueNoise(x, z, 144, 17);
+  const elevation = valueNoise(x, z, 220, 23);
+
+  if (elevation > 0.7) {
+    return 3;
+  }
+  if (temperature > 0.58 && moisture < 0.42) {
+    return 2;
+  }
+  if (moisture > 0.57) {
+    return 1;
+  }
+  return 0;
 }
 
 function heightAt(x, z, biome) {
-  const coarse = Number(hash(Math.floor(x / 8), Math.floor(z / 8), 13) % 16n);
-  const fine = Number(hash(x, z, 29) % 7n);
-  const biomeOffset = biome === 0 ? 58 : biome === 1 ? 62 : biome === 2 ? 54 : 78;
-  return biomeOffset + coarse + fine;
+  const broad = valueNoise(x, z, 96, 13);
+  const rolling = valueNoise(x, z, 42, 29);
+  const detail = valueNoise(x, z, 18, 41);
+  const biomeOffset = biome === 0 ? 60 : biome === 1 ? 63 : biome === 2 ? 58 : 70;
+  const biomeScale = biome === 0 ? 7 : biome === 1 ? 9 : biome === 2 ? 6 : 14;
+  return Math.round(biomeOffset + broad * biomeScale + rolling * 5 + detail * 2);
+}
+
+function valueNoise(x, z, scale, salt) {
+  const scaledX = x / scale;
+  const scaledZ = z / scale;
+  const gx = Math.floor(scaledX);
+  const gz = Math.floor(scaledZ);
+  const fx = smoothstep(scaledX - gx);
+  const fz = smoothstep(scaledZ - gz);
+  const n00 = noiseValue(gx, gz, salt);
+  const n10 = noiseValue(gx + 1, gz, salt);
+  const n01 = noiseValue(gx, gz + 1, salt);
+  const n11 = noiseValue(gx + 1, gz + 1, salt);
+  const nx0 = lerp(n00, n10, fx);
+  const nx1 = lerp(n01, n11, fx);
+  return lerp(nx0, nx1, fz);
+}
+
+function noiseValue(x, z, salt) {
+  return Number(hash(x, z, salt)) / Number((1n << 64n) - 1n);
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function smoothstep(t) {
+  const clamped = Math.max(0, Math.min(1, t));
+  return clamped * clamped * (3 - 2 * clamped);
 }
 
 function placeTree(voxels, x, y, z) {

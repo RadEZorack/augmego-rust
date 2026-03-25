@@ -249,7 +249,9 @@ impl GameApp {
 
         match target {
             InteractionTarget::Link if button == MouseButton::Left => {
-                let _ = open_url(LINK_PANEL_URL);
+                if confirm_open_url(LINK_PANEL_URL) {
+                    let _ = open_url(LINK_PANEL_URL);
+                }
             }
             InteractionTarget::Block(hit) => match button {
                 MouseButton::Left => {
@@ -1683,6 +1685,51 @@ fn open_url(url: &str) -> Result<()> {
 
     #[allow(unreachable_code)]
     Err(anyhow::anyhow!("opening URLs is unsupported on this platform"))
+}
+
+fn confirm_open_url(url: &str) -> bool {
+    let prompt = format!("Do you want to go to {url}?");
+
+    #[cfg(target_os = "macos")]
+    {
+        return Command::new("osascript")
+            .args([
+                "-e",
+                &format!(
+                    "button returned of (display dialog {:?} buttons {{\"Decline\", \"Accept\"}} default button \"Accept\")",
+                    prompt
+                ),
+            ])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "Accept")
+            .unwrap_or(false);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "$result = [System.Windows.Forms.MessageBox]::Show({prompt:?}, 'External Link', 'YesNo', 'Question'); if ($result -eq 'Yes') {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let zenity_status = Command::new("zenity")
+            .args(["--question", "--text", &prompt, "--ok-label=Accept", "--cancel-label=Decline"])
+            .status();
+        return zenity_status.map(|status| status.success()).unwrap_or(false);
+    }
+
+    #[allow(unreachable_code)]
+    false
 }
 
 fn darken(color: [f32; 3], amount: f32) -> [f32; 3] {

@@ -3,7 +3,7 @@
 use anyhow::Result;
 use glam::{Mat4, Vec3};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
-use shared_world::{BlockId, TerrainGenerator};
+use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
@@ -36,6 +36,7 @@ const PLAYER_JUMP_SPEED: f32 = 9.5;
 const PLAYER_GRAVITY: f32 = 28.0;
 const STEP_HEIGHT: f32 = 0.6;
 const COLLISION_STEP: f32 = 0.2;
+const WEB_PLACE_BLOCK: BlockId = BlockId::Stone;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -118,8 +119,10 @@ struct WebApp {
     desired_chunks: HashSet<ChunkPos>,
     pending_generation: VecDeque<ChunkPos>,
     inflight_generation: HashSet<ChunkPos>,
+    dirty_generation: HashSet<ChunkPos>,
     movement_active: bool,
     mouse_captured: bool,
+    chunk_edits: HashMap<ChunkPos, HashMap<(u8, u8, u8), BlockId>>,
     mesh_result_rx: Receiver<MeshBuildResult>,
     workers: Vec<Worker>,
     next_worker_index: usize,
@@ -136,13 +139,7 @@ impl WebApp {
     ) -> Self {
         let terrain = TerrainGenerator::new(0xA66D_E601);
         let mut camera = Camera::default();
-        let spawn_x = 8_i64;
-        let spawn_z = 16_i64;
-        camera.position = Vec3::new(
-            spawn_x as f32 + 0.5,
-            terrain.surface_height(spawn_x, spawn_z) as f32 + 1.0 + PLAYER_EYE_HEIGHT,
-            spawn_z as f32 + 0.5,
-        );
+        camera.position = find_safe_spawn_position(&terrain);
         camera.on_ground = true;
         let current_chunk = chunk_from_world_position(camera.position);
         let desired_chunks = desired_chunk_set(current_chunk, WEB_RADIUS);
@@ -161,8 +158,10 @@ impl WebApp {
             desired_chunks,
             pending_generation,
             inflight_generation: HashSet::new(),
+            dirty_generation: HashSet::new(),
             movement_active: false,
             mouse_captured: false,
+            chunk_edits: HashMap::new(),
             mesh_result_rx,
             workers,
             next_worker_index: 0,
@@ -202,13 +201,33 @@ impl WebApp {
         self.camera.pitch = (self.camera.pitch - dy * 0.0025).clamp(-1.45, 1.45);
     }
 
-    fn handle_mouse_button(&mut self, _button: MouseButton) {
-        if self.mouse_captured {
-            return;
+    fn handle_mouse_button(&mut self, button: MouseButton) {
+        if !self.mouse_captured {
+            self.canvas.request_pointer_lock();
+            self.mouse_captured = pointer_is_locked(&self.canvas);
         }
 
-        self.canvas.request_pointer_lock();
-        self.mouse_captured = pointer_is_locked(&self.canvas);
+        let Some(hit) = self.raycast_world(6.0) else {
+            return;
+        };
+
+        match button {
+            MouseButton::Left => {
+                self.apply_local_block_edit(hit.block, BlockId::Air);
+            }
+            MouseButton::Right => {
+                let Some(place_at) = hit.previous_empty else {
+                    return;
+                };
+
+                if self.player_collides_with_world_pos(self.camera.position, place_at, WEB_PLACE_BLOCK) {
+                    return;
+                }
+
+                self.apply_local_block_edit(place_at, WEB_PLACE_BLOCK);
+            }
+            _ => {}
+        }
     }
 
     fn tick(&mut self) {
@@ -287,6 +306,10 @@ impl WebApp {
                     .insert(result.position, result.heights.clone());
                 chunk_meshes.insert(result.position, renderer.create_mesh(&result.vertices, &result.indices));
             }
+
+            if self.dirty_generation.remove(&result.position) {
+                self.pending_generation.push_front(result.position);
+            }
         }
 
         self.reprioritize_pending_generation(chunk_meshes);
@@ -302,7 +325,8 @@ impl WebApp {
             }
 
             let worker_index = self.next_worker_index % self.workers.len();
-            dispatch_mesh_job(&self.workers[worker_index], position);
+            let edits = self.chunk_edits.get(&position);
+            dispatch_mesh_job(&self.workers[worker_index], position, edits);
             self.next_worker_index = (self.next_worker_index + 1) % self.workers.len();
             self.inflight_generation.insert(position);
         }
@@ -331,9 +355,13 @@ impl WebApp {
         chunk_meshes.retain(|position, _| self.desired_chunks.contains(position));
         self.collision_heightmaps
             .retain(|position, _| self.desired_chunks.contains(position));
+        self.chunk_edits
+            .retain(|position, _| self.desired_chunks.contains(position));
         self.pending_generation
             .retain(|position| self.desired_chunks.contains(position));
         self.inflight_generation
+            .retain(|position| self.desired_chunks.contains(position));
+        self.dirty_generation
             .retain(|position| self.desired_chunks.contains(position));
     }
 
@@ -496,6 +524,15 @@ impl WebApp {
             z: z.rem_euclid(CHUNK_DEPTH) as u8,
         };
 
+        if let Some(block) = self
+            .chunk_edits
+            .get(&chunk_pos)
+            .and_then(|edits| edits.get(&(local.x, local.y, local.z)))
+            .copied()
+        {
+            return block_is_solid(block);
+        }
+
         if let Some(heights) = self.collision_heightmaps.get(&chunk_pos) {
             let surface = heights[usize::from(local.z) * CHUNK_WIDTH as usize + usize::from(local.x)] as i32;
             return y <= surface;
@@ -514,6 +551,99 @@ impl WebApp {
                 | BlockId::Lantern
                 | BlockId::Storage
         )
+    }
+
+    fn player_collides_with_world_pos(&mut self, eye_position: Vec3, position: WorldPos, block: BlockId) -> bool {
+        let min = Vec3::new(
+            eye_position.x - PLAYER_RADIUS,
+            eye_position.y - PLAYER_EYE_HEIGHT,
+            eye_position.z - PLAYER_RADIUS,
+        );
+        let max = Vec3::new(
+            eye_position.x + PLAYER_RADIUS,
+            eye_position.y + (PLAYER_HEIGHT - PLAYER_EYE_HEIGHT),
+            eye_position.z + PLAYER_RADIUS,
+        );
+
+        let min_x = min.x.floor() as i32;
+        let max_x = (max.x - 0.001).floor() as i32;
+        let min_y = min.y.floor() as i32;
+        let max_y = (max.y - 0.001).floor() as i32;
+        let min_z = min.z.floor() as i32;
+        let max_z = (max.z - 0.001).floor() as i32;
+
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                for x in min_x..=max_x {
+                    if i64::from(x) == position.x && y == position.y && i64::from(z) == position.z {
+                        if block_is_solid(block) {
+                            return true;
+                        }
+                        continue;
+                    }
+
+                    if self.world_block_is_solid(x, y, z) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    fn raycast_world(&mut self, max_distance: f32) -> Option<RaycastHit> {
+        let direction = self.camera.forward().normalize_or_zero();
+        if direction == Vec3::ZERO {
+            return None;
+        }
+
+        let step = 0.1;
+        let steps = (max_distance / step).ceil() as usize;
+        let mut previous_empty = None;
+
+        for index in 1..=steps {
+            let sample = self.camera.position + direction * (index as f32 * step);
+            let world = WorldPos {
+                x: sample.x.floor() as i64,
+                y: sample.y.floor() as i32,
+                z: sample.z.floor() as i64,
+            };
+
+            if self.world_block_is_solid(world.x as i32, world.y, world.z as i32) {
+                return Some(RaycastHit {
+                    block: world,
+                    previous_empty,
+                });
+            }
+
+            previous_empty = Some(world);
+        }
+
+        None
+    }
+
+    fn apply_local_block_edit(&mut self, position: WorldPos, block: BlockId) {
+        let Ok((chunk_pos, local)) = position.to_chunk_local() else {
+            return;
+        };
+
+        self.chunk_edits
+            .entry(chunk_pos)
+            .or_default()
+            .insert((local.x, local.y, local.z), block);
+        self.schedule_chunk_rebuild(chunk_pos);
+    }
+
+    fn schedule_chunk_rebuild(&mut self, position: ChunkPos) {
+        if self.inflight_generation.contains(&position) {
+            self.dirty_generation.insert(position);
+            return;
+        }
+
+        if !self.pending_generation.contains(&position) {
+            self.pending_generation.push_front(position);
+        }
     }
 }
 
@@ -569,6 +699,108 @@ fn pointer_is_locked(canvas: &HtmlCanvasElement) -> bool {
         .and_then(|element| element.dyn_into::<HtmlCanvasElement>().ok())
         .map(|locked| locked == *canvas)
         .unwrap_or(false)
+}
+
+fn find_safe_spawn_position(terrain: &TerrainGenerator) -> Vec3 {
+    let mut chunks = HashMap::<ChunkPos, ChunkData>::new();
+
+    for radius in 0_i32..=8 {
+        for z in -radius..=radius {
+            for x in -radius..=radius {
+                if radius > 0 && x.abs().max(z.abs()) != radius {
+                    continue;
+                }
+
+                let world_x = i64::from(x * 2);
+                let world_z = i64::from(z * 2);
+                let surface = terrain.surface_height(world_x, world_z);
+                let candidate = Vec3::new(
+                    world_x as f32 + 0.5,
+                    surface as f32 + 1.0 + PLAYER_EYE_HEIGHT,
+                    world_z as f32 + 0.5,
+                );
+
+                if !generated_player_collides(terrain, &mut chunks, candidate) {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    Vec3::new(0.5, terrain.surface_height(0, 0) as f32 + 3.0 + PLAYER_EYE_HEIGHT, 0.5)
+}
+
+fn generated_player_collides(
+    terrain: &TerrainGenerator,
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
+    eye_position: Vec3,
+) -> bool {
+    let min = Vec3::new(
+        eye_position.x - PLAYER_RADIUS,
+        eye_position.y - PLAYER_EYE_HEIGHT,
+        eye_position.z - PLAYER_RADIUS,
+    );
+    let max = Vec3::new(
+        eye_position.x + PLAYER_RADIUS,
+        eye_position.y + (PLAYER_HEIGHT - PLAYER_EYE_HEIGHT),
+        eye_position.z + PLAYER_RADIUS,
+    );
+
+    let min_x = min.x.floor() as i32;
+    let max_x = (max.x - 0.001).floor() as i32;
+    let min_y = min.y.floor() as i32;
+    let max_y = (max.y - 0.001).floor() as i32;
+    let min_z = min.z.floor() as i32;
+    let max_z = (max.z - 0.001).floor() as i32;
+
+    for y in min_y..=max_y {
+        for z in min_z..=max_z {
+            for x in min_x..=max_x {
+                if generated_world_block_is_solid(terrain, chunks, x, y, z) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn generated_world_block_is_solid(
+    terrain: &TerrainGenerator,
+    chunks: &mut HashMap<ChunkPos, ChunkData>,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    if y < 0 {
+        return true;
+    }
+    if y >= CHUNK_HEIGHT {
+        return false;
+    }
+
+    let world = WorldPos {
+        x: i64::from(x),
+        y,
+        z: i64::from(z),
+    };
+    let chunk_pos = ChunkPos::from_world(world);
+    let local = LocalVoxelPos {
+        x: x.rem_euclid(CHUNK_WIDTH) as u8,
+        y: y as u8,
+        z: z.rem_euclid(CHUNK_DEPTH) as u8,
+    };
+
+    if !chunks.contains_key(&chunk_pos) {
+        chunks.insert(chunk_pos, terrain.generate_chunk(chunk_pos));
+    }
+
+    let Some(chunk) = chunks.get(&chunk_pos) else {
+        return false;
+    };
+
+    block_is_solid(chunk.voxel(local).block)
 }
 
 fn start_mesh_worker_pool(
@@ -649,11 +881,27 @@ fn start_mesh_worker_pool(
     Ok((rx, workers, onmessages))
 }
 
-fn dispatch_mesh_job(worker: &Worker, position: ChunkPos) {
+fn dispatch_mesh_job(
+    worker: &Worker,
+    position: ChunkPos,
+    edits: Option<&HashMap<(u8, u8, u8), BlockId>>,
+) {
     let job = js_sys::Object::new();
     let _ = js_sys::Reflect::set(&job, &JsValue::from_str("kind"), &JsValue::from_str("build"));
     let _ = js_sys::Reflect::set(&job, &JsValue::from_str("x"), &JsValue::from_f64(f64::from(position.x)));
     let _ = js_sys::Reflect::set(&job, &JsValue::from_str("z"), &JsValue::from_f64(f64::from(position.z)));
+    let edits_array = js_sys::Array::new();
+    if let Some(edits) = edits {
+        for (&(x, y, z), &block) in edits {
+            let edit = js_sys::Array::new();
+            edit.push(&JsValue::from_f64(f64::from(x)));
+            edit.push(&JsValue::from_f64(f64::from(y)));
+            edit.push(&JsValue::from_f64(f64::from(z)));
+            edit.push(&JsValue::from_f64(block as u16 as f64));
+            edits_array.push(&edit);
+        }
+    }
+    let _ = js_sys::Reflect::set(&job, &JsValue::from_str("edits"), &edits_array);
     let _ = worker.post_message(&job);
 }
 
@@ -740,4 +988,24 @@ struct MeshBuildResult {
     indices: Vec<u32>,
     heights: Vec<u16>,
     failed: bool,
+}
+
+struct RaycastHit {
+    block: WorldPos,
+    previous_empty: Option<WorldPos>,
+}
+
+fn block_is_solid(block: BlockId) -> bool {
+    matches!(
+        block,
+        BlockId::Grass
+            | BlockId::Dirt
+            | BlockId::Stone
+            | BlockId::Sand
+            | BlockId::Log
+            | BlockId::Planks
+            | BlockId::Glass
+            | BlockId::Lantern
+            | BlockId::Storage
+    )
 }

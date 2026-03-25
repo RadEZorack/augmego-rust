@@ -12,7 +12,7 @@ self.onmessage = (event) => {
   const { x, z } = data;
 
   try {
-    const mesh = buildChunkMesh(x, z);
+    const mesh = buildChunkMesh(x, z, Array.isArray(data.edits) ? data.edits : []);
     self.postMessage(
       {
         kind: "mesh",
@@ -34,8 +34,9 @@ self.onmessage = (event) => {
   }
 };
 
-function buildChunkMesh(chunkX, chunkZ) {
+function buildChunkMesh(chunkX, chunkZ, edits) {
   const { voxels, heights } = generateChunk(chunkX, chunkZ);
+  applyEdits(voxels, heights, edits);
   const vertices = [];
   const indices = [];
   const originX = chunkX * CHUNK_WIDTH;
@@ -98,6 +99,39 @@ function generateChunk(chunkX, chunkZ) {
   }
 
   return { voxels, heights };
+}
+
+function applyEdits(voxels, heights, edits) {
+  for (const edit of edits) {
+    if (!Array.isArray(edit) || edit.length !== 4) {
+      continue;
+    }
+
+    const [x, y, z, block] = edit;
+    if (x < 0 || x >= CHUNK_WIDTH || y < 0 || y >= CHUNK_HEIGHT || z < 0 || z >= CHUNK_DEPTH) {
+      continue;
+    }
+
+    voxels[linearIndex(x, y, z)] = block;
+  }
+
+  recomputeHeights(voxels, heights);
+}
+
+function recomputeHeights(voxels, heights) {
+  for (let z = 0; z < CHUNK_DEPTH; z++) {
+    for (let x = 0; x < CHUNK_WIDTH; x++) {
+      let surface = 0;
+      for (let y = CHUNK_HEIGHT - 1; y >= 0; y--) {
+        const block = voxels[linearIndex(x, y, z)];
+        if (block !== 0) {
+          surface = y;
+          break;
+        }
+      }
+      heights[z * CHUNK_WIDTH + x] = surface;
+    }
+  }
 }
 
 function biomeAt(x, z) {

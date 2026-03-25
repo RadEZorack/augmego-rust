@@ -1268,17 +1268,20 @@ fn emit_block_faces(
 ) {
     let base_color = [1.0, 1.0, 1.0];
     let neighbors = [
-        ((0, 0, -1), face_vertices(world, Face::North, base_color, tile_uvs(block, Face::North))),
-        ((0, 0, 1), face_vertices(world, Face::South, base_color, tile_uvs(block, Face::South))),
-        ((-1, 0, 0), face_vertices(world, Face::West, base_color, tile_uvs(block, Face::West))),
-        ((1, 0, 0), face_vertices(world, Face::East, base_color, tile_uvs(block, Face::East))),
-        ((0, 1, 0), face_vertices(world, Face::Up, brighten(base_color, 0.08), tile_uvs(block, Face::Up))),
-        ((0, -1, 0), face_vertices(world, Face::Down, darken(base_color, 0.16), tile_uvs(block, Face::Down))),
+        ((0, 0, -1), Face::North),
+        ((0, 0, 1), Face::South),
+        ((-1, 0, 0), Face::West),
+        ((1, 0, 0), Face::East),
+        ((0, 1, 0), Face::Up),
+        ((0, -1, 0), Face::Down),
     ];
 
     for (offset, face) in neighbors {
         let neighbor = sample_voxel(chunk, x + offset.0, y + offset.1, z + offset.2);
         if neighbor.map(|voxel| voxel.block.is_transparent()).unwrap_or(true) {
+            let shadow = skylight_shadow(chunk, x + offset.0, y.max(0), z + offset.2);
+            let color = shaded_face_color(base_color, face, shadow);
+            let face = face_vertices(world, face, color, tile_uvs(block, face));
             let base = vertices.len() as u32;
             vertices.extend(face);
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -1296,6 +1299,47 @@ fn sample_voxel(chunk: &ChunkData, x: i32, y: i32, z: i32) -> Option<shared_worl
         y: y as u8,
         z: z as u8,
     }))
+}
+
+fn skylight_shadow(chunk: &ChunkData, x: i32, y: i32, z: i32) -> f32 {
+    if !(0..CHUNK_WIDTH).contains(&x) || !(0..CHUNK_DEPTH).contains(&z) {
+        return 1.0;
+    }
+
+    let mut light = 1.0_f32;
+    for yy in (y + 1).max(0)..CHUNK_HEIGHT {
+        let Some(voxel) = sample_voxel(chunk, x, yy, z) else {
+            break;
+        };
+
+        light *= match voxel.block {
+            BlockId::Air => 1.0,
+            BlockId::Glass | BlockId::Water => 0.96,
+            BlockId::Leaves => 0.72,
+            _ => 0.52,
+        };
+
+        if light <= 0.35 || !matches!(voxel.block, BlockId::Air | BlockId::Glass | BlockId::Water | BlockId::Leaves) {
+            break;
+        }
+    }
+
+    light.clamp(0.35, 1.0)
+}
+
+fn shaded_face_color(base: [f32; 3], face: Face, shadow: f32) -> [f32; 3] {
+    let directional = match face {
+        Face::Up => brighten(base, 0.08),
+        Face::Down => darken(base, 0.22),
+        Face::North | Face::South => darken(base, 0.08),
+        Face::East | Face::West => darken(base, 0.02),
+    };
+
+    [
+        directional[0] * shadow,
+        directional[1] * shadow,
+        directional[2] * shadow,
+    ]
 }
 
 #[derive(Clone, Copy)]

@@ -182,19 +182,22 @@ function placeTree(voxels, x, y, z) {
 function emitBlockFaces(voxels, vertices, indices, world, x, y, z, block) {
   const baseColor = [1, 1, 1];
   const faces = [
-    { offset: [0, 0, -1], vertices: faceVertices(world, "north", baseColor, tileUvs(block, "north")) },
-    { offset: [0, 0, 1], vertices: faceVertices(world, "south", baseColor, tileUvs(block, "south")) },
-    { offset: [-1, 0, 0], vertices: faceVertices(world, "west", baseColor, tileUvs(block, "west")) },
-    { offset: [1, 0, 0], vertices: faceVertices(world, "east", baseColor, tileUvs(block, "east")) },
-    { offset: [0, 1, 0], vertices: faceVertices(world, "up", brighten(baseColor, 0.08), tileUvs(block, "up")) },
-    { offset: [0, -1, 0], vertices: faceVertices(world, "down", darken(baseColor, 0.16), tileUvs(block, "down")) },
+    { offset: [0, 0, -1], face: "north" },
+    { offset: [0, 0, 1], face: "south" },
+    { offset: [-1, 0, 0], face: "west" },
+    { offset: [1, 0, 0], face: "east" },
+    { offset: [0, 1, 0], face: "up" },
+    { offset: [0, -1, 0], face: "down" },
   ];
 
   for (const face of faces) {
     const neighbor = sampleVoxel(voxels, x + face.offset[0], y + face.offset[1], z + face.offset[2]);
     if (neighbor === null || isTransparent(neighbor)) {
+      const shadow = skylightShadow(voxels, x + face.offset[0], y, z + face.offset[2]);
+      const color = shadedFaceColor(baseColor, face.face, shadow);
+      const faceVerticesData = faceVertices(world, face.face, color, tileUvs(block, face.face));
       const base = vertices.length / 11;
-      vertices.push(...face.vertices.flat());
+      vertices.push(...faceVerticesData.flat());
       indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
     }
   }
@@ -209,6 +212,58 @@ function sampleVoxel(voxels, x, y, z) {
 
 function isTransparent(block) {
   return block === 0 || block === 5 || block === 7 || block === 9;
+}
+
+function skylightShadow(voxels, x, y, z) {
+  if (x < 0 || x >= CHUNK_WIDTH || z < 0 || z >= CHUNK_DEPTH) {
+    return 1;
+  }
+
+  let light = 1;
+  for (let yy = Math.max(y + 1, 0); yy < CHUNK_HEIGHT; yy++) {
+    const block = sampleVoxel(voxels, x, yy, z);
+    if (block === null) {
+      break;
+    }
+
+    if (block === 0) {
+      continue;
+    }
+    if (block === 9 || block === 5) {
+      light *= 0.96;
+    } else if (block === 7) {
+      light *= 0.72;
+    } else {
+      light *= 0.52;
+    }
+
+    if (light <= 0.35 || !(block === 7 || block === 9 || block === 5)) {
+      break;
+    }
+  }
+
+  return Math.max(0.35, Math.min(1, light));
+}
+
+function shadedFaceColor(base, face, shadow) {
+  let directional;
+  switch (face) {
+    case "up":
+      directional = brighten(base, 0.08);
+      break;
+    case "down":
+      directional = darken(base, 0.22);
+      break;
+    case "north":
+    case "south":
+      directional = darken(base, 0.08);
+      break;
+    default:
+      directional = darken(base, 0.02);
+      break;
+  }
+
+  return directional.map((value) => value * shadow);
 }
 
 function faceVertices(origin, face, color, uvs) {

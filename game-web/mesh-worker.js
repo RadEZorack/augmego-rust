@@ -193,7 +193,7 @@ function emitBlockFaces(voxels, vertices, indices, world, x, y, z, block) {
   for (const face of faces) {
     const neighbor = sampleVoxel(voxels, x + face.offset[0], y + face.offset[1], z + face.offset[2]);
     if (neighbor === null || isTransparent(neighbor)) {
-      const base = vertices.length / 8;
+      const base = vertices.length / 11;
       vertices.push(...face.vertices.flat());
       indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
     }
@@ -213,7 +213,8 @@ function isTransparent(block) {
 
 function faceVertices(origin, face, color, uvs) {
   const [x, y, z] = origin;
-  const make = (px, py, pz, uv) => [px, py, pz, color[0], color[1], color[2], uv[0], uv[1]];
+  const normal = faceNormal(face);
+  const make = (px, py, pz, uv) => [px, py, pz, color[0], color[1], color[2], normal[0], normal[1], normal[2], uv[0], uv[1]];
   switch (face) {
     case "north":
       return [make(x, y + 1, z, uvs[0]), make(x + 1, y + 1, z, uvs[1]), make(x + 1, y, z, uvs[2]), make(x, y, z, uvs[3])];
@@ -227,6 +228,23 @@ function faceVertices(origin, face, color, uvs) {
       return [make(x, y + 1, z, uvs[0]), make(x, y + 1, z + 1, uvs[1]), make(x + 1, y + 1, z + 1, uvs[2]), make(x + 1, y + 1, z, uvs[3])];
     default:
       return [make(x, y, z, uvs[0]), make(x + 1, y, z, uvs[1]), make(x + 1, y, z + 1, uvs[2]), make(x, y, z + 1, uvs[3])];
+  }
+}
+
+function faceNormal(face) {
+  switch (face) {
+    case "north":
+      return [0, 0, -1];
+    case "south":
+      return [0, 0, 1];
+    case "east":
+      return [1, 0, 0];
+    case "west":
+      return [-1, 0, 0];
+    case "up":
+      return [0, 1, 0];
+    default:
+      return [0, -1, 0];
   }
 }
 

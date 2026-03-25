@@ -401,11 +401,12 @@ fn start_mesh_worker_pool(
             let vertex_floats = js_sys::Float32Array::new(&vertices_value).to_vec();
             let indices = js_sys::Uint32Array::new(&indices_value).to_vec();
             let vertices = vertex_floats
-                .chunks_exact(8)
+                .chunks_exact(11)
                 .map(|values| Vertex {
                     position: [values[0], values[1], values[2]],
                     color: [values[3], values[4], values[5]],
-                    uv: [values[6], values[7]],
+                    normal: [values[6], values[7], values[8]],
+                    uv: [values[9], values[10]],
                 })
                 .collect::<Vec<_>>();
 

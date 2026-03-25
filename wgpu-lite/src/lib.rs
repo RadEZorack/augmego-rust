@@ -10,6 +10,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 pub struct Vertex {
     pub position: [f32; 3],
     pub color: [f32; 3],
+    pub normal: [f32; 3],
     pub uv: [f32; 2],
 }
 
@@ -32,6 +33,11 @@ impl Vertex {
                 wgpu::VertexAttribute {
                     offset: mem::size_of::<[f32; 6]>() as u64,
                     shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 9]>() as u64,
+                    shader_location: 3,
                     format: wgpu::VertexFormat::Float32x2,
                 },
             ],

@@ -1007,11 +1007,15 @@ fn add_face_indices(
     color: [f32; 3],
     uvs: [[f32; 2]; 4],
 ) {
+    let edge_a = positions[1] - positions[0];
+    let edge_b = positions[2] - positions[0];
+    let normal = edge_a.cross(edge_b).normalize_or_zero().to_array();
     let base = vertices.len() as u32;
     for (position, uv) in positions.into_iter().zip(uvs) {
         vertices.push(Vertex {
             position: position.to_array(),
             color,
+            normal,
             uv,
         });
     }
@@ -1306,51 +1310,64 @@ enum Face {
 
 fn face_vertices(origin: [f32; 3], face: Face, color: [f32; 3], uvs: [[f32; 2]; 4]) -> [Vertex; 4] {
     let [x, y, z] = origin;
+    let normal = face_normal(face);
     match face {
         Face::North => [
-            v(x, y + 1.0, z, color, uvs[0]),
-            v(x + 1.0, y + 1.0, z, color, uvs[1]),
-            v(x + 1.0, y, z, color, uvs[2]),
-            v(x, y, z, color, uvs[3]),
+            v(x, y + 1.0, z, color, normal, uvs[0]),
+            v(x + 1.0, y + 1.0, z, color, normal, uvs[1]),
+            v(x + 1.0, y, z, color, normal, uvs[2]),
+            v(x, y, z, color, normal, uvs[3]),
         ],
         Face::South => [
-            v(x + 1.0, y + 1.0, z + 1.0, color, uvs[0]),
-            v(x, y + 1.0, z + 1.0, color, uvs[1]),
-            v(x, y, z + 1.0, color, uvs[2]),
-            v(x + 1.0, y, z + 1.0, color, uvs[3]),
+            v(x + 1.0, y + 1.0, z + 1.0, color, normal, uvs[0]),
+            v(x, y + 1.0, z + 1.0, color, normal, uvs[1]),
+            v(x, y, z + 1.0, color, normal, uvs[2]),
+            v(x + 1.0, y, z + 1.0, color, normal, uvs[3]),
         ],
         Face::East => [
-            v(x + 1.0, y + 1.0, z, color, uvs[0]),
-            v(x + 1.0, y + 1.0, z + 1.0, color, uvs[1]),
-            v(x + 1.0, y, z + 1.0, color, uvs[2]),
-            v(x + 1.0, y, z, color, uvs[3]),
+            v(x + 1.0, y + 1.0, z, color, normal, uvs[0]),
+            v(x + 1.0, y + 1.0, z + 1.0, color, normal, uvs[1]),
+            v(x + 1.0, y, z + 1.0, color, normal, uvs[2]),
+            v(x + 1.0, y, z, color, normal, uvs[3]),
         ],
         Face::West => [
-            v(x, y + 1.0, z + 1.0, color, uvs[0]),
-            v(x, y + 1.0, z, color, uvs[1]),
-            v(x, y, z, color, uvs[2]),
-            v(x, y, z + 1.0, color, uvs[3]),
+            v(x, y + 1.0, z + 1.0, color, normal, uvs[0]),
+            v(x, y + 1.0, z, color, normal, uvs[1]),
+            v(x, y, z, color, normal, uvs[2]),
+            v(x, y, z + 1.0, color, normal, uvs[3]),
         ],
         Face::Up => [
-            v(x, y + 1.0, z, color, uvs[0]),
-            v(x, y + 1.0, z + 1.0, color, uvs[1]),
-            v(x + 1.0, y + 1.0, z + 1.0, color, uvs[2]),
-            v(x + 1.0, y + 1.0, z, color, uvs[3]),
+            v(x, y + 1.0, z, color, normal, uvs[0]),
+            v(x, y + 1.0, z + 1.0, color, normal, uvs[1]),
+            v(x + 1.0, y + 1.0, z + 1.0, color, normal, uvs[2]),
+            v(x + 1.0, y + 1.0, z, color, normal, uvs[3]),
         ],
         Face::Down => [
-            v(x, y, z, color, uvs[0]),
-            v(x + 1.0, y, z, color, uvs[1]),
-            v(x + 1.0, y, z + 1.0, color, uvs[2]),
-            v(x, y, z + 1.0, color, uvs[3]),
+            v(x, y, z, color, normal, uvs[0]),
+            v(x + 1.0, y, z, color, normal, uvs[1]),
+            v(x + 1.0, y, z + 1.0, color, normal, uvs[2]),
+            v(x, y, z + 1.0, color, normal, uvs[3]),
         ],
     }
 }
 
-fn v(x: f32, y: f32, z: f32, color: [f32; 3], uv: [f32; 2]) -> Vertex {
+fn v(x: f32, y: f32, z: f32, color: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> Vertex {
     Vertex {
         position: [x, y, z],
         color,
+        normal,
         uv,
+    }
+}
+
+fn face_normal(face: Face) -> [f32; 3] {
+    match face {
+        Face::North => [0.0, 0.0, -1.0],
+        Face::South => [0.0, 0.0, 1.0],
+        Face::East => [1.0, 0.0, 0.0],
+        Face::West => [-1.0, 0.0, 0.0],
+        Face::Up => [0.0, 1.0, 0.0],
+        Face::Down => [0.0, -1.0, 0.0],
     }
 }
 

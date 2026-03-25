@@ -37,6 +37,10 @@ const PLAYER_GRAVITY: f32 = 28.0;
 const STEP_HEIGHT: f32 = 0.6;
 const COLLISION_STEP: f32 = 0.2;
 const WEB_PLACE_BLOCK: BlockId = BlockId::Stone;
+const CROSSHAIR_DISTANCE: f32 = 0.6;
+const CROSSHAIR_LENGTH: f32 = 0.035;
+const CROSSHAIR_THICKNESS: f32 = 0.004;
+const TARGET_OUTLINE_THICKNESS: f32 = 0.035;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -87,8 +91,16 @@ async fn run() -> Result<()> {
                         .iter()
                         .filter_map(|(position, mesh)| app.chunk_is_visible(*position).then_some(mesh))
                         .collect::<Vec<_>>();
+                    let mut overlay_meshes = Vec::new();
+                    if let Some(mesh) = app.build_crosshair_mesh(&renderer) {
+                        overlay_meshes.push(mesh);
+                    }
+                    if let Some(mesh) = app.build_target_highlight_mesh(&renderer) {
+                        overlay_meshes.push(mesh);
+                    }
+                    let overlay_refs = overlay_meshes.iter().collect::<Vec<_>>();
 
-                    if let Err(error) = renderer.render(&visible_meshes, &[]) {
+                    if let Err(error) = renderer.render(&visible_meshes, &overlay_refs) {
                         panic!("{error:?}");
                     }
                 }
@@ -110,8 +122,7 @@ async fn run() -> Result<()> {
 struct WebApp {
     canvas: HtmlCanvasElement,
     camera: Camera,
-    terrain: TerrainGenerator,
-    collision_heightmaps: HashMap<ChunkPos, Vec<u16>>,
+    collision_voxels: HashMap<ChunkPos, Vec<u16>>,
     pressed: HashSet<KeyCode>,
     last_tick: Instant,
     size: PhysicalSize<u32>,
@@ -122,6 +133,7 @@ struct WebApp {
     dirty_generation: HashSet<ChunkPos>,
     movement_active: bool,
     mouse_captured: bool,
+    spawn_settled: bool,
     chunk_edits: HashMap<ChunkPos, HashMap<(u8, u8, u8), BlockId>>,
     mesh_result_rx: Receiver<MeshBuildResult>,
     workers: Vec<Worker>,
@@ -149,8 +161,7 @@ impl WebApp {
         Self {
             canvas,
             camera,
-            terrain,
-            collision_heightmaps: HashMap::new(),
+            collision_voxels: HashMap::new(),
             pressed: HashSet::new(),
             last_tick: Instant::now(),
             size,
@@ -161,6 +172,7 @@ impl WebApp {
             dirty_generation: HashSet::new(),
             movement_active: false,
             mouse_captured: false,
+            spawn_settled: false,
             chunk_edits: HashMap::new(),
             mesh_result_rx,
             workers,
@@ -236,6 +248,10 @@ impl WebApp {
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
 
+        if !self.spawn_settled && self.ensure_clear_spawn_space() {
+            self.spawn_settled = true;
+        }
+
         let mut movement = Vec3::ZERO;
         if self.pressed.contains(&KeyCode::KeyW) {
             movement.z -= 1.0;
@@ -259,6 +275,65 @@ impl WebApp {
     fn camera_matrix(&self) -> Mat4 {
         let aspect = self.size.width as f32 / self.size.height.max(1) as f32;
         self.camera.matrix(aspect)
+    }
+
+    fn current_target(&mut self) -> Option<RaycastHit> {
+        self.raycast_world(6.0)
+    }
+
+    fn build_crosshair_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
+        if !self.mouse_captured {
+            return None;
+        }
+
+        let forward = self.camera.forward();
+        let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+        let center = self.camera.position + forward * CROSSHAIR_DISTANCE;
+
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        add_box_oriented(
+            &mut vertices,
+            &mut indices,
+            center,
+            right * CROSSHAIR_LENGTH,
+            up * CROSSHAIR_THICKNESS,
+            forward * CROSSHAIR_THICKNESS,
+            [1.0, 1.0, 1.0],
+            (3, 1),
+        );
+        add_box_oriented(
+            &mut vertices,
+            &mut indices,
+            center,
+            right * CROSSHAIR_THICKNESS,
+            up * CROSSHAIR_LENGTH,
+            forward * CROSSHAIR_THICKNESS,
+            [1.0, 1.0, 1.0],
+            (3, 1),
+        );
+
+        Some(renderer.create_mesh(&vertices, &indices))
+    }
+
+    fn build_target_highlight_mesh(&mut self, renderer: &Renderer<'_>) -> Option<Mesh> {
+        let target = self.current_target()?;
+        let min = Vec3::new(target.block.x as f32, target.block.y as f32, target.block.z as f32)
+            - Vec3::splat(TARGET_OUTLINE_THICKNESS * 0.5);
+        let max = min + Vec3::splat(1.0 + TARGET_OUTLINE_THICKNESS);
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        add_wire_box(
+            &mut vertices,
+            &mut indices,
+            min,
+            max,
+            TARGET_OUTLINE_THICKNESS,
+            [1.0, 0.95, 0.45],
+            (3, 1),
+        );
+        Some(renderer.create_mesh(&vertices, &indices))
     }
 
     fn chunk_is_visible(&self, position: ChunkPos) -> bool {
@@ -302,8 +377,8 @@ impl WebApp {
             }
 
             if self.desired_chunks.contains(&result.position) {
-                self.collision_heightmaps
-                    .insert(result.position, result.heights.clone());
+                self.collision_voxels
+                    .insert(result.position, result.voxels.clone());
                 chunk_meshes.insert(result.position, renderer.create_mesh(&result.vertices, &result.indices));
             }
 
@@ -353,7 +428,7 @@ impl WebApp {
         self.current_chunk = next_chunk;
         self.desired_chunks = desired_chunk_set(self.current_chunk, WEB_RADIUS);
         chunk_meshes.retain(|position, _| self.desired_chunks.contains(position));
-        self.collision_heightmaps
+        self.collision_voxels
             .retain(|position, _| self.desired_chunks.contains(position));
         self.chunk_edits
             .retain(|position, _| self.desired_chunks.contains(position));
@@ -533,24 +608,18 @@ impl WebApp {
             return block_is_solid(block);
         }
 
-        if let Some(heights) = self.collision_heightmaps.get(&chunk_pos) {
-            let surface = heights[usize::from(local.z) * CHUNK_WIDTH as usize + usize::from(local.x)] as i32;
-            return y <= surface;
+        if let Some(voxels) = self.collision_voxels.get(&chunk_pos) {
+            let index = usize::from(local.y) * CHUNK_WIDTH as usize * CHUNK_DEPTH as usize
+                + usize::from(local.z) * CHUNK_WIDTH as usize
+                + usize::from(local.x);
+            return voxels
+                .get(index)
+                .copied()
+                .map(|block| block_is_solid(block_from_id(block)))
+                .unwrap_or(false);
         }
 
-        let chunk = self.terrain.generate_chunk(chunk_pos);
-        matches!(
-            chunk.voxel(local).block,
-            BlockId::Grass
-                | BlockId::Dirt
-                | BlockId::Stone
-                | BlockId::Sand
-                | BlockId::Log
-                | BlockId::Planks
-                | BlockId::Glass
-                | BlockId::Lantern
-                | BlockId::Storage
-        )
+        false
     }
 
     fn player_collides_with_world_pos(&mut self, eye_position: Vec3, position: WorldPos, block: BlockId) -> bool {
@@ -645,6 +714,29 @@ impl WebApp {
             self.pending_generation.push_front(position);
         }
     }
+
+    fn ensure_clear_spawn_space(&mut self) -> bool {
+        if !self.collision_voxels.contains_key(&self.current_chunk) {
+            return false;
+        }
+
+        if !self.player_collides(self.camera.position) {
+            return true;
+        }
+
+        for lift in 1..=12 {
+            let mut candidate = self.camera.position;
+            candidate.y += lift as f32;
+            if !self.player_collides(candidate) {
+                self.camera.position = candidate;
+                self.camera.vertical_velocity = 0.0;
+                self.camera.on_ground = false;
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
 #[derive(Default)]
@@ -703,25 +795,37 @@ fn pointer_is_locked(canvas: &HtmlCanvasElement) -> bool {
 
 fn find_safe_spawn_position(terrain: &TerrainGenerator) -> Vec3 {
     let mut chunks = HashMap::<ChunkPos, ChunkData>::new();
+    let spawn_offsets = [
+        (0.5_f32, 0.5_f32),
+        (0.25_f32, 0.25_f32),
+        (0.75_f32, 0.25_f32),
+        (0.25_f32, 0.75_f32),
+        (0.75_f32, 0.75_f32),
+    ];
 
-    for radius in 0_i32..=8 {
+    for radius in 0_i32..=12 {
         for z in -radius..=radius {
             for x in -radius..=radius {
                 if radius > 0 && x.abs().max(z.abs()) != radius {
                     continue;
                 }
 
-                let world_x = i64::from(x * 2);
-                let world_z = i64::from(z * 2);
-                let surface = terrain.surface_height(world_x, world_z);
-                let candidate = Vec3::new(
-                    world_x as f32 + 0.5,
-                    surface as f32 + 1.0 + PLAYER_EYE_HEIGHT,
-                    world_z as f32 + 0.5,
-                );
+                for (offset_x, offset_z) in spawn_offsets {
+                    let sample_x = x as f32 + offset_x;
+                    let sample_z = z as f32 + offset_z;
+                    let surface = terrain.surface_height(sample_x.floor() as i64, sample_z.floor() as i64);
 
-                if !generated_player_collides(terrain, &mut chunks, candidate) {
-                    return candidate;
+                    for lift in 0..=12 {
+                        let candidate = Vec3::new(
+                            sample_x,
+                            surface as f32 + 1.0 + lift as f32 + PLAYER_EYE_HEIGHT,
+                            sample_z,
+                        );
+
+                        if !generated_player_collides(terrain, &mut chunks, candidate) {
+                            return candidate;
+                        }
+                    }
                 }
             }
         }
@@ -842,7 +946,7 @@ fn start_mesh_worker_pool(
                     position: ChunkPos { x, z },
                     vertices: Vec::new(),
                     indices: Vec::new(),
-                    heights: Vec::new(),
+                    voxels: Vec::new(),
                     failed: true,
                 });
                 return;
@@ -850,10 +954,10 @@ fn start_mesh_worker_pool(
 
             let vertices_value = js_sys::Reflect::get(&object, &JsValue::from_str("vertices")).unwrap();
             let indices_value = js_sys::Reflect::get(&object, &JsValue::from_str("indices")).unwrap();
-            let heights_value = js_sys::Reflect::get(&object, &JsValue::from_str("heights")).unwrap();
+            let voxels_value = js_sys::Reflect::get(&object, &JsValue::from_str("voxels")).unwrap();
             let vertex_floats = js_sys::Float32Array::new(&vertices_value).to_vec();
             let indices = js_sys::Uint32Array::new(&indices_value).to_vec();
-            let heights = js_sys::Uint16Array::new(&heights_value).to_vec();
+            let voxels = js_sys::Uint16Array::new(&voxels_value).to_vec();
             let vertices = vertex_floats
                 .chunks_exact(11)
                 .map(|values| Vertex {
@@ -868,7 +972,7 @@ fn start_mesh_worker_pool(
                 position: ChunkPos { x, z },
                 vertices,
                 indices,
-                heights,
+                voxels,
                 failed: false,
             });
         }) as Box<dyn FnMut(MessageEvent)>);
@@ -986,7 +1090,7 @@ struct MeshBuildResult {
     position: ChunkPos,
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
-    heights: Vec<u16>,
+    voxels: Vec<u16>,
     failed: bool,
 }
 
@@ -1008,4 +1112,153 @@ fn block_is_solid(block: BlockId) -> bool {
             | BlockId::Lantern
             | BlockId::Storage
     )
+}
+
+fn block_from_id(id: u16) -> BlockId {
+    match id {
+        1 => BlockId::Grass,
+        2 => BlockId::Dirt,
+        3 => BlockId::Stone,
+        4 => BlockId::Sand,
+        5 => BlockId::Water,
+        6 => BlockId::Log,
+        7 => BlockId::Leaves,
+        8 => BlockId::Planks,
+        9 => BlockId::Glass,
+        10 => BlockId::Lantern,
+        11 => BlockId::Storage,
+        _ => BlockId::Air,
+    }
+}
+
+fn add_wire_box(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    min: Vec3,
+    max: Vec3,
+    thickness: f32,
+    color: [f32; 3],
+    tile: (u32, u32),
+) {
+    let corners = [
+        Vec3::new(min.x, min.y, min.z),
+        Vec3::new(max.x, min.y, min.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(min.x, min.y, max.z),
+        Vec3::new(max.x, min.y, max.z),
+        Vec3::new(max.x, max.y, max.z),
+        Vec3::new(min.x, max.y, max.z),
+    ];
+    let edges = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+
+    for (start, end) in edges {
+        add_edge_prism(vertices, indices, corners[start], corners[end], thickness, color, tile);
+    }
+}
+
+fn add_edge_prism(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    start: Vec3,
+    end: Vec3,
+    thickness: f32,
+    color: [f32; 3],
+    tile: (u32, u32),
+) {
+    let delta = end - start;
+    let midpoint = (start + end) * 0.5;
+    let half = delta * 0.5;
+    let axis_x = if delta.x.abs() > 0.0 {
+        Vec3::new(half.x, 0.0, 0.0)
+    } else {
+        Vec3::new(thickness * 0.5, 0.0, 0.0)
+    };
+    let axis_y = if delta.y.abs() > 0.0 {
+        Vec3::new(0.0, half.y, 0.0)
+    } else {
+        Vec3::new(0.0, thickness * 0.5, 0.0)
+    };
+    let axis_z = if delta.z.abs() > 0.0 {
+        Vec3::new(0.0, 0.0, half.z)
+    } else {
+        Vec3::new(0.0, 0.0, thickness * 0.5)
+    };
+    add_box_oriented(vertices, indices, midpoint, axis_x, axis_y, axis_z, color, tile);
+}
+
+fn add_box_oriented(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: Vec3,
+    axis_x: Vec3,
+    axis_y: Vec3,
+    axis_z: Vec3,
+    color: [f32; 3],
+    tile: (u32, u32),
+) {
+    let corners = [
+        center - axis_x - axis_y - axis_z,
+        center + axis_x - axis_y - axis_z,
+        center + axis_x + axis_y - axis_z,
+        center - axis_x + axis_y - axis_z,
+        center - axis_x - axis_y + axis_z,
+        center + axis_x - axis_y + axis_z,
+        center + axis_x + axis_y + axis_z,
+        center - axis_x + axis_y + axis_z,
+    ];
+    let uvs = atlas_quad(tile);
+    add_face_indices(vertices, indices, [corners[3], corners[2], corners[1], corners[0]], color, uvs);
+    add_face_indices(vertices, indices, [corners[6], corners[7], corners[4], corners[5]], color, uvs);
+    add_face_indices(vertices, indices, [corners[2], corners[6], corners[5], corners[1]], color, uvs);
+    add_face_indices(vertices, indices, [corners[7], corners[3], corners[0], corners[4]], color, uvs);
+    add_face_indices(vertices, indices, [corners[7], corners[6], corners[2], corners[3]], color, uvs);
+    add_face_indices(vertices, indices, [corners[0], corners[1], corners[5], corners[4]], color, uvs);
+}
+
+fn add_face_indices(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    positions: [Vec3; 4],
+    color: [f32; 3],
+    uvs: [[f32; 2]; 4],
+) {
+    let edge_a = positions[1] - positions[0];
+    let edge_b = positions[2] - positions[0];
+    let normal = edge_a.cross(edge_b).normalize_or_zero().to_array();
+    let base = vertices.len() as u32;
+    for (position, uv) in positions.into_iter().zip(uvs) {
+        vertices.push(Vertex {
+            position: position.to_array(),
+            color,
+            normal,
+            uv,
+        });
+    }
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+fn atlas_quad(tile: (u32, u32)) -> [[f32; 2]; 4] {
+    const TILE_COUNT: f32 = 4.0;
+    const EPS: f32 = 0.001;
+
+    let min_u = tile.0 as f32 / TILE_COUNT + EPS;
+    let max_u = (tile.0 + 1) as f32 / TILE_COUNT - EPS;
+    let min_v = tile.1 as f32 / TILE_COUNT + EPS;
+    let max_v = (tile.1 + 1) as f32 / TILE_COUNT - EPS;
+
+    [[min_u, min_v], [max_u, min_v], [max_u, max_v], [min_u, max_v]]
 }

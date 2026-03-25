@@ -21,8 +21,9 @@ self.onmessage = (event) => {
         vertices: mesh.vertices.buffer,
         indices: mesh.indices.buffer,
         heights: mesh.heights.buffer,
+        voxels: mesh.voxels.buffer,
       },
-      [mesh.vertices.buffer, mesh.indices.buffer, mesh.heights.buffer],
+      [mesh.vertices.buffer, mesh.indices.buffer, mesh.heights.buffer, mesh.voxels.buffer],
     );
   } catch (error) {
     self.postMessage({
@@ -59,6 +60,7 @@ function buildChunkMesh(chunkX, chunkZ, edits) {
     vertices: new Float32Array(vertices),
     indices: new Uint32Array(indices),
     heights,
+    voxels,
   };
 }
 

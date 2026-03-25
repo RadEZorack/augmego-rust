@@ -196,6 +196,7 @@ pub struct Renderer<'a> {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
+    max_surface_extent: u32,
     pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
@@ -229,6 +230,9 @@ impl<'a> Renderer<'a> {
             )
             .await
             .context("request device")?;
+
+        let max_surface_extent = device.limits().max_texture_dimension_2d.max(1);
+        let size = clamp_surface_size(size, max_surface_extent);
 
         let capabilities = surface.get_capabilities(&adapter);
         let format = capabilities
@@ -380,6 +384,7 @@ impl<'a> Renderer<'a> {
             queue,
             config,
             size,
+            max_surface_extent,
             pipeline,
             overlay_pipeline,
             camera_buffer,
@@ -394,6 +399,7 @@ impl<'a> Renderer<'a> {
             return;
         }
 
+        let size = clamp_surface_size(size, self.max_surface_extent);
         self.size = size;
         self.config.width = size.width;
         self.config.height = size.height;
@@ -543,6 +549,10 @@ fn create_instance() -> wgpu::Instance {
     {
         wgpu::Instance::default()
     }
+}
+
+fn clamp_surface_size(size: PhysicalSize<u32>, max_extent: u32) -> PhysicalSize<u32> {
+    PhysicalSize::new(size.width.clamp(1, max_extent), size.height.clamp(1, max_extent))
 }
 
 fn fill_tile(pixels: &mut [u8], atlas_size: u32, tile_x: u32, tile_y: u32, base: [u8; 4]) {

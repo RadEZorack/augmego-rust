@@ -41,6 +41,12 @@ const CROSSHAIR_DISTANCE: f32 = 0.6;
 const CROSSHAIR_LENGTH: f32 = 0.035;
 const CROSSHAIR_THICKNESS: f32 = 0.004;
 const TARGET_OUTLINE_THICKNESS: f32 = 0.035;
+const LINK_PANEL_OPEN_URL: &str = "https://www.google.com";
+const LINK_PANEL_LABEL_URL: &str = "google.com";
+const LINK_PANEL_HALF_WIDTH: f32 = 1.2;
+const LINK_PANEL_HALF_HEIGHT: f32 = 0.75;
+const LINK_PANEL_HALF_DEPTH: f32 = 0.03;
+const LINK_PANEL_TILE: (u32, u32) = (0, 2);
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -91,6 +97,11 @@ async fn run() -> Result<()> {
                         .iter()
                         .filter_map(|(position, mesh)| app.chunk_is_visible(*position).then_some(mesh))
                         .collect::<Vec<_>>();
+                    let link_panel_mesh = app.build_link_panel_mesh(&renderer);
+                    let mut visible_mesh_refs = visible_meshes;
+                    if let Some(mesh) = &link_panel_mesh {
+                        visible_mesh_refs.push(mesh);
+                    }
                     let mut overlay_meshes = Vec::new();
                     if let Some(mesh) = app.build_crosshair_mesh(&renderer) {
                         overlay_meshes.push(mesh);
@@ -100,7 +111,7 @@ async fn run() -> Result<()> {
                     }
                     let overlay_refs = overlay_meshes.iter().collect::<Vec<_>>();
 
-                    if let Err(error) = renderer.render(&visible_meshes, &overlay_refs) {
+                    if let Err(error) = renderer.render(&visible_mesh_refs, &overlay_refs) {
                         panic!("{error:?}");
                     }
                 }
@@ -135,6 +146,7 @@ struct WebApp {
     mouse_captured: bool,
     spawn_settled: bool,
     chunk_edits: HashMap<ChunkPos, HashMap<(u8, u8, u8), BlockId>>,
+    link_panel: LinkPanel,
     mesh_result_rx: Receiver<MeshBuildResult>,
     workers: Vec<Worker>,
     next_worker_index: usize,
@@ -153,6 +165,7 @@ impl WebApp {
         let mut camera = Camera::default();
         camera.position = find_safe_spawn_position(&terrain);
         camera.on_ground = true;
+        let link_panel = LinkPanel::near_spawn(camera.position);
         let current_chunk = chunk_from_world_position(camera.position);
         let desired_chunks = desired_chunk_set(current_chunk, WEB_RADIUS);
         let pending_generation =
@@ -174,6 +187,7 @@ impl WebApp {
             mouse_captured: false,
             spawn_settled: false,
             chunk_edits: HashMap::new(),
+            link_panel,
             mesh_result_rx,
             workers,
             next_worker_index: 0,
@@ -219,26 +233,34 @@ impl WebApp {
             self.mouse_captured = pointer_is_locked(&self.canvas);
         }
 
-        let Some(hit) = self.raycast_world(6.0) else {
+        let Some(target) = self.current_interaction_target() else {
             return;
         };
 
-        match button {
-            MouseButton::Left => {
-                self.apply_local_block_edit(hit.block, BlockId::Air);
-            }
-            MouseButton::Right => {
-                let Some(place_at) = hit.previous_empty else {
-                    return;
-                };
-
-                if self.player_collides_with_world_pos(self.camera.position, place_at, WEB_PLACE_BLOCK) {
-                    return;
+        match target {
+            InteractionTarget::Link if button == MouseButton::Left => {
+                if confirm_open_url(LINK_PANEL_LABEL_URL) {
+                    open_url(LINK_PANEL_OPEN_URL);
                 }
-
-                self.apply_local_block_edit(place_at, WEB_PLACE_BLOCK);
             }
-            _ => {}
+            InteractionTarget::Block(hit) => match button {
+                MouseButton::Left => {
+                    self.apply_local_block_edit(hit.block, BlockId::Air);
+                }
+                MouseButton::Right => {
+                    let Some(place_at) = hit.previous_empty else {
+                        return;
+                    };
+
+                    if self.player_collides_with_world_pos(self.camera.position, place_at, WEB_PLACE_BLOCK) {
+                        return;
+                    }
+
+                    self.apply_local_block_edit(place_at, WEB_PLACE_BLOCK);
+                }
+                _ => {}
+            },
+            InteractionTarget::Link => {}
         }
     }
 
@@ -281,6 +303,28 @@ impl WebApp {
         self.raycast_world(6.0)
     }
 
+    fn current_interaction_target(&mut self) -> Option<InteractionTarget> {
+        let block_hit = self.current_target();
+        let link_hit = self.current_link_target();
+
+        match (block_hit, link_hit) {
+            (Some(block), Some(link)) => {
+                if link.distance < block.distance {
+                    Some(InteractionTarget::Link)
+                } else {
+                    Some(InteractionTarget::Block(block))
+                }
+            }
+            (Some(block), None) => Some(InteractionTarget::Block(block)),
+            (None, Some(_)) => Some(InteractionTarget::Link),
+            (None, None) => None,
+        }
+    }
+
+    fn current_link_target(&self) -> Option<LinkHit> {
+        raycast_link_panel(self.camera.position, self.camera.forward(), self.link_panel)
+    }
+
     fn build_crosshair_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
         if !self.mouse_captured {
             return None;
@@ -318,7 +362,9 @@ impl WebApp {
     }
 
     fn build_target_highlight_mesh(&mut self, renderer: &Renderer<'_>) -> Option<Mesh> {
-        let target = self.current_target()?;
+        let InteractionTarget::Block(target) = self.current_interaction_target()? else {
+            return None;
+        };
         let face = target.face?;
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
@@ -331,6 +377,13 @@ impl WebApp {
             [1.0, 0.95, 0.45],
             (3, 1),
         );
+        Some(renderer.create_mesh(&vertices, &indices))
+    }
+
+    fn build_link_panel_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        add_link_panel_mesh(&mut vertices, &mut indices, self.link_panel, [1.0, 1.0, 1.0], LINK_PANEL_TILE);
         Some(renderer.create_mesh(&vertices, &indices))
     }
 
@@ -682,6 +735,7 @@ impl WebApp {
                     block: world,
                     previous_empty,
                     face: previous_empty.and_then(|empty| face_from_empty_neighbor(world, empty)),
+                    distance: index as f32 * step,
                 });
             }
 
@@ -790,6 +844,22 @@ fn pointer_is_locked(canvas: &HtmlCanvasElement) -> bool {
         .and_then(|element| element.dyn_into::<HtmlCanvasElement>().ok())
         .map(|locked| locked == *canvas)
         .unwrap_or(false)
+}
+
+fn confirm_open_url(label: &str) -> bool {
+    web_sys::window()
+        .and_then(|window| {
+            window
+                .confirm_with_message(&format!("Do you want to go to {label}?"))
+                .ok()
+        })
+        .unwrap_or(false)
+}
+
+fn open_url(url: &str) {
+    if let Some(window) = web_sys::window() {
+        let _ = window.open_with_url_and_target(url, "_blank");
+    }
 }
 
 fn find_safe_spawn_position(terrain: &TerrainGenerator) -> Vec3 {
@@ -1103,10 +1173,36 @@ enum Face {
     Down,
 }
 
+#[derive(Clone, Copy, Debug)]
 struct RaycastHit {
     block: WorldPos,
     previous_empty: Option<WorldPos>,
     face: Option<Face>,
+    distance: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LinkPanel {
+    center: Vec3,
+}
+
+impl LinkPanel {
+    fn near_spawn(spawn: Vec3) -> Self {
+        Self {
+            center: Vec3::new(spawn.x + 4.0, spawn.y + 0.2, spawn.z),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LinkHit {
+    distance: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InteractionTarget {
+    Block(RaycastHit),
+    Link,
 }
 
 fn block_is_solid(block: BlockId) -> bool {
@@ -1155,6 +1251,29 @@ fn face_from_empty_neighbor(block: WorldPos, empty: WorldPos) -> Option<Face> {
         (0, -1, 0) => Some(Face::Down),
         _ => None,
     }
+}
+
+fn raycast_link_panel(origin: Vec3, direction: Vec3, panel: LinkPanel) -> Option<LinkHit> {
+    let direction = direction.normalize_or_zero();
+    if direction == Vec3::ZERO || direction.x.abs() < 0.0001 {
+        return None;
+    }
+
+    let t = (panel.center.x - origin.x) / direction.x;
+    if !(0.0..=6.0).contains(&t) {
+        return None;
+    }
+
+    let hit = origin + direction * t;
+    let local = hit - panel.center;
+    if local.y.abs() > LINK_PANEL_HALF_HEIGHT || local.z.abs() > LINK_PANEL_HALF_WIDTH {
+        return None;
+    }
+    if local.x.abs() > LINK_PANEL_HALF_DEPTH + 0.02 {
+        return None;
+    }
+
+    Some(LinkHit { distance: t })
 }
 
 fn add_face_highlight(
@@ -1233,6 +1352,53 @@ fn add_face_highlight(
             tile,
         ),
     }
+}
+
+fn add_link_panel_mesh(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    panel: LinkPanel,
+    color: [f32; 3],
+    tile: (u32, u32),
+) {
+    let center = panel.center;
+    let screen_half_depth = 0.006;
+    let frame_half_depth = 0.028;
+    let screen_gap = 0.008;
+    let axis_x = Vec3::new(0.0, 0.0, LINK_PANEL_HALF_WIDTH);
+    let axis_y = Vec3::new(0.0, LINK_PANEL_HALF_HEIGHT, 0.0);
+    let normal = Vec3::new(-1.0, 0.0, 0.0);
+    let screen_center = center + normal * (frame_half_depth + screen_gap + screen_half_depth);
+    let front_center = screen_center + normal * screen_half_depth;
+    let back_center = screen_center - normal * screen_half_depth;
+    let uvs = atlas_quad(tile);
+
+    let front = [
+        front_center - axis_x + axis_y,
+        front_center + axis_x + axis_y,
+        front_center + axis_x - axis_y,
+        front_center - axis_x - axis_y,
+    ];
+    let back = [
+        back_center + axis_x + axis_y,
+        back_center - axis_x + axis_y,
+        back_center - axis_x - axis_y,
+        back_center + axis_x - axis_y,
+    ];
+
+    add_face_indices(vertices, indices, front, color, uvs);
+    add_face_indices(vertices, indices, back, color, uvs);
+
+    add_box_oriented(
+        vertices,
+        indices,
+        center,
+        Vec3::new(frame_half_depth, 0.0, 0.0),
+        Vec3::new(0.0, LINK_PANEL_HALF_HEIGHT + 0.08, 0.0),
+        Vec3::new(0.0, 0.0, LINK_PANEL_HALF_WIDTH + 0.08),
+        [0.22, 0.18, 0.12],
+        (0, 1),
+    );
 }
 
 fn add_box_oriented(

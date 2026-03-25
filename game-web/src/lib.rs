@@ -31,6 +31,7 @@ use winit::window::WindowBuilder;
 const WEB_RADIUS: i32 = 6;
 #[allow(dead_code)]
 const INITIAL_WEB_RADIUS: i32 = 1;
+const SPAWN_READY_RADIUS: i32 = 1;
 const CHUNK_WORLD_RADIUS: f32 = (CHUNK_WIDTH as f32) * 0.5;
 const DRAW_DISTANCE_CHUNKS: f32 = 14.0;
 const MESH_WORKER_COUNT: usize = 3;
@@ -54,6 +55,8 @@ const LINK_PANEL_HALF_WIDTH: f32 = 1.2;
 const LINK_PANEL_HALF_HEIGHT: f32 = 0.75;
 const LINK_PANEL_HALF_DEPTH: f32 = 0.03;
 const LINK_PANEL_TILE: (u32, u32) = (0, 2);
+const REMOTE_PLAYER_HALF_WIDTH: f32 = 0.35;
+const REMOTE_PLAYER_HALF_HEIGHT: f32 = 0.9;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -107,8 +110,8 @@ async fn run() -> Result<()> {
                     app.handle_mouse_button(button);
                 }
                 WindowEvent::RedrawRequested => {
-                    app.tick();
                     app.process_generation_updates(&renderer, &mut chunk_meshes, DEFAULT_GENERATION_BUDGET_PER_UPDATE);
+                    app.tick();
                     renderer.update_camera(app.camera_matrix());
                     let visible_meshes = chunk_meshes
                         .iter()
@@ -117,6 +120,10 @@ async fn run() -> Result<()> {
                     let link_panel_mesh = app.build_link_panel_mesh(&renderer);
                     let mut visible_mesh_refs = visible_meshes;
                     if let Some(mesh) = &link_panel_mesh {
+                        visible_mesh_refs.push(mesh);
+                    }
+                    let remote_players_mesh = app.build_remote_players_mesh(&renderer);
+                    if let Some(mesh) = &remote_players_mesh {
                         visible_mesh_refs.push(mesh);
                     }
                     let mut overlay_meshes = Vec::new();
@@ -168,6 +175,8 @@ struct WebApp {
     hotbar_slots: Vec<Element>,
     hotbar_blocks: Vec<BlockId>,
     selected_hotbar: usize,
+    player_id: Option<u64>,
+    remote_players: HashMap<u64, [f32; 3]>,
     tick_counter: u64,
     transport_open: bool,
     logged_in: bool,
@@ -228,6 +237,8 @@ impl WebApp {
             hotbar_slots,
             hotbar_blocks,
             selected_hotbar: 0,
+            player_id: None,
+            remote_players: HashMap::new(),
             tick_counter: 0,
             transport_open: false,
             logged_in: false,
@@ -364,6 +375,8 @@ impl WebApp {
                     ServerMessage::LoginResponse(response) => {
                         if response.accepted {
                             self.logged_in = true;
+                            self.player_id = Some(response.player_id);
+                            self.remote_players.clear();
                             self.camera.position = Vec3::new(
                                 response.spawn_position.x as f32 + 0.5,
                                 response.spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
@@ -405,7 +418,11 @@ impl WebApp {
                         }
                         update_hotbar_ui(&self.hotbar_slots, &self.hotbar_blocks, self.selected_hotbar);
                     }
-                    ServerMessage::PlayerStateSnapshot(_) => {}
+                    ServerMessage::PlayerStateSnapshot(snapshot) => {
+                        if Some(snapshot.player_id) != self.player_id {
+                            self.remote_players.insert(snapshot.player_id, snapshot.position);
+                        }
+                    }
                     ServerMessage::BlockActionResult(result) => {
                         if !result.accepted {
                             web_sys::console::warn_1(&JsValue::from_str(&result.reason));
@@ -416,6 +433,8 @@ impl WebApp {
                 NetworkEvent::Disconnected(reason) => {
                     self.transport_open = false;
                     self.logged_in = false;
+                    self.player_id = None;
+                    self.remote_players.clear();
                     web_sys::console::error_1(&JsValue::from_str(&format!("multiplayer disconnected: {reason}")));
                 }
             }
@@ -453,10 +472,6 @@ impl WebApp {
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
 
-        if !self.spawn_settled && self.ensure_clear_spawn_space() {
-            self.spawn_settled = true;
-        }
-
         let mut movement = Vec3::ZERO;
         if self.pressed.contains(&KeyCode::KeyW) {
             movement.z -= 1.0;
@@ -474,6 +489,23 @@ impl WebApp {
         let sprint = self.pressed.contains(&KeyCode::ShiftLeft);
 
         self.movement_active = movement != Vec3::ZERO;
+
+        if !self.spawn_settled {
+            if self.ensure_clear_spawn_space() {
+                self.spawn_settled = true;
+            } else {
+                return;
+            }
+        }
+
+        let mut movement_for_server = Vec3::new(movement.x, 0.0, movement.z);
+        if movement_for_server.length_squared() > 1.0 {
+            movement_for_server = movement_for_server.normalize();
+        }
+        let forward = Vec3::new(self.camera.yaw.sin(), 0.0, self.camera.yaw.cos()).normalize_or_zero();
+        let right = Vec3::new(-forward.z, 0.0, forward.x);
+        let world_movement = forward * -movement_for_server.z + right * movement_for_server.x;
+
         self.update_camera_physics(dt, movement, jump, sprint);
         if !self.logged_in {
             return;
@@ -481,7 +513,7 @@ impl WebApp {
         self.tick_counter = self.tick_counter.wrapping_add(1);
         self.send_client_message(&ClientMessage::PlayerInputTick(PlayerInputTick {
             tick: self.tick_counter,
-            movement: [movement.x, 0.0, movement.z],
+            movement: [world_movement.x, 0.0, world_movement.z],
             jump,
         }));
     }
@@ -576,6 +608,35 @@ impl WebApp {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         add_link_panel_mesh(&mut vertices, &mut indices, self.link_panel, [1.0, 1.0, 1.0], LINK_PANEL_TILE);
+        Some(renderer.create_mesh(&vertices, &indices))
+    }
+
+    fn build_remote_players_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
+        if self.remote_players.is_empty() {
+            return None;
+        }
+
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for (&player_id, position) in &self.remote_players {
+            let tint = remote_player_color(player_id);
+            let center = Vec3::new(
+                position[0],
+                position[1] + REMOTE_PLAYER_HALF_HEIGHT,
+                position[2],
+            );
+            add_box_oriented(
+                &mut vertices,
+                &mut indices,
+                center,
+                Vec3::new(REMOTE_PLAYER_HALF_WIDTH, 0.0, 0.0),
+                Vec3::new(0.0, REMOTE_PLAYER_HALF_HEIGHT, 0.0),
+                Vec3::new(0.0, 0.0, REMOTE_PLAYER_HALF_WIDTH),
+                tint,
+                (2, 0),
+            );
+        }
+
         Some(renderer.create_mesh(&vertices, &indices))
     }
 
@@ -964,7 +1025,7 @@ impl WebApp {
     }
 
     fn ensure_clear_spawn_space(&mut self) -> bool {
-        if !self.collision_voxels.contains_key(&self.current_chunk) {
+        if !self.spawn_area_ready() {
             return false;
         }
 
@@ -984,6 +1045,21 @@ impl WebApp {
         }
 
         false
+    }
+
+    fn spawn_area_ready(&self) -> bool {
+        for dz in -SPAWN_READY_RADIUS..=SPAWN_READY_RADIUS {
+            for dx in -SPAWN_READY_RADIUS..=SPAWN_READY_RADIUS {
+                let chunk = ChunkPos {
+                    x: self.current_chunk.x + dx,
+                    z: self.current_chunk.z + dz,
+                };
+                if !self.collision_voxels.contains_key(&chunk) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -1842,4 +1918,12 @@ fn atlas_quad(tile: (u32, u32)) -> [[f32; 2]; 4] {
     let max_v = (tile.1 + 1) as f32 / TILE_COUNT - EPS;
 
     [[min_u, min_v], [max_u, min_v], [max_u, max_v], [min_u, max_v]]
+}
+
+fn remote_player_color(player_id: u64) -> [f32; 3] {
+    let hue = (player_id as f32 * 0.173).fract();
+    let r = 0.45 + 0.4 * (hue * std::f32::consts::TAU).sin().abs();
+    let g = 0.45 + 0.4 * ((hue + 0.33) * std::f32::consts::TAU).sin().abs();
+    let b = 0.45 + 0.4 * ((hue + 0.66) * std::f32::consts::TAU).sin().abs();
+    [r, g, b]
 }

@@ -33,13 +33,16 @@ wgpu = { version = "0.20", features = ["webgl"] }
 
 [workspace.dependencies.web-sys]
 version = "0.3"
-features = ["Document", "Element", "HtmlCanvasElement", "Window"]
+features = ["Document", "Element", "EventTarget", "HtmlCanvasElement", "MessageEvent", "Window", "Worker"]
 
 [workspace.dependencies.wasm-bindgen]
 version = "0.2"
 
 [workspace.dependencies.wasm-bindgen-futures]
 version = "0.4"
+
+[workspace.dependencies.js-sys]
+version = "0.3"
 
 [workspace.dependencies.web-time]
 version = "1.1"

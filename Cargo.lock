@@ -553,6 +553,7 @@ dependencies = [
  "bytemuck",
  "console_error_panic_hook",
  "glam",
+ "js-sys",
  "shared_math",
  "shared_world",
  "wasm-bindgen",

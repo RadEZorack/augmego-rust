@@ -3,13 +3,15 @@
 use anyhow::Result;
 use glam::{Mat4, Vec3};
 use shared_math::{CHUNK_DEPTH, CHUNK_WIDTH, ChunkPos};
-use shared_world::{BlockId, ChunkData, TerrainGenerator};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_time::Instant;
-use web_sys::HtmlCanvasElement;
+use web_sys::{HtmlCanvasElement, MessageEvent, Worker};
 use wgpu_lite::{Mesh, Renderer, Vertex};
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
@@ -19,8 +21,10 @@ use winit::platform::web::WindowExtWebSys;
 use winit::window::WindowBuilder;
 
 const WEB_RADIUS: i32 = 6;
+const INITIAL_WEB_RADIUS: i32 = 1;
 const CHUNK_WORLD_RADIUS: f32 = (CHUNK_WIDTH as f32) * 0.5;
 const DRAW_DISTANCE_CHUNKS: f32 = 14.0;
+const DEFAULT_GENERATION_BUDGET_PER_UPDATE: usize = 2;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -43,9 +47,11 @@ async fn run() -> Result<()> {
     attach_canvas(window.canvas().expect("winit web canvas"));
 
     let renderer = Renderer::new(window).await?;
-    let mut app = WebApp::new(renderer.size());
-    let chunk_meshes = build_world_meshes(&renderer);
+    let (mesh_result_rx, worker, worker_onmessage) = start_mesh_worker_bridge()?;
+    let pending_generation = initial_generation_queue();
+    let mut app = WebApp::new(renderer.size(), pending_generation, worker, worker_onmessage, mesh_result_rx);
     let mut renderer = renderer;
+    let mut chunk_meshes = HashMap::new();
 
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Poll);
@@ -60,6 +66,7 @@ async fn run() -> Result<()> {
                 WindowEvent::KeyboardInput { event, .. } => app.handle_key(event),
                 WindowEvent::RedrawRequested => {
                     app.tick();
+                    app.process_generation_updates(&renderer, &mut chunk_meshes, DEFAULT_GENERATION_BUDGET_PER_UPDATE);
                     renderer.update_camera(app.camera_matrix());
                     let visible_meshes = chunk_meshes
                         .iter()
@@ -88,10 +95,22 @@ struct WebApp {
     pressed: HashSet<KeyCode>,
     last_tick: Instant,
     size: PhysicalSize<u32>,
+    pending_generation: VecDeque<ChunkPos>,
+    inflight_generation: HashSet<ChunkPos>,
+    movement_active: bool,
+    mesh_result_rx: Receiver<MeshBuildResult>,
+    _worker: Worker,
+    _worker_onmessage: Closure<dyn FnMut(MessageEvent)>,
 }
 
 impl WebApp {
-    fn new(size: PhysicalSize<u32>) -> Self {
+    fn new(
+        size: PhysicalSize<u32>,
+        pending_generation: VecDeque<ChunkPos>,
+        worker: Worker,
+        worker_onmessage: Closure<dyn FnMut(MessageEvent)>,
+        mesh_result_rx: Receiver<MeshBuildResult>,
+    ) -> Self {
         let mut camera = Camera::default();
         camera.position = Vec3::new(8.0, 98.0, 16.0);
 
@@ -100,6 +119,12 @@ impl WebApp {
             pressed: HashSet::new(),
             last_tick: Instant::now(),
             size,
+            pending_generation,
+            inflight_generation: HashSet::new(),
+            movement_active: false,
+            mesh_result_rx,
+            _worker: worker,
+            _worker_onmessage: worker_onmessage,
         }
     }
 
@@ -153,6 +178,7 @@ impl WebApp {
             movement.y -= 1.0;
         }
 
+        self.movement_active = movement != Vec3::ZERO;
         self.camera.update(dt, movement);
     }
 
@@ -182,6 +208,49 @@ impl WebApp {
         let direction = to_chunk / distance.max(0.001);
         let threshold = 0.1 - (24.0 / distance).min(0.25);
         self.camera.forward().dot(direction) >= threshold
+    }
+
+    fn process_generation_updates(
+        &mut self,
+        renderer: &Renderer<'_>,
+        chunk_meshes: &mut HashMap<ChunkPos, Mesh>,
+        default_budget: usize,
+    ) {
+        while let Ok(result) = self.mesh_result_rx.try_recv() {
+            self.inflight_generation.remove(&result.position);
+            if result.failed {
+                self.pending_generation.push_back(result.position);
+                continue;
+            }
+
+            chunk_meshes.insert(result.position, renderer.create_mesh(&result.vertices, &result.indices));
+        }
+
+        let budget = self.generation_budget(default_budget);
+        for _ in 0..budget {
+            let Some(position) = self.pending_generation.pop_front() else {
+                break;
+            };
+
+            if self.inflight_generation.contains(&position) {
+                continue;
+            }
+
+            dispatch_mesh_job(&self._worker, position);
+            self.inflight_generation.insert(position);
+        }
+    }
+
+    fn generation_budget(&self, default_budget: usize) -> usize {
+        if self.pending_generation.is_empty() {
+            return 0;
+        }
+
+        if self.movement_active {
+            return 0;
+        }
+
+        default_budget
     }
 }
 
@@ -224,169 +293,113 @@ fn attach_canvas(canvas: HtmlCanvasElement) {
     let _ = body.append_child(&canvas);
 }
 
-fn build_world_meshes(renderer: &Renderer<'_>) -> HashMap<ChunkPos, Mesh> {
-    let generator = TerrainGenerator::new(0xA66D_E601);
-    let mut meshes = HashMap::new();
-
-    for z in -WEB_RADIUS..=WEB_RADIUS {
-        for x in -WEB_RADIUS..=WEB_RADIUS {
-            let position = ChunkPos { x, z };
-            let chunk = generator.generate_chunk(position);
-            let (vertices, indices) = mesh_chunk(&chunk);
-            meshes.insert(position, renderer.create_mesh(&vertices, &indices));
+fn initial_generation_queue() -> VecDeque<ChunkPos> {
+    let mut pending = VecDeque::new();
+    for position in ordered_chunk_positions(WEB_RADIUS) {
+        if position.x.abs() > INITIAL_WEB_RADIUS || position.z.abs() > INITIAL_WEB_RADIUS {
+            pending.push_back(position);
+            continue;
         }
+
+        pending.push_front(position);
     }
 
-    meshes
+    pending
 }
 
-fn mesh_chunk(chunk: &ChunkData) -> (Vec<Vertex>, Vec<u32>) {
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    let origin_x = chunk.position.x as f32 * CHUNK_WIDTH as f32;
-    let origin_z = chunk.position.z as f32 * CHUNK_DEPTH as f32;
+fn start_mesh_worker_bridge() -> Result<(Receiver<MeshBuildResult>, Worker, Closure<dyn FnMut(MessageEvent)>)> {
+    let worker = Worker::new("mesh-worker.js")
+        .map_err(|error| anyhow::anyhow!("create mesh worker: {error:?}"))?;
+    let (tx, rx) = mpsc::channel::<MeshBuildResult>();
 
-    for y in 0..shared_math::CHUNK_HEIGHT {
-        for z in 0..CHUNK_DEPTH {
-            for x in 0..CHUNK_WIDTH {
-                let block = chunk.voxel(shared_math::LocalVoxelPos {
-                    x: x as u8,
-                    y: y as u8,
-                    z: z as u8,
-                });
-                if block.block.is_empty() || matches!(block.block, BlockId::Water) {
+    let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let data = event.data();
+        let object = js_sys::Object::from(data);
+        let kind = js_sys::Reflect::get(&object, &JsValue::from_str("kind"))
+            .ok()
+            .and_then(|value| value.as_string())
+            .unwrap_or_default();
+        let x = js_sys::Reflect::get(&object, &JsValue::from_str("x"))
+            .ok()
+            .and_then(|value| value.as_f64())
+            .unwrap_or_default() as i32;
+        let z = js_sys::Reflect::get(&object, &JsValue::from_str("z"))
+            .ok()
+            .and_then(|value| value.as_f64())
+            .unwrap_or_default() as i32;
+
+        if kind == "error" {
+            let message = js_sys::Reflect::get(&object, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|value| value.as_string())
+                .unwrap_or_else(|| "unknown worker error".to_string());
+            web_sys::console::error_1(&JsValue::from_str(&format!(
+                "mesh worker failed for chunk ({x}, {z}): {message}"
+            )));
+            let _ = tx.send(MeshBuildResult {
+                position: ChunkPos { x, z },
+                vertices: Vec::new(),
+                indices: Vec::new(),
+                failed: true,
+            });
+            return;
+        }
+
+        let vertices_value = js_sys::Reflect::get(&object, &JsValue::from_str("vertices")).unwrap();
+        let indices_value = js_sys::Reflect::get(&object, &JsValue::from_str("indices")).unwrap();
+        let vertex_floats = js_sys::Float32Array::new(&vertices_value).to_vec();
+        let indices = js_sys::Uint32Array::new(&indices_value).to_vec();
+        let vertices = vertex_floats
+            .chunks_exact(8)
+            .map(|values| Vertex {
+                position: [values[0], values[1], values[2]],
+                color: [values[3], values[4], values[5]],
+                uv: [values[6], values[7]],
+            })
+            .collect::<Vec<_>>();
+
+        let _ = tx.send(MeshBuildResult {
+            position: ChunkPos { x, z },
+            vertices,
+            indices,
+            failed: false,
+        });
+    }) as Box<dyn FnMut(MessageEvent)>);
+
+    worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+    Ok((rx, worker, onmessage))
+}
+
+fn dispatch_mesh_job(worker: &Worker, position: ChunkPos) {
+    let job = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&job, &JsValue::from_str("kind"), &JsValue::from_str("build"));
+    let _ = js_sys::Reflect::set(&job, &JsValue::from_str("x"), &JsValue::from_f64(f64::from(position.x)));
+    let _ = js_sys::Reflect::set(&job, &JsValue::from_str("z"), &JsValue::from_f64(f64::from(position.z)));
+    let _ = worker.post_message(&job);
+}
+
+fn ordered_chunk_positions(radius: i32) -> Vec<ChunkPos> {
+    let mut positions = Vec::new();
+    positions.push(ChunkPos { x: 0, z: 0 });
+
+    for ring in 1..=radius {
+        for z in -ring..=ring {
+            for x in -ring..=ring {
+                if x.abs().max(z.abs()) != ring {
                     continue;
                 }
 
-                let world = [origin_x + x as f32, y as f32, origin_z + z as f32];
-                emit_block_faces(chunk, &mut vertices, &mut indices, world, x, y, z, block.block);
+                positions.push(ChunkPos { x, z });
             }
         }
     }
 
-    (vertices, indices)
+    positions
 }
 
-fn emit_block_faces(
-    chunk: &ChunkData,
-    vertices: &mut Vec<Vertex>,
-    indices: &mut Vec<u32>,
-    world: [f32; 3],
-    x: i32,
-    y: i32,
-    z: i32,
-    block: BlockId,
-) {
-    let base_color = [1.0, 1.0, 1.0];
-    let neighbors = [
-        ((0, 0, -1), face_vertices(world, Face::North, base_color, tile_uvs(block, Face::North))),
-        ((0, 0, 1), face_vertices(world, Face::South, base_color, tile_uvs(block, Face::South))),
-        ((-1, 0, 0), face_vertices(world, Face::West, base_color, tile_uvs(block, Face::West))),
-        ((1, 0, 0), face_vertices(world, Face::East, base_color, tile_uvs(block, Face::East))),
-        ((0, 1, 0), face_vertices(world, Face::Up, brighten(base_color, 0.08), tile_uvs(block, Face::Up))),
-        ((0, -1, 0), face_vertices(world, Face::Down, darken(base_color, 0.16), tile_uvs(block, Face::Down))),
-    ];
-
-    for (offset, face) in neighbors {
-        let neighbor = sample_voxel(chunk, x + offset.0, y + offset.1, z + offset.2);
-        if neighbor.map(|voxel| voxel.block.is_transparent()).unwrap_or(true) {
-            let base = vertices.len() as u32;
-            vertices.extend(face);
-            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-        }
-    }
-}
-
-fn sample_voxel(chunk: &ChunkData, x: i32, y: i32, z: i32) -> Option<shared_world::Voxel> {
-    if !(0..CHUNK_WIDTH).contains(&x) || !(0..shared_math::CHUNK_HEIGHT).contains(&y) || !(0..CHUNK_DEPTH).contains(&z) {
-        return None;
-    }
-
-    Some(chunk.voxel(shared_math::LocalVoxelPos {
-        x: x as u8,
-        y: y as u8,
-        z: z as u8,
-    }))
-}
-
-#[derive(Clone, Copy)]
-enum Face {
-    North,
-    South,
-    East,
-    West,
-    Up,
-    Down,
-}
-
-fn face_vertices(origin: [f32; 3], face: Face, color: [f32; 3], uvs: [[f32; 2]; 4]) -> [Vertex; 4] {
-    let [x, y, z] = origin;
-    match face {
-        Face::North => [v(x, y + 1.0, z, color, uvs[0]), v(x + 1.0, y + 1.0, z, color, uvs[1]), v(x + 1.0, y, z, color, uvs[2]), v(x, y, z, color, uvs[3])],
-        Face::South => [v(x + 1.0, y + 1.0, z + 1.0, color, uvs[0]), v(x, y + 1.0, z + 1.0, color, uvs[1]), v(x, y, z + 1.0, color, uvs[2]), v(x + 1.0, y, z + 1.0, color, uvs[3])],
-        Face::East => [v(x + 1.0, y + 1.0, z, color, uvs[0]), v(x + 1.0, y + 1.0, z + 1.0, color, uvs[1]), v(x + 1.0, y, z + 1.0, color, uvs[2]), v(x + 1.0, y, z, color, uvs[3])],
-        Face::West => [v(x, y + 1.0, z + 1.0, color, uvs[0]), v(x, y + 1.0, z, color, uvs[1]), v(x, y, z, color, uvs[2]), v(x, y, z + 1.0, color, uvs[3])],
-        Face::Up => [v(x, y + 1.0, z, color, uvs[0]), v(x, y + 1.0, z + 1.0, color, uvs[1]), v(x + 1.0, y + 1.0, z + 1.0, color, uvs[2]), v(x + 1.0, y + 1.0, z, color, uvs[3])],
-        Face::Down => [v(x, y, z, color, uvs[0]), v(x + 1.0, y, z, color, uvs[1]), v(x + 1.0, y, z + 1.0, color, uvs[2]), v(x, y, z + 1.0, color, uvs[3])],
-    }
-}
-
-fn v(x: f32, y: f32, z: f32, color: [f32; 3], uv: [f32; 2]) -> Vertex {
-    Vertex {
-        position: [x, y, z],
-        color,
-        uv,
-    }
-}
-
-fn tile_uvs(block: BlockId, face: Face) -> [[f32; 2]; 4] {
-    atlas_quad(tile_for(block, face))
-}
-
-fn tile_for(block: BlockId, face: Face) -> (u32, u32) {
-    match block {
-        BlockId::Grass => match face {
-            Face::Up => (1, 0),
-            Face::Down => (0, 0),
-            _ => (1, 1),
-        },
-        BlockId::Dirt => (0, 0),
-        BlockId::Stone => (2, 0),
-        BlockId::Sand => (3, 0),
-        BlockId::Water => (2, 1),
-        BlockId::Log => match face {
-            Face::Up | Face::Down => (3, 1),
-            _ => (0, 1),
-        },
-        BlockId::Leaves => (1, 1),
-        BlockId::Planks => (3, 1),
-        BlockId::Glass => (2, 1),
-        BlockId::Lantern => (3, 1),
-        BlockId::Storage => (0, 1),
-        BlockId::Air => (0, 0),
-    }
-}
-
-fn atlas_quad(tile: (u32, u32)) -> [[f32; 2]; 4] {
-    const TILE_COUNT: f32 = 4.0;
-    const EPS: f32 = 0.001;
-
-    let min_u = tile.0 as f32 / TILE_COUNT + EPS;
-    let max_u = (tile.0 + 1) as f32 / TILE_COUNT - EPS;
-    let min_v = tile.1 as f32 / TILE_COUNT + EPS;
-    let max_v = (tile.1 + 1) as f32 / TILE_COUNT - EPS;
-
-    [[min_u, min_v], [max_u, min_v], [max_u, max_v], [min_u, max_v]]
-}
-
-fn darken(color: [f32; 3], amount: f32) -> [f32; 3] {
-    [color[0] * (1.0 - amount), color[1] * (1.0 - amount), color[2] * (1.0 - amount)]
-}
-
-fn brighten(color: [f32; 3], amount: f32) -> [f32; 3] {
-    [
-        (color[0] + amount).min(1.0),
-        (color[1] + amount).min(1.0),
-        (color[2] + amount).min(1.0),
-    ]
+struct MeshBuildResult {
+    position: ChunkPos,
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+    failed: bool,
 }

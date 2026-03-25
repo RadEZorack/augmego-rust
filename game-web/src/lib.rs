@@ -12,7 +12,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_time::Instant;
-use web_sys::{Document, HtmlCanvasElement, MessageEvent, Worker};
+use web_sys::{Document, Element, HtmlCanvasElement, MessageEvent, Worker};
 use wgpu_lite::{Mesh, Renderer, Vertex};
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, WindowEvent};
@@ -36,7 +36,6 @@ const PLAYER_JUMP_SPEED: f32 = 9.5;
 const PLAYER_GRAVITY: f32 = 28.0;
 const STEP_HEIGHT: f32 = 0.6;
 const COLLISION_STEP: f32 = 0.2;
-const WEB_PLACE_BLOCK: BlockId = BlockId::Stone;
 const CROSSHAIR_DISTANCE: f32 = 0.6;
 const CROSSHAIR_LENGTH: f32 = 0.035;
 const CROSSHAIR_THICKNESS: f32 = 0.004;
@@ -147,6 +146,9 @@ struct WebApp {
     spawn_settled: bool,
     chunk_edits: HashMap<ChunkPos, HashMap<(u8, u8, u8), BlockId>>,
     link_panel: LinkPanel,
+    hotbar_slots: Vec<Element>,
+    hotbar_blocks: Vec<BlockId>,
+    selected_hotbar: usize,
     mesh_result_rx: Receiver<MeshBuildResult>,
     workers: Vec<Worker>,
     next_worker_index: usize,
@@ -166,6 +168,15 @@ impl WebApp {
         camera.position = find_safe_spawn_position(&terrain);
         camera.on_ground = true;
         let link_panel = LinkPanel::near_spawn(camera.position);
+        let hotbar_blocks = vec![
+            BlockId::Grass,
+            BlockId::Stone,
+            BlockId::Planks,
+            BlockId::Glass,
+            BlockId::Lantern,
+        ];
+        let hotbar_slots = create_hotbar(&hotbar_blocks);
+        update_hotbar_ui(&hotbar_slots, &hotbar_blocks, 0);
         let current_chunk = chunk_from_world_position(camera.position);
         let desired_chunks = desired_chunk_set(current_chunk, WEB_RADIUS);
         let pending_generation =
@@ -188,6 +199,9 @@ impl WebApp {
             spawn_settled: false,
             chunk_edits: HashMap::new(),
             link_panel,
+            hotbar_slots,
+            hotbar_blocks,
+            selected_hotbar: 0,
             mesh_result_rx,
             workers,
             next_worker_index: 0,
@@ -212,6 +226,21 @@ impl WebApp {
             self.mouse_captured = false;
         }
 
+        if event.state == ElementState::Pressed {
+            match code {
+                KeyCode::Digit1 => self.set_selected_hotbar(0),
+                KeyCode::Digit2 => self.set_selected_hotbar(1),
+                KeyCode::Digit3 => self.set_selected_hotbar(2),
+                KeyCode::Digit4 => self.set_selected_hotbar(3),
+                KeyCode::Digit5 => self.set_selected_hotbar(4),
+                KeyCode::Digit6 => self.set_selected_hotbar(5),
+                KeyCode::Digit7 => self.set_selected_hotbar(6),
+                KeyCode::Digit8 => self.set_selected_hotbar(7),
+                KeyCode::Digit9 => self.set_selected_hotbar(8),
+                _ => {}
+            }
+        }
+
         match event.state {
             ElementState::Pressed => {
                 self.pressed.insert(code);
@@ -220,6 +249,20 @@ impl WebApp {
                 self.pressed.remove(&code);
             }
         }
+    }
+
+    fn set_selected_hotbar(&mut self, index: usize) {
+        if index < self.hotbar_blocks.len() {
+            self.selected_hotbar = index;
+            update_hotbar_ui(&self.hotbar_slots, &self.hotbar_blocks, self.selected_hotbar);
+        }
+    }
+
+    fn selected_hotbar_block(&self) -> BlockId {
+        self.hotbar_blocks
+            .get(self.selected_hotbar)
+            .copied()
+            .unwrap_or(BlockId::Stone)
     }
 
     fn handle_mouse_motion(&mut self, dx: f32, dy: f32) {
@@ -253,11 +296,12 @@ impl WebApp {
                         return;
                     };
 
-                    if self.player_collides_with_world_pos(self.camera.position, place_at, WEB_PLACE_BLOCK) {
+                    let selected_block = self.selected_hotbar_block();
+                    if self.player_collides_with_world_pos(self.camera.position, place_at, selected_block) {
                         return;
                     }
 
-                    self.apply_local_block_edit(place_at, WEB_PLACE_BLOCK);
+                    self.apply_local_block_edit(place_at, selected_block);
                 }
                 _ => {}
             },
@@ -833,6 +877,75 @@ fn attach_canvas(canvas: HtmlCanvasElement) {
     let document = window.document().expect("document");
     let body = document.body().expect("body");
     let _ = body.append_child(&canvas);
+}
+
+fn create_hotbar(blocks: &[BlockId]) -> Vec<Element> {
+    let Some(document) = document() else {
+        return Vec::new();
+    };
+    let Some(body) = document.body() else {
+        return Vec::new();
+    };
+
+    let root = document.create_element("div").expect("hotbar root");
+    let _ = root.set_attribute(
+        "style",
+        "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);display:flex;gap:10px;padding:10px 14px;border-radius:18px;background:rgba(18,24,32,0.64);backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,0.28);pointer-events:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;z-index:20;",
+    );
+
+    let mut slots = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        let slot = document.create_element("div").expect("hotbar slot");
+        let _ = slot.set_attribute(
+            "style",
+            "width:78px;height:62px;border-radius:14px;padding:8px 10px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;color:#e6edf3;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.08);",
+        );
+        slot.set_inner_html(&format!(
+            "<div style=\"font-size:11px;opacity:0.72;\">{}</div><div style=\"font-size:13px;font-weight:700;\">{}</div>",
+            index + 1,
+            block_label(*block)
+        ));
+        let _ = root.append_child(&slot);
+        slots.push(slot);
+    }
+
+    let _ = body.append_child(&root);
+    slots
+}
+
+fn update_hotbar_ui(slots: &[Element], blocks: &[BlockId], selected: usize) {
+    for (index, slot) in slots.iter().enumerate() {
+        let active = index == selected;
+        let block = blocks.get(index).copied().unwrap_or(BlockId::Air);
+        let style = if active {
+            "width:78px;height:62px;border-radius:14px;padding:8px 10px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;color:#081018;border:1px solid rgba(255,255,255,0.36);background:linear-gradient(180deg,rgba(255,244,196,0.96),rgba(245,208,105,0.96));box-shadow:0 0 0 2px rgba(255,240,180,0.42);"
+        } else {
+            "width:78px;height:62px;border-radius:14px;padding:8px 10px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;color:#e6edf3;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.08);"
+        };
+        let _ = slot.set_attribute("style", style);
+        slot.set_inner_html(&format!(
+            "<div style=\"font-size:11px;opacity:0.72;\">{}</div><div style=\"font-size:13px;font-weight:700;\">{}</div>",
+            index + 1,
+            block_label(block)
+        ));
+    }
+}
+
+fn block_label(block: BlockId) -> &'static str {
+    match block {
+        BlockId::Grass => "Grass",
+        BlockId::Dirt => "Dirt",
+        BlockId::Stone => "Stone",
+        BlockId::Sand => "Sand",
+        BlockId::Water => "Water",
+        BlockId::Log => "Log",
+        BlockId::Leaves => "Leaves",
+        BlockId::Planks => "Planks",
+        BlockId::Glass => "Glass",
+        BlockId::Lantern => "Lantern",
+        BlockId::Storage => "Storage",
+        BlockId::Air => "Empty",
+    }
 }
 
 fn document() -> Option<Document> {

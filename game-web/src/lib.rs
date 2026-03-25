@@ -73,7 +73,7 @@ async fn run() -> Result<()> {
                         .filter_map(|(position, mesh)| app.chunk_is_visible(*position).then_some(mesh))
                         .collect::<Vec<_>>();
 
-                    if let Err(error) = renderer.render(&visible_meshes) {
+                    if let Err(error) = renderer.render(&visible_meshes, &[]) {
                         panic!("{error:?}");
                     }
                 }

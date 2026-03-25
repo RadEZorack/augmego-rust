@@ -3,7 +3,8 @@ use glam::{Mat4, Vec3};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
     BreakBlockRequest, ChunkUnload, ClientHello, ClientMessage, LoginRequest, PROTOCOL_VERSION,
-    PlaceBlockRequest, ServerMessage, SubscribeChunks, decode, frame,
+    InventorySnapshot, InventoryStack, PlaceBlockRequest, ServerMessage, SubscribeChunks, decode,
+    frame,
 };
 use shared_world::{BlockId, ChunkData};
 use std::collections::{HashMap, HashSet};
@@ -30,6 +31,11 @@ const PLAYER_SPRINT_SPEED: f32 = 11.0;
 const PLAYER_JUMP_SPEED: f32 = 9.5;
 const PLAYER_GRAVITY: f32 = 28.0;
 const COLLISION_STEP: f32 = 0.2;
+const STEP_HEIGHT: f32 = 0.6;
+const CROSSHAIR_DISTANCE: f32 = 0.6;
+const CROSSHAIR_LENGTH: f32 = 0.035;
+const CROSSHAIR_THICKNESS: f32 = 0.004;
+const TARGET_OUTLINE_THICKNESS: f32 = 0.035;
 
 fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
@@ -81,11 +87,20 @@ fn main() -> Result<()> {
 
                     app.tick();
                     renderer.update_camera(app.camera_matrix());
+                    window.set_title(&app.hud_title());
                     let visible_meshes = chunk_meshes
                         .iter()
                         .filter_map(|(position, mesh)| app.chunk_is_visible(*position).then_some(mesh))
                         .collect::<Vec<_>>();
-                    if let Err(error) = renderer.render(&visible_meshes) {
+                    let mut overlay_meshes = Vec::new();
+                    if let Some(mesh) = app.build_crosshair_mesh(&renderer) {
+                        overlay_meshes.push(mesh);
+                    }
+                    if let Some(mesh) = app.build_target_highlight_mesh(&renderer) {
+                        overlay_meshes.push(mesh);
+                    }
+                    let overlay_refs = overlay_meshes.iter().collect::<Vec<_>>();
+                    if let Err(error) = renderer.render(&visible_meshes, &overlay_refs) {
                         eprintln!("render error: {error:?}");
                         target.exit();
                     }
@@ -124,6 +139,8 @@ struct GameApp {
     current_subscription_center: Option<ChunkPos>,
     physics_ready: bool,
     mouse_captured: bool,
+    inventory: Vec<InventoryStack>,
+    selected_hotbar: usize,
 }
 
 impl GameApp {
@@ -151,6 +168,12 @@ impl GameApp {
             current_subscription_center: None,
             physics_ready: false,
             mouse_captured: true,
+            inventory: vec![
+                InventoryStack { block: BlockId::Grass, count: 64 },
+                InventoryStack { block: BlockId::Stone, count: 64 },
+                InventoryStack { block: BlockId::Planks, count: 32 },
+            ],
+            selected_hotbar: 0,
         }
     }
 
@@ -168,6 +191,21 @@ impl GameApp {
         if code == KeyCode::Escape && event.state == ElementState::Pressed {
             self.mouse_captured = false;
             return true;
+        }
+
+        if event.state == ElementState::Pressed {
+            match code {
+                KeyCode::Digit1 => self.selected_hotbar = 0,
+                KeyCode::Digit2 => self.selected_hotbar = 1,
+                KeyCode::Digit3 => self.selected_hotbar = 2,
+                KeyCode::Digit4 => self.selected_hotbar = 3,
+                KeyCode::Digit5 => self.selected_hotbar = 4,
+                KeyCode::Digit6 => self.selected_hotbar = 5,
+                KeyCode::Digit7 => self.selected_hotbar = 6,
+                KeyCode::Digit8 => self.selected_hotbar = 7,
+                KeyCode::Digit9 => self.selected_hotbar = 8,
+                _ => {}
+            }
         }
 
         match event.state {
@@ -192,7 +230,7 @@ impl GameApp {
             return;
         }
 
-        let Some(hit) = raycast_world(&self.chunk_cache, self.camera.position, self.camera.forward(), 6.0) else {
+        let Some(hit) = self.current_target() else {
             return;
         };
 
@@ -206,14 +244,15 @@ impl GameApp {
                     return;
                 };
 
-                if player_collides_with_world_pos(&self.chunk_cache, self.camera.position, place_at, BlockId::Stone) {
+                let selected_block = self.selected_hotbar_block();
+                if player_collides_with_world_pos(&self.chunk_cache, self.camera.position, place_at, selected_block) {
                     return;
                 }
 
-                self.apply_local_block_edit(place_at, BlockId::Stone);
+                self.apply_local_block_edit(place_at, selected_block);
                 let _ = self.command_tx.send(ClientCommand::PlaceBlock {
                     position: place_at,
-                    block: BlockId::Stone,
+                    block: selected_block,
                 });
             }
             _ => {}
@@ -235,8 +274,21 @@ impl GameApp {
                         self.dirty_meshes.remove(&position);
                     }
                 }
-                NetworkEvent::Welcome { message, .. } => {
+                NetworkEvent::Welcome { message, spawn_position } => {
                     println!("{message}");
+                    if !self.spawned {
+                        self.camera.position = Vec3::new(
+                            spawn_position.x as f32 + 0.5,
+                            spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
+                            spawn_position.z as f32 + 0.5,
+                        );
+                    }
+                }
+                NetworkEvent::Inventory(snapshot) => {
+                    self.inventory = snapshot.slots;
+                    if self.selected_hotbar >= self.inventory.len() {
+                        self.selected_hotbar = self.inventory.len().saturating_sub(1);
+                    }
                 }
                 NetworkEvent::PlayerState { position } => {
                     let server_camera = Vec3::new(position[0], position[1] + PLAYER_EYE_HEIGHT, position[2]);
@@ -271,9 +323,8 @@ impl GameApp {
             self.update_chunk_subscription();
             if self.chunk_cache.contains_key(&world_to_chunk(self.camera.position)) {
                 self.snap_to_ground();
-                self.physics_ready = true;
+                self.physics_ready = self.ensure_clear_spawn_space();
             }
-            return;
         }
 
         let mut movement = Vec3::ZERO;
@@ -292,7 +343,11 @@ impl GameApp {
         let jump = self.pressed.contains(&KeyCode::Space);
         let sprint = self.pressed.contains(&KeyCode::ShiftLeft);
 
-        update_camera_physics(&self.chunk_cache, &mut self.camera, dt, movement, jump, sprint);
+        if self.physics_ready {
+            update_camera_physics(&self.chunk_cache, &mut self.camera, dt, movement, jump, sprint);
+        } else {
+            update_camera_preview(&mut self.camera, dt, movement, sprint);
+        }
         self.update_chunk_subscription();
 
         let _ = self.command_tx.send(ClientCommand::Input {
@@ -304,6 +359,105 @@ impl GameApp {
     fn camera_matrix(&self) -> Mat4 {
         let aspect = self.width as f32 / self.height.max(1) as f32;
         self.camera.matrix(aspect)
+    }
+
+    fn current_target(&self) -> Option<RaycastHit> {
+        if !self.spawned || !self.physics_ready {
+            return None;
+        }
+
+        raycast_world(&self.chunk_cache, self.camera.position, self.camera.forward(), 6.0)
+    }
+
+    fn selected_hotbar_block(&self) -> BlockId {
+        self.inventory
+            .get(self.selected_hotbar)
+            .map(|slot| slot.block)
+            .unwrap_or(BlockId::Stone)
+    }
+
+    fn hud_title(&self) -> String {
+        let selected = self.selected_hotbar_block();
+        let target = self
+            .current_target()
+            .map(|hit| {
+                let block = self
+                    .block_at_world(hit.block)
+                    .map(|voxel| voxel.block)
+                    .unwrap_or(BlockId::Air);
+                format!(" | Target: {:?}", block)
+            })
+            .unwrap_or_default();
+        format!(
+            "Augmego Voxel Sandbox | Slot {}: {:?} x{}{}",
+            self.selected_hotbar + 1,
+            selected,
+            self.inventory
+                .get(self.selected_hotbar)
+                .map(|slot| slot.count)
+                .unwrap_or(0),
+            target
+        )
+    }
+
+    fn build_crosshair_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
+        if !self.mouse_captured {
+            return None;
+        }
+
+        let forward = self.camera.forward();
+        let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+        let center = self.camera.position + forward * CROSSHAIR_DISTANCE;
+
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        add_box_oriented(
+            &mut vertices,
+            &mut indices,
+            center,
+            right * CROSSHAIR_LENGTH,
+            up * CROSSHAIR_THICKNESS,
+            forward * CROSSHAIR_THICKNESS,
+            [1.0, 1.0, 1.0],
+            (3, 1),
+        );
+        add_box_oriented(
+            &mut vertices,
+            &mut indices,
+            center,
+            right * CROSSHAIR_THICKNESS,
+            up * CROSSHAIR_LENGTH,
+            forward * CROSSHAIR_THICKNESS,
+            [1.0, 1.0, 1.0],
+            (3, 1),
+        );
+
+        Some(renderer.create_mesh(&vertices, &indices))
+    }
+
+    fn build_target_highlight_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
+        let target = self.current_target()?;
+        let min = Vec3::new(target.block.x as f32, target.block.y as f32, target.block.z as f32)
+            - Vec3::splat(TARGET_OUTLINE_THICKNESS * 0.5);
+        let max = min + Vec3::splat(1.0 + TARGET_OUTLINE_THICKNESS);
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        add_wire_box(
+            &mut vertices,
+            &mut indices,
+            min,
+            max,
+            TARGET_OUTLINE_THICKNESS,
+            [1.0, 0.95, 0.45],
+            (3, 1),
+        );
+        Some(renderer.create_mesh(&vertices, &indices))
+    }
+
+    fn block_at_world(&self, position: WorldPos) -> Option<shared_world::Voxel> {
+        let (chunk_pos, local) = position.to_chunk_local().ok()?;
+        self.chunk_cache.get(&chunk_pos).map(|chunk| chunk.voxel(local))
     }
 
     fn process_mesh_updates(
@@ -398,6 +552,26 @@ impl GameApp {
         }
     }
 
+    fn ensure_clear_spawn_space(&mut self) -> bool {
+        if !player_collides(&self.chunk_cache, self.camera.position) {
+            return true;
+        }
+
+        let base_feet = self.camera.position.y - PLAYER_EYE_HEIGHT;
+        for offset in 1..=12 {
+            let mut candidate = self.camera.position;
+            candidate.y = base_feet + offset as f32 + PLAYER_EYE_HEIGHT;
+            if !player_collides(&self.chunk_cache, candidate) {
+                self.camera.position = candidate;
+                self.camera.vertical_velocity = 0.0;
+                self.camera.on_ground = false;
+                return true;
+            }
+        }
+
+        false
+    }
+
     fn apply_local_block_edit(&mut self, position: WorldPos, block: BlockId) {
         let Ok((chunk_pos, local)) = position.to_chunk_local() else {
             return;
@@ -476,10 +650,10 @@ fn update_camera_physics(
     let vertical_delta = camera.vertical_velocity * dt_secs;
 
     let mut position = camera.position;
-    sweep_axis(chunk_cache, &mut position, horizontal_delta.x, Axis::X);
-    sweep_axis(chunk_cache, &mut position, horizontal_delta.z, Axis::Z);
+    sweep_axis(chunk_cache, &mut position, horizontal_delta.x, Axis::X, camera.on_ground);
+    sweep_axis(chunk_cache, &mut position, horizontal_delta.z, Axis::Z, camera.on_ground);
 
-    let moved_vertically = sweep_axis(chunk_cache, &mut position, vertical_delta, Axis::Y);
+    let moved_vertically = sweep_axis(chunk_cache, &mut position, vertical_delta, Axis::Y, false);
     if moved_vertically {
         camera.on_ground = false;
     } else {
@@ -492,6 +666,28 @@ fn update_camera_physics(
     camera.position = position;
 }
 
+fn update_camera_preview(camera: &mut Camera, dt: Duration, local_movement: Vec3, sprint: bool) {
+    let dt_secs = dt.as_secs_f32();
+    if dt_secs <= 0.0 {
+        return;
+    }
+
+    let mut horizontal = Vec3::new(local_movement.x, 0.0, local_movement.z);
+    if horizontal.length_squared() > 1.0 {
+        horizontal = horizontal.normalize();
+    }
+
+    let forward = Vec3::new(camera.yaw.sin(), 0.0, camera.yaw.cos()).normalize_or_zero();
+    let right = Vec3::new(-forward.z, 0.0, forward.x);
+    let speed = if sprint {
+        PLAYER_SPRINT_SPEED
+    } else {
+        PLAYER_WALK_SPEED
+    };
+
+    camera.position += (forward * -horizontal.z + right * horizontal.x) * speed * dt_secs;
+}
+
 #[derive(Clone, Copy)]
 enum Axis {
     X,
@@ -499,7 +695,13 @@ enum Axis {
     Z,
 }
 
-fn sweep_axis(chunk_cache: &HashMap<ChunkPos, ChunkData>, position: &mut Vec3, delta: f32, axis: Axis) -> bool {
+fn sweep_axis(
+    chunk_cache: &HashMap<ChunkPos, ChunkData>,
+    position: &mut Vec3,
+    delta: f32,
+    axis: Axis,
+    allow_step: bool,
+) -> bool {
     if delta.abs() <= f32::EPSILON {
         return false;
     }
@@ -517,6 +719,15 @@ fn sweep_axis(chunk_cache: &HashMap<ChunkPos, ChunkData>, position: &mut Vec3, d
         }
 
         if player_collides(chunk_cache, candidate) {
+            if allow_step && matches!(axis, Axis::X | Axis::Z) {
+                let mut stepped = candidate;
+                stepped.y += STEP_HEIGHT;
+                if !player_collides(chunk_cache, stepped) {
+                    *position = stepped;
+                    moved = true;
+                    continue;
+                }
+            }
             return moved;
         }
 
@@ -687,6 +898,122 @@ fn raycast_world(
     None
 }
 
+fn add_wire_box(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    min: Vec3,
+    max: Vec3,
+    thickness: f32,
+    color: [f32; 3],
+    tile: (u32, u32),
+) {
+    let corners = [
+        Vec3::new(min.x, min.y, min.z),
+        Vec3::new(max.x, min.y, min.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(min.x, min.y, max.z),
+        Vec3::new(max.x, min.y, max.z),
+        Vec3::new(max.x, max.y, max.z),
+        Vec3::new(min.x, max.y, max.z),
+    ];
+    let edges = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+
+    for (start, end) in edges {
+        add_edge_prism(vertices, indices, corners[start], corners[end], thickness, color, tile);
+    }
+}
+
+fn add_edge_prism(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    start: Vec3,
+    end: Vec3,
+    thickness: f32,
+    color: [f32; 3],
+    tile: (u32, u32),
+) {
+    let delta = end - start;
+    let midpoint = (start + end) * 0.5;
+    let half = delta * 0.5;
+    let axis_x = if delta.x.abs() > 0.0 {
+        Vec3::new(half.x, 0.0, 0.0)
+    } else {
+        Vec3::new(thickness * 0.5, 0.0, 0.0)
+    };
+    let axis_y = if delta.y.abs() > 0.0 {
+        Vec3::new(0.0, half.y, 0.0)
+    } else {
+        Vec3::new(0.0, thickness * 0.5, 0.0)
+    };
+    let axis_z = if delta.z.abs() > 0.0 {
+        Vec3::new(0.0, 0.0, half.z)
+    } else {
+        Vec3::new(0.0, 0.0, thickness * 0.5)
+    };
+    add_box_oriented(vertices, indices, midpoint, axis_x, axis_y, axis_z, color, tile);
+}
+
+fn add_box_oriented(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: Vec3,
+    axis_x: Vec3,
+    axis_y: Vec3,
+    axis_z: Vec3,
+    color: [f32; 3],
+    tile: (u32, u32),
+) {
+    let corners = [
+        center - axis_x - axis_y - axis_z,
+        center + axis_x - axis_y - axis_z,
+        center + axis_x + axis_y - axis_z,
+        center - axis_x + axis_y - axis_z,
+        center - axis_x - axis_y + axis_z,
+        center + axis_x - axis_y + axis_z,
+        center + axis_x + axis_y + axis_z,
+        center - axis_x + axis_y + axis_z,
+    ];
+    let uvs = atlas_quad(tile);
+    add_face_indices(vertices, indices, [corners[3], corners[2], corners[1], corners[0]], color, uvs);
+    add_face_indices(vertices, indices, [corners[6], corners[7], corners[4], corners[5]], color, uvs);
+    add_face_indices(vertices, indices, [corners[2], corners[6], corners[5], corners[1]], color, uvs);
+    add_face_indices(vertices, indices, [corners[7], corners[3], corners[0], corners[4]], color, uvs);
+    add_face_indices(vertices, indices, [corners[7], corners[6], corners[2], corners[3]], color, uvs);
+    add_face_indices(vertices, indices, [corners[0], corners[1], corners[5], corners[4]], color, uvs);
+}
+
+fn add_face_indices(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    positions: [Vec3; 4],
+    color: [f32; 3],
+    uvs: [[f32; 2]; 4],
+) {
+    let base = vertices.len() as u32;
+    for (position, uv) in positions.into_iter().zip(uvs) {
+        vertices.push(Vertex {
+            position: position.to_array(),
+            color,
+            uv,
+        });
+    }
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
 #[derive(Debug)]
 enum ClientCommand {
     Input { movement: [f32; 3], jump: bool },
@@ -697,7 +1024,8 @@ enum ClientCommand {
 
 #[derive(Debug)]
 enum NetworkEvent {
-    Welcome { message: String },
+    Welcome { message: String, spawn_position: WorldPos },
+    Inventory(InventorySnapshot),
     Chunk(ChunkData),
     ChunkUnload(ChunkUnload),
     PlayerState { position: [f32; 3] },
@@ -788,6 +1116,7 @@ fn network_main(events: Sender<NetworkEvent>, commands: Receiver<ClientCommand>)
     if let ServerMessage::LoginResponse(response) = login {
         let _ = events.send(NetworkEvent::Welcome {
             message: response.message,
+            spawn_position: response.spawn_position,
         });
     }
 
@@ -840,6 +1169,9 @@ fn network_main(events: Sender<NetworkEvent>, commands: Receiver<ClientCommand>)
                 }
                 ServerMessage::ChunkUnload(unload) => {
                     let _ = events.send(NetworkEvent::ChunkUnload(unload));
+                }
+                ServerMessage::InventorySnapshot(snapshot) => {
+                    let _ = events.send(NetworkEvent::Inventory(snapshot));
                 }
                 ServerMessage::PlayerStateSnapshot(state) => {
                     let _ = events.send(NetworkEvent::PlayerState { position: state.position });

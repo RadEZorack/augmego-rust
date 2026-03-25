@@ -59,12 +59,12 @@ impl PlayerService {
         }
     }
 
-    async fn login(&self, name: String) -> Player {
+    async fn login(&self, name: String, spawn: WorldPos) -> Player {
         let mut next_id = self.next_id.lock().await;
         let player = Player {
             id: *next_id,
             name,
-            position: [0.5, 90.0, 0.5],
+            position: [spawn.x as f32 + 0.5, spawn.y as f32, spawn.z as f32 + 0.5],
             velocity: [0.0; 3],
             subscribed_chunks: HashSet::new(),
         };
@@ -150,6 +150,15 @@ impl WorldService {
             accepted: true,
             reason: "ok".to_string(),
         })
+    }
+
+    pub fn safe_spawn_position(&self) -> WorldPos {
+        let surface = self.generator.surface_height(0, 0);
+        WorldPos {
+            x: 0,
+            y: (surface + 3).min(CHUNK_HEIGHT - 1),
+            z: 0,
+        }
     }
 }
 
@@ -319,7 +328,8 @@ impl VoxelServer {
             _ => return Err(anyhow!("expected login request")),
         };
 
-        let player = self.player_service.login(login.name).await;
+        let spawn_position = self.world_service.safe_spawn_position();
+        let player = self.player_service.login(login.name, spawn_position).await;
         tracing::info!(player_id = player.id, name = %player.name, "player joined");
 
         write_message(
@@ -327,7 +337,7 @@ impl VoxelServer {
             &ServerMessage::LoginResponse(LoginResponse {
                 accepted: true,
                 player_id: player.id,
-                spawn_position: WorldPos { x: 0, y: 90, z: 0 },
+                spawn_position,
                 message: format!("Welcome, {}", player.name),
             }),
         )

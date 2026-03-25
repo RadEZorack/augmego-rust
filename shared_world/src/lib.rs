@@ -231,6 +231,12 @@ impl TerrainGenerator {
         ChunkData::from_voxels(position, biome, voxels)
     }
 
+    pub fn surface_height(&self, x: i64, z: i64) -> i32 {
+        let chunk = ChunkPos::from_world(shared_math::WorldPos { x, y: 0, z });
+        let biome = self.biome_at(chunk);
+        self.height_at(x, z, biome)
+    }
+
     fn biome_at(&self, position: ChunkPos) -> BiomeId {
         match self.hash(i64::from(position.x), i64::from(position.z), 7) % 4 {
             0 => BiomeId::Plains,

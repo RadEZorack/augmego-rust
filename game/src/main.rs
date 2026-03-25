@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use glam::{Mat4, Vec3};
-use shared_math::{CHUNK_DEPTH, CHUNK_WIDTH, ChunkPos, WorldPos};
+use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
-    ChunkUnload, ClientHello, ClientMessage, LoginRequest, PROTOCOL_VERSION, ServerMessage,
-    SubscribeChunks, decode, frame,
+    BreakBlockRequest, ChunkUnload, ClientHello, ClientMessage, LoginRequest, PROTOCOL_VERSION,
+    PlaceBlockRequest, ServerMessage, SubscribeChunks, decode, frame,
 };
 use shared_world::{BlockId, ChunkData};
 use std::collections::{HashMap, HashSet};
@@ -14,14 +14,22 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use wgpu_lite::{Mesh, Renderer, Vertex};
-use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
+use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::WindowBuilder;
+use winit::window::{CursorGrabMode, Window, WindowBuilder};
 
 const CHUNK_RADIUS: u8 = 12;
 const CHUNK_WORLD_RADIUS: f32 = (CHUNK_WIDTH as f32) * 0.5;
 const DRAW_DISTANCE_CHUNKS: f32 = 18.0;
+const PLAYER_RADIUS: f32 = 0.35;
+const PLAYER_HEIGHT: f32 = 1.8;
+const PLAYER_EYE_HEIGHT: f32 = 1.62;
+const PLAYER_WALK_SPEED: f32 = 7.5;
+const PLAYER_SPRINT_SPEED: f32 = 11.0;
+const PLAYER_JUMP_SPEED: f32 = 9.5;
+const PLAYER_GRAVITY: f32 = 28.0;
+const COLLISION_STEP: f32 = 0.2;
 
 fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
@@ -30,6 +38,7 @@ fn main() -> Result<()> {
             .with_title("Augmego Voxel Sandbox")
             .build(&event_loop)?,
     ));
+    set_mouse_capture(window, true);
 
     let renderer = pollster::block_on(Renderer::new(window))?;
     let (network_tx, network_rx) = mpsc::channel();
@@ -54,7 +63,17 @@ fn main() -> Result<()> {
                     app.resize(size.width, size.height);
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
-                    app.handle_key(event);
+                    if app.handle_key(event) {
+                        set_mouse_capture(window, false);
+                    }
+                }
+                WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
+                    if !app.mouse_captured {
+                        set_mouse_capture(window, true);
+                        app.mouse_captured = true;
+                        return;
+                    }
+                    app.handle_mouse_button(button);
                 }
                 WindowEvent::RedrawRequested => {
                     app.drain_network();
@@ -74,7 +93,9 @@ fn main() -> Result<()> {
                 _ => {}
             },
             Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta }, .. } => {
-                app.handle_mouse_motion(delta.0 as f32, delta.1 as f32);
+                if app.mouse_captured {
+                    app.handle_mouse_motion(delta.0 as f32, delta.1 as f32);
+                }
             }
             Event::AboutToWait => {
                 window.request_redraw();
@@ -101,6 +122,8 @@ struct GameApp {
     inflight_meshes: HashSet<ChunkPos>,
     dirty_meshes: HashSet<ChunkPos>,
     current_subscription_center: Option<ChunkPos>,
+    physics_ready: bool,
+    mouse_captured: bool,
 }
 
 impl GameApp {
@@ -126,6 +149,8 @@ impl GameApp {
             inflight_meshes: HashSet::new(),
             dirty_meshes: HashSet::new(),
             current_subscription_center: None,
+            physics_ready: false,
+            mouse_captured: true,
         }
     }
 
@@ -134,11 +159,16 @@ impl GameApp {
         self.height = height.max(1);
     }
 
-    fn handle_key(&mut self, event: KeyEvent) {
+    fn handle_key(&mut self, event: KeyEvent) -> bool {
         let code = match event.physical_key {
             PhysicalKey::Code(code) => code,
-            _ => return,
+            _ => return false,
         };
+
+        if code == KeyCode::Escape && event.state == ElementState::Pressed {
+            self.mouse_captured = false;
+            return true;
+        }
 
         match event.state {
             ElementState::Pressed => {
@@ -148,11 +178,46 @@ impl GameApp {
                 self.pressed.remove(&code);
             }
         }
+
+        false
     }
 
     fn handle_mouse_motion(&mut self, dx: f32, dy: f32) {
         self.camera.yaw -= dx * 0.0025;
         self.camera.pitch = (self.camera.pitch - dy * 0.0025).clamp(-1.45, 1.45);
+    }
+
+    fn handle_mouse_button(&mut self, button: MouseButton) {
+        if !self.spawned || !self.physics_ready {
+            return;
+        }
+
+        let Some(hit) = raycast_world(&self.chunk_cache, self.camera.position, self.camera.forward(), 6.0) else {
+            return;
+        };
+
+        match button {
+            MouseButton::Left => {
+                self.apply_local_block_edit(hit.block, BlockId::Air);
+                let _ = self.command_tx.send(ClientCommand::BreakBlock(hit.block));
+            }
+            MouseButton::Right => {
+                let Some(place_at) = hit.previous_empty else {
+                    return;
+                };
+
+                if player_collides_with_world_pos(&self.chunk_cache, self.camera.position, place_at, BlockId::Stone) {
+                    return;
+                }
+
+                self.apply_local_block_edit(place_at, BlockId::Stone);
+                let _ = self.command_tx.send(ClientCommand::PlaceBlock {
+                    position: place_at,
+                    block: BlockId::Stone,
+                });
+            }
+            _ => {}
+        }
     }
 
     fn drain_network(&mut self) {
@@ -174,10 +239,13 @@ impl GameApp {
                     println!("{message}");
                 }
                 NetworkEvent::PlayerState { position } => {
-                    let server_camera = Vec3::new(position[0], position[1] + 4.0, position[2] + 8.0);
+                    let server_camera = Vec3::new(position[0], position[1] + PLAYER_EYE_HEIGHT, position[2]);
                     if !self.spawned {
                         self.camera.position = server_camera;
+                        self.camera.vertical_velocity = 0.0;
+                        self.camera.on_ground = false;
                         self.spawned = true;
+                        self.physics_ready = false;
                     }
                 }
                 NetworkEvent::BlockAction(message) => {
@@ -195,6 +263,19 @@ impl GameApp {
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
 
+        if !self.spawned {
+            return;
+        }
+
+        if !self.physics_ready {
+            self.update_chunk_subscription();
+            if self.chunk_cache.contains_key(&world_to_chunk(self.camera.position)) {
+                self.snap_to_ground();
+                self.physics_ready = true;
+            }
+            return;
+        }
+
         let mut movement = Vec3::ZERO;
         if self.pressed.contains(&KeyCode::KeyW) {
             movement.z -= 1.0;
@@ -208,18 +289,15 @@ impl GameApp {
         if self.pressed.contains(&KeyCode::KeyD) {
             movement.x += 1.0;
         }
-        if self.pressed.contains(&KeyCode::Space) {
-            movement.y += 1.0;
-        }
-        if self.pressed.contains(&KeyCode::ShiftLeft) {
-            movement.y -= 1.0;
-        }
+        let jump = self.pressed.contains(&KeyCode::Space);
+        let sprint = self.pressed.contains(&KeyCode::ShiftLeft);
 
-        self.camera.update(dt, movement);
+        update_camera_physics(&self.chunk_cache, &mut self.camera, dt, movement, jump, sprint);
         self.update_chunk_subscription();
 
         let _ = self.command_tx.send(ClientCommand::Input {
-            movement: [movement.x, movement.y, movement.z],
+            movement: [movement.x, 0.0, movement.z],
+            jump,
         });
     }
 
@@ -304,6 +382,34 @@ impl GameApp {
             .command_tx
             .send(ClientCommand::SubscribeChunks(SubscribeChunks { center, radius: CHUNK_RADIUS }));
     }
+
+    fn snap_to_ground(&mut self) {
+        let foot_x = self.camera.position.x.floor() as i32;
+        let foot_z = self.camera.position.z.floor() as i32;
+        let start_y = (self.camera.position.y - PLAYER_EYE_HEIGHT).floor() as i32;
+
+        for y in (0..=start_y.max(0)).rev() {
+            if world_block_is_solid(&self.chunk_cache, foot_x, y, foot_z) {
+                self.camera.position.y = y as f32 + 1.0 + PLAYER_EYE_HEIGHT;
+                self.camera.vertical_velocity = 0.0;
+                self.camera.on_ground = true;
+                return;
+            }
+        }
+    }
+
+    fn apply_local_block_edit(&mut self, position: WorldPos, block: BlockId) {
+        let Ok((chunk_pos, local)) = position.to_chunk_local() else {
+            return;
+        };
+
+        let Some(chunk) = self.chunk_cache.get_mut(&chunk_pos) else {
+            return;
+        };
+
+        chunk.set_voxel(local, shared_world::Voxel { block });
+        self.schedule_mesh(chunk_pos);
+    }
 }
 
 #[derive(Default)]
@@ -311,15 +417,11 @@ struct Camera {
     position: Vec3,
     yaw: f32,
     pitch: f32,
+    vertical_velocity: f32,
+    on_ground: bool,
 }
 
 impl Camera {
-    fn update(&mut self, dt: Duration, local_movement: Vec3) {
-        let forward = Vec3::new(self.yaw.sin(), 0.0, self.yaw.cos()).normalize_or_zero();
-        let right = Vec3::new(forward.z, 0.0, -forward.x);
-        let speed = 18.0 * dt.as_secs_f32();
-        self.position += (forward * -local_movement.z + right * local_movement.x + Vec3::Y * local_movement.y) * speed;
-    }
 
     fn matrix(&self, aspect: f32) -> Mat4 {
         let look = self.forward();
@@ -338,10 +440,259 @@ impl Camera {
     }
 }
 
+fn update_camera_physics(
+    chunk_cache: &HashMap<ChunkPos, ChunkData>,
+    camera: &mut Camera,
+    dt: Duration,
+    local_movement: Vec3,
+    jump: bool,
+    sprint: bool,
+) {
+    let dt_secs = dt.as_secs_f32();
+    if dt_secs <= 0.0 {
+        return;
+    }
+
+    let mut horizontal = Vec3::new(local_movement.x, 0.0, local_movement.z);
+    if horizontal.length_squared() > 1.0 {
+        horizontal = horizontal.normalize();
+    }
+
+    let forward = Vec3::new(camera.yaw.sin(), 0.0, camera.yaw.cos()).normalize_or_zero();
+    let right = Vec3::new(-forward.z, 0.0, forward.x);
+    let speed = if sprint {
+        PLAYER_SPRINT_SPEED
+    } else {
+        PLAYER_WALK_SPEED
+    };
+    let horizontal_delta = (forward * -horizontal.z + right * horizontal.x) * speed * dt_secs;
+
+    if jump && camera.on_ground {
+        camera.vertical_velocity = PLAYER_JUMP_SPEED;
+        camera.on_ground = false;
+    }
+
+    camera.vertical_velocity -= PLAYER_GRAVITY * dt_secs;
+    let vertical_delta = camera.vertical_velocity * dt_secs;
+
+    let mut position = camera.position;
+    sweep_axis(chunk_cache, &mut position, horizontal_delta.x, Axis::X);
+    sweep_axis(chunk_cache, &mut position, horizontal_delta.z, Axis::Z);
+
+    let moved_vertically = sweep_axis(chunk_cache, &mut position, vertical_delta, Axis::Y);
+    if moved_vertically {
+        camera.on_ground = false;
+    } else {
+        if camera.vertical_velocity < 0.0 {
+            camera.on_ground = true;
+        }
+        camera.vertical_velocity = 0.0;
+    }
+
+    camera.position = position;
+}
+
+#[derive(Clone, Copy)]
+enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+fn sweep_axis(chunk_cache: &HashMap<ChunkPos, ChunkData>, position: &mut Vec3, delta: f32, axis: Axis) -> bool {
+    if delta.abs() <= f32::EPSILON {
+        return false;
+    }
+
+    let steps = (delta.abs() / COLLISION_STEP).ceil().max(1.0) as usize;
+    let step = delta / steps as f32;
+    let mut moved = false;
+
+    for _ in 0..steps {
+        let mut candidate = *position;
+        match axis {
+            Axis::X => candidate.x += step,
+            Axis::Y => candidate.y += step,
+            Axis::Z => candidate.z += step,
+        }
+
+        if player_collides(chunk_cache, candidate) {
+            return moved;
+        }
+
+        *position = candidate;
+        moved = true;
+    }
+
+    moved
+}
+
+fn player_collides(chunk_cache: &HashMap<ChunkPos, ChunkData>, eye_position: Vec3) -> bool {
+    let min = Vec3::new(
+        eye_position.x - PLAYER_RADIUS,
+        eye_position.y - PLAYER_EYE_HEIGHT,
+        eye_position.z - PLAYER_RADIUS,
+    );
+    let max = Vec3::new(
+        eye_position.x + PLAYER_RADIUS,
+        eye_position.y + (PLAYER_HEIGHT - PLAYER_EYE_HEIGHT),
+        eye_position.z + PLAYER_RADIUS,
+    );
+
+    let min_x = min.x.floor() as i32;
+    let max_x = (max.x - 0.001).floor() as i32;
+    let min_y = min.y.floor() as i32;
+    let max_y = (max.y - 0.001).floor() as i32;
+    let min_z = min.z.floor() as i32;
+    let max_z = (max.z - 0.001).floor() as i32;
+
+    for y in min_y..=max_y {
+        for z in min_z..=max_z {
+            for x in min_x..=max_x {
+                if world_block_is_solid(chunk_cache, x, y, z) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn player_collides_with_world_pos(
+    chunk_cache: &HashMap<ChunkPos, ChunkData>,
+    eye_position: Vec3,
+    position: WorldPos,
+    block: BlockId,
+) -> bool {
+    let min = Vec3::new(
+        eye_position.x - PLAYER_RADIUS,
+        eye_position.y - PLAYER_EYE_HEIGHT,
+        eye_position.z - PLAYER_RADIUS,
+    );
+    let max = Vec3::new(
+        eye_position.x + PLAYER_RADIUS,
+        eye_position.y + (PLAYER_HEIGHT - PLAYER_EYE_HEIGHT),
+        eye_position.z + PLAYER_RADIUS,
+    );
+
+    let min_x = min.x.floor() as i32;
+    let max_x = (max.x - 0.001).floor() as i32;
+    let min_y = min.y.floor() as i32;
+    let max_y = (max.y - 0.001).floor() as i32;
+    let min_z = min.z.floor() as i32;
+    let max_z = (max.z - 0.001).floor() as i32;
+
+    for y in min_y..=max_y {
+        for z in min_z..=max_z {
+            for x in min_x..=max_x {
+                if i64::from(x) == position.x && y == position.y && i64::from(z) == position.z {
+                    if block_is_solid(block) {
+                        return true;
+                    }
+                    continue;
+                }
+
+                if world_block_is_solid(chunk_cache, x, y, z) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn world_block_is_solid(chunk_cache: &HashMap<ChunkPos, ChunkData>, x: i32, y: i32, z: i32) -> bool {
+    if y < 0 {
+        return true;
+    }
+
+    if y >= CHUNK_HEIGHT {
+        return false;
+    }
+
+    let world = WorldPos {
+        x: i64::from(x),
+        y,
+        z: i64::from(z),
+    };
+    let chunk_pos = ChunkPos::from_world(world);
+    let local = LocalVoxelPos {
+        x: x.rem_euclid(CHUNK_WIDTH) as u8,
+        y: y as u8,
+        z: z.rem_euclid(CHUNK_DEPTH) as u8,
+    };
+
+    let Some(chunk) = chunk_cache.get(&chunk_pos) else {
+        return false;
+    };
+
+    block_is_solid(chunk.voxel(local).block)
+}
+
+fn block_is_solid(block: BlockId) -> bool {
+    matches!(
+        block,
+        BlockId::Grass
+            | BlockId::Dirt
+            | BlockId::Stone
+            | BlockId::Sand
+            | BlockId::Log
+            | BlockId::Planks
+            | BlockId::Glass
+            | BlockId::Lantern
+            | BlockId::Storage
+    )
+}
+
+struct RaycastHit {
+    block: WorldPos,
+    previous_empty: Option<WorldPos>,
+}
+
+fn raycast_world(
+    chunk_cache: &HashMap<ChunkPos, ChunkData>,
+    origin: Vec3,
+    direction: Vec3,
+    max_distance: f32,
+) -> Option<RaycastHit> {
+    let direction = direction.normalize_or_zero();
+    if direction == Vec3::ZERO {
+        return None;
+    }
+
+    let step = 0.1;
+    let steps = (max_distance / step).ceil() as usize;
+    let mut previous_empty = None;
+
+    for index in 1..=steps {
+        let sample = origin + direction * (index as f32 * step);
+        let world = WorldPos {
+            x: sample.x.floor() as i64,
+            y: sample.y.floor() as i32,
+            z: sample.z.floor() as i64,
+        };
+
+        if world_block_is_solid(chunk_cache, world.x as i32, world.y, world.z as i32) {
+            return Some(RaycastHit {
+                block: world,
+                previous_empty,
+            });
+        }
+
+        previous_empty = Some(world);
+    }
+
+    None
+}
+
 #[derive(Debug)]
 enum ClientCommand {
-    Input { movement: [f32; 3] },
+    Input { movement: [f32; 3], jump: bool },
     SubscribeChunks(SubscribeChunks),
+    PlaceBlock { position: WorldPos, block: BlockId },
+    BreakBlock(WorldPos),
 }
 
 #[derive(Debug)]
@@ -453,19 +804,31 @@ fn network_main(events: Sender<NetworkEvent>, commands: Receiver<ClientCommand>)
     loop {
         while let Ok(command) = commands.try_recv() {
             match command {
-                ClientCommand::Input { movement } => {
+                ClientCommand::Input { movement, jump } => {
                     tick += 1;
                     write_client(
                         &mut stream,
                         &ClientMessage::PlayerInputTick(shared_protocol::PlayerInputTick {
                             tick,
                             movement,
-                            jump: false,
+                            jump,
                         }),
                     )?;
                 }
                 ClientCommand::SubscribeChunks(request) => {
                     write_client(&mut stream, &ClientMessage::SubscribeChunks(request))?;
+                }
+                ClientCommand::PlaceBlock { position, block } => {
+                    write_client(
+                        &mut stream,
+                        &ClientMessage::PlaceBlockRequest(PlaceBlockRequest { position, block }),
+                    )?;
+                }
+                ClientCommand::BreakBlock(position) => {
+                    write_client(
+                        &mut stream,
+                        &ClientMessage::BreakBlockRequest(BreakBlockRequest { position }),
+                    )?;
                 }
             }
         }
@@ -718,4 +1081,16 @@ fn brighten(color: [f32; 3], amount: f32) -> [f32; 3] {
         (color[1] + amount).min(1.0),
         (color[2] + amount).min(1.0),
     ]
+}
+
+fn set_mouse_capture(window: &Window, captured: bool) {
+    if captured {
+        let _ = window
+            .set_cursor_grab(CursorGrabMode::Locked)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+        window.set_cursor_visible(false);
+    } else {
+        let _ = window.set_cursor_grab(CursorGrabMode::None);
+        window.set_cursor_visible(true);
+    }
 }

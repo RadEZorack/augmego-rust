@@ -95,6 +95,10 @@ impl PlayerService {
     async fn remove(&self, player_id: u64) {
         self.players.lock().await.remove(&player_id);
     }
+
+    async fn player(&self, player_id: u64) -> Option<Player> {
+        self.players.lock().await.get(&player_id).cloned()
+    }
 }
 
 #[derive(Clone)]
@@ -394,7 +398,11 @@ impl VoxelServer {
                 }
             }
             ClientMessage::PlaceBlockRequest(request) => {
-                if !within_reach(request.position) {
+                let Some(player) = self.player_service.player(player_id).await else {
+                    return Ok(());
+                };
+
+                if !within_reach(player.position, request.position) {
                     write_message(
                         stream,
                         &ServerMessage::BlockActionResult(BlockActionResult {
@@ -409,8 +417,23 @@ impl VoxelServer {
                 }
             }
             ClientMessage::BreakBlockRequest(request) => {
-                let result = self.world_service.apply_block_edit(request.position, BlockId::Air).await?;
-                write_message(stream, &ServerMessage::BlockActionResult(result)).await?;
+                let Some(player) = self.player_service.player(player_id).await else {
+                    return Ok(());
+                };
+
+                if !within_reach(player.position, request.position) {
+                    write_message(
+                        stream,
+                        &ServerMessage::BlockActionResult(BlockActionResult {
+                            accepted: false,
+                            reason: "target outside break reach".to_string(),
+                        }),
+                    )
+                    .await?;
+                } else {
+                    let result = self.world_service.apply_block_edit(request.position, BlockId::Air).await?;
+                    write_message(stream, &ServerMessage::BlockActionResult(result)).await?;
+                }
             }
             ClientMessage::ChatMessage(message) => {
                 write_message(stream, &ServerMessage::ChatMessage(message)).await?;
@@ -434,11 +457,11 @@ impl Clone for VoxelServer {
     }
 }
 
-fn within_reach(position: WorldPos) -> bool {
-    let origin = WorldPos { x: 0, y: 90, z: 0 };
-    let dx = (position.x - origin.x) as f32;
-    let dy = (position.y - origin.y) as f32;
-    let dz = (position.z - origin.z) as f32;
+fn within_reach(player_position: [f32; 3], target: WorldPos) -> bool {
+    let origin = [player_position[0], player_position[1] + 1.6, player_position[2]];
+    let dx = target.x as f32 + 0.5 - origin[0];
+    let dy = target.y as f32 + 0.5 - origin[1];
+    let dz = target.z as f32 + 0.5 - origin[2];
     let distance_squared = dx * dx + dy * dy + dz * dz;
     distance_squared <= 8.0_f32.powi(2)
 }

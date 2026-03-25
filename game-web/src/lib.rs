@@ -177,6 +177,8 @@ struct WebApp {
     selected_hotbar: usize,
     player_id: Option<u64>,
     remote_players: HashMap<u64, [f32; 3]>,
+    last_sent_position: Option<[f32; 3]>,
+    last_sent_velocity: Option<[f32; 3]>,
     tick_counter: u64,
     transport_open: bool,
     logged_in: bool,
@@ -239,6 +241,8 @@ impl WebApp {
             selected_hotbar: 0,
             player_id: None,
             remote_players: HashMap::new(),
+            last_sent_position: None,
+            last_sent_velocity: None,
             tick_counter: 0,
             transport_open: false,
             logged_in: false,
@@ -377,6 +381,8 @@ impl WebApp {
                             self.logged_in = true;
                             self.player_id = Some(response.player_id);
                             self.remote_players.clear();
+                            self.last_sent_position = None;
+                            self.last_sent_velocity = None;
                             self.camera.position = Vec3::new(
                                 response.spawn_position.x as f32 + 0.5,
                                 response.spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
@@ -506,16 +512,52 @@ impl WebApp {
         let right = Vec3::new(-forward.z, 0.0, forward.x);
         let world_movement = forward * -movement_for_server.z + right * movement_for_server.x;
 
+        let previous_position = self.camera.position;
         self.update_camera_physics(dt, movement, jump, sprint);
         if !self.logged_in {
             return;
         }
-        self.tick_counter = self.tick_counter.wrapping_add(1);
-        self.send_client_message(&ClientMessage::PlayerInputTick(PlayerInputTick {
-            tick: self.tick_counter,
-            movement: [world_movement.x, 0.0, world_movement.z],
-            jump,
-        }));
+        let dt_secs = dt.as_secs_f32();
+        let actual_velocity = if dt_secs > 0.0 {
+            (self.camera.position - previous_position) / dt_secs
+        } else {
+            Vec3::ZERO
+        };
+        let position = self.camera.position.to_array();
+        let velocity = [actual_velocity.x, self.camera.vertical_velocity, actual_velocity.z];
+        let input_active = movement != Vec3::ZERO || jump || sprint;
+        let should_broadcast_motion = input_active || !self.camera.on_ground;
+        let position_changed = self
+            .last_sent_position
+            .map(|last| {
+                let dx = position[0] - last[0];
+                let dy = position[1] - last[1];
+                let dz = position[2] - last[2];
+                dx * dx + dy * dy + dz * dz > 0.0001
+            })
+            .unwrap_or(true);
+        let velocity_changed = self
+            .last_sent_velocity
+            .map(|last| {
+                let dx = velocity[0] - last[0];
+                let dy = velocity[1] - last[1];
+                let dz = velocity[2] - last[2];
+                dx * dx + dy * dy + dz * dz > 0.0025
+            })
+            .unwrap_or(true);
+
+        if should_broadcast_motion && (position_changed || velocity_changed) {
+            self.tick_counter = self.tick_counter.wrapping_add(1);
+            self.send_client_message(&ClientMessage::PlayerInputTick(PlayerInputTick {
+                tick: self.tick_counter,
+                movement: [world_movement.x, 0.0, world_movement.z],
+                position: Some(position),
+                velocity: Some(velocity),
+                jump,
+            }));
+            self.last_sent_position = Some(position);
+            self.last_sent_velocity = Some(velocity);
+        }
     }
 
     fn camera_matrix(&self) -> Mat4 {

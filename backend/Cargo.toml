@@ -9,6 +9,7 @@ authors.workspace = true
 anyhow.workspace = true
 bincode.workspace = true
 futures-util = "0.3"
+glam.workspace = true
 serde.workspace = true
 shared_content = { path = "../shared_content" }
 shared_math = { path = "../shared_math" }

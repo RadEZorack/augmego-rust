@@ -1335,6 +1335,8 @@ fn network_main(events: Sender<NetworkEvent>, commands: Receiver<ClientCommand>)
                         &ClientMessage::PlayerInputTick(shared_protocol::PlayerInputTick {
                             tick,
                             movement,
+                            position: None,
+                            velocity: None,
                             jump,
                         }),
                     )?;

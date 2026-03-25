@@ -3,7 +3,7 @@ use shared_math::{ChunkPos, WorldPos};
 use shared_world::{BlockId, ChunkData, ChunkDelta};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -46,6 +46,8 @@ pub struct ChunkUnload {
 pub struct PlayerInputTick {
     pub tick: u64,
     pub movement: [f32; 3],
+    pub position: Option<[f32; 3]>,
+    pub velocity: Option<[f32; 3]>,
     pub jump: bool,
 }
 

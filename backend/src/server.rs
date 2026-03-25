@@ -2,6 +2,7 @@ use crate::net::{is_disconnect, read_message, write_message};
 use crate::persistence::PersistenceService;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use glam::Vec3;
 use shared_content::block_definitions;
 use shared_math::{CHUNK_HEIGHT, ChunkPos, WorldPos};
 use shared_protocol::{
@@ -18,6 +19,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::yield_now;
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
+
+const PLAYER_RADIUS: f32 = 0.35;
+const PLAYER_HEIGHT: f32 = 1.8;
+const PLAYER_EYE_HEIGHT: f32 = 1.62;
+const COLLISION_STEP: f32 = 0.2;
+const STEP_HEIGHT: f32 = 0.6;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -77,13 +84,11 @@ impl PlayerService {
         player
     }
 
-    async fn update(&self, player_id: u64, movement: [f32; 3]) -> Option<Player> {
+    async fn update_motion(&self, player_id: u64, position: [f32; 3], velocity: [f32; 3]) -> Option<Player> {
         let mut players = self.players.lock().await;
         let player = players.get_mut(&player_id)?;
-        player.velocity = [movement[0] * 0.2, movement[1], movement[2] * 0.2];
-        player.position[0] += player.velocity[0];
-        player.position[1] = player.position[1].clamp(1.0, (CHUNK_HEIGHT - 1) as f32);
-        player.position[2] += player.velocity[2];
+        player.position = position;
+        player.velocity = velocity;
         Some(player.clone())
     }
 
@@ -215,6 +220,118 @@ impl WorldService {
             z: 0,
         }
     }
+
+    pub async fn resolve_player_motion(
+        &self,
+        eye_position: [f32; 3],
+        movement: [f32; 3],
+    ) -> Result<([f32; 3], [f32; 3])> {
+        let velocity = [movement[0] * 0.2, 0.0, movement[2] * 0.2];
+        let mut position = Vec3::from_array(eye_position);
+
+        self.sweep_axis(&mut position, velocity[0], MovementAxis::X, true).await?;
+        self.sweep_axis(&mut position, velocity[2], MovementAxis::Z, true).await?;
+        position.y = position.y.clamp(1.0 + PLAYER_EYE_HEIGHT, (CHUNK_HEIGHT - 1) as f32 + PLAYER_EYE_HEIGHT);
+
+        Ok((position.to_array(), velocity))
+    }
+
+    async fn sweep_axis(
+        &self,
+        position: &mut Vec3,
+        delta: f32,
+        axis: MovementAxis,
+        allow_step: bool,
+    ) -> Result<bool> {
+        if delta.abs() <= f32::EPSILON {
+            return Ok(false);
+        }
+
+        let steps = (delta.abs() / COLLISION_STEP).ceil().max(1.0) as usize;
+        let step = delta / steps as f32;
+        let mut moved = false;
+
+        for _ in 0..steps {
+            let mut candidate = *position;
+            match axis {
+                MovementAxis::X => candidate.x += step,
+                MovementAxis::Z => candidate.z += step,
+            }
+
+            if self.player_collides(candidate).await? {
+                if allow_step && matches!(axis, MovementAxis::X | MovementAxis::Z) {
+                    let mut stepped = candidate;
+                    stepped.y += STEP_HEIGHT;
+                    if !self.player_collides(stepped).await? {
+                        *position = stepped;
+                        moved = true;
+                        continue;
+                    }
+                }
+                return Ok(moved);
+            }
+
+            *position = candidate;
+            moved = true;
+        }
+
+        Ok(moved)
+    }
+
+    async fn player_collides(&self, eye_position: Vec3) -> Result<bool> {
+        let min = Vec3::new(
+            eye_position.x - PLAYER_RADIUS,
+            eye_position.y - PLAYER_EYE_HEIGHT,
+            eye_position.z - PLAYER_RADIUS,
+        );
+        let max = Vec3::new(
+            eye_position.x + PLAYER_RADIUS,
+            eye_position.y + (PLAYER_HEIGHT - PLAYER_EYE_HEIGHT),
+            eye_position.z + PLAYER_RADIUS,
+        );
+
+        let min_x = min.x.floor() as i32;
+        let max_x = (max.x - 0.001).floor() as i32;
+        let min_y = min.y.floor() as i32;
+        let max_y = (max.y - 0.001).floor() as i32;
+        let min_z = min.z.floor() as i32;
+        let max_z = (max.z - 0.001).floor() as i32;
+
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                for x in min_x..=max_x {
+                    if self.world_block_is_solid(x, y, z).await? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn world_block_is_solid(&self, x: i32, y: i32, z: i32) -> Result<bool> {
+        if y < 0 {
+            return Ok(true);
+        }
+        if y >= CHUNK_HEIGHT {
+            return Ok(false);
+        }
+
+        let world = WorldPos {
+            x: i64::from(x),
+            y,
+            z: i64::from(z),
+        };
+        let (chunk_pos, local) = world.to_chunk_local().context("convert world position for collision")?;
+        Ok(!self.chunk(chunk_pos).await?.voxel(local).block.is_transparent())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MovementAxis {
+    X,
+    Z,
 }
 
 #[derive(Clone)]
@@ -619,17 +736,31 @@ impl VoxelServer {
                     .await?;
             }
             ClientMessage::PlayerInputTick(input) => {
-                if let Some(player) = self.player_service.update(player_id, input.movement).await {
-                    write_message(
-                        stream,
-                        &ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
-                            player_id,
-                            tick: input.tick,
-                            position: player.position,
-                            velocity: player.velocity,
-                        }),
-                    )
-                    .await?;
+                if let Some(current_player) = self.player_service.player(player_id).await {
+                    let (position, velocity) = if let Some(position) = input.position {
+                        (position, input.velocity.unwrap_or([0.0; 3]))
+                    } else {
+                        self.world_service
+                            .resolve_player_motion(current_player.position, input.movement)
+                            .await?
+                    };
+
+                    if let Some(player) = self
+                        .player_service
+                        .update_motion(player_id, position, velocity)
+                        .await
+                    {
+                        write_message(
+                            stream,
+                            &ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
+                                player_id,
+                                tick: input.tick,
+                                position: player.position,
+                                velocity: player.velocity,
+                            }),
+                        )
+                        .await?;
+                    }
                 }
             }
             ClientMessage::PlaceBlockRequest(request) => {
@@ -692,15 +823,34 @@ impl VoxelServer {
                     .await?;
             }
             ClientMessage::PlayerInputTick(input) => {
-                if let Some(player) = self.player_service.update(player_id, input.movement).await {
-                    let _ = sender.send(ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
-                        player_id,
-                        tick: input.tick,
-                        position: player.position,
-                        velocity: player.velocity,
-                    }));
-                    self.broadcast_player_snapshot(player_id, input.tick, player.position, player.velocity)
+                if let Some(current_player) = self.player_service.player(player_id).await {
+                    let (position, velocity) = if let Some(position) = input.position {
+                        (position, input.velocity.unwrap_or([0.0; 3]))
+                    } else {
+                        self.world_service
+                            .resolve_player_motion(current_player.position, input.movement)
+                            .await?
+                    };
+
+                    if let Some(player) = self
+                        .player_service
+                        .update_motion(player_id, position, velocity)
+                        .await
+                    {
+                        let _ = sender.send(ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
+                            player_id,
+                            tick: input.tick,
+                            position: player.position,
+                            velocity: player.velocity,
+                        }));
+                        self.broadcast_player_snapshot(
+                            player_id,
+                            input.tick,
+                            player.position,
+                            player.velocity,
+                        )
                         .await;
+                    }
                 }
             }
             ClientMessage::PlaceBlockRequest(request) => {

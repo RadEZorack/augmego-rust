@@ -39,6 +39,33 @@ pub struct Mesh {
     index_count: u32,
 }
 
+struct DepthTarget {
+    view: wgpu::TextureView,
+}
+
+impl DepthTarget {
+    fn new(device: &wgpu::Device, size: PhysicalSize<u32>) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth-texture"),
+            size: wgpu::Extent3d {
+                width: size.width.max(1),
+                height: size.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth24Plus,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+
+        Self {
+            view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
@@ -54,6 +81,7 @@ pub struct Renderer<'a> {
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    depth: DepthTarget,
 }
 
 impl<'a> Renderer<'a> {
@@ -168,7 +196,13 @@ impl<'a> Renderer<'a> {
                 polygon_mode: wgpu::PolygonMode::Fill,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -183,6 +217,8 @@ impl<'a> Renderer<'a> {
             multiview: None,
         });
 
+        let depth = DepthTarget::new(&device, size);
+
         Ok(Self {
             surface,
             device,
@@ -192,6 +228,7 @@ impl<'a> Renderer<'a> {
             pipeline,
             camera_buffer,
             camera_bind_group,
+            depth,
         })
     }
 
@@ -204,6 +241,7 @@ impl<'a> Renderer<'a> {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        self.depth = DepthTarget::new(&self.device, size);
     }
 
     pub fn create_mesh(&self, vertices: &[Vertex], indices: &[u32]) -> Mesh {
@@ -265,7 +303,14 @@ impl<'a> Renderer<'a> {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });

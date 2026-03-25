@@ -442,40 +442,40 @@ fn face_vertices(origin: [f32; 3], face: Face, color: [f32; 3]) -> [Vertex; 4] {
     let [x, y, z] = origin;
     match face {
         Face::North => [
-            v(x, y, z, color),
-            v(x + 1.0, y, z, color),
-            v(x + 1.0, y + 1.0, z, color),
             v(x, y + 1.0, z, color),
+            v(x + 1.0, y + 1.0, z, color),
+            v(x + 1.0, y, z, color),
+            v(x, y, z, color),
         ],
         Face::South => [
-            v(x + 1.0, y, z + 1.0, color),
-            v(x, y, z + 1.0, color),
-            v(x, y + 1.0, z + 1.0, color),
             v(x + 1.0, y + 1.0, z + 1.0, color),
+            v(x, y + 1.0, z + 1.0, color),
+            v(x, y, z + 1.0, color),
+            v(x + 1.0, y, z + 1.0, color),
         ],
         Face::East => [
-            v(x + 1.0, y, z, color),
-            v(x + 1.0, y, z + 1.0, color),
-            v(x + 1.0, y + 1.0, z + 1.0, color),
             v(x + 1.0, y + 1.0, z, color),
+            v(x + 1.0, y + 1.0, z + 1.0, color),
+            v(x + 1.0, y, z + 1.0, color),
+            v(x + 1.0, y, z, color),
         ],
         Face::West => [
-            v(x, y, z + 1.0, color),
-            v(x, y, z, color),
-            v(x, y + 1.0, z, color),
             v(x, y + 1.0, z + 1.0, color),
+            v(x, y + 1.0, z, color),
+            v(x, y, z, color),
+            v(x, y, z + 1.0, color),
         ],
         Face::Up => [
             v(x, y + 1.0, z, color),
-            v(x + 1.0, y + 1.0, z, color),
-            v(x + 1.0, y + 1.0, z + 1.0, color),
             v(x, y + 1.0, z + 1.0, color),
+            v(x + 1.0, y + 1.0, z + 1.0, color),
+            v(x + 1.0, y + 1.0, z, color),
         ],
         Face::Down => [
-            v(x, y, z + 1.0, color),
-            v(x + 1.0, y, z + 1.0, color),
-            v(x + 1.0, y, z, color),
             v(x, y, z, color),
+            v(x + 1.0, y, z, color),
+            v(x + 1.0, y, z + 1.0, color),
+            v(x, y, z + 1.0, color),
         ],
     }
 }

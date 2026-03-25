@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::yield_now;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -29,7 +30,7 @@ impl Default for ServerConfig {
             bind_addr: "127.0.0.1:4000".to_string(),
             world_seed: 0xA66D_E601,
             save_path: PathBuf::from("world"),
-            view_radius: 8,
+            view_radius: 12,
         }
     }
 }
@@ -168,21 +169,47 @@ impl ChunkStreamingService {
         });
 
         let mut subscriptions = HashSet::new();
-        for dx in -(request.radius as i32)..=(request.radius as i32) {
-            for dz in -(request.radius as i32)..=(request.radius as i32) {
-                let position = ChunkPos {
-                    x: request.center.x + dx,
-                    z: request.center.z + dz,
-                };
-                subscriptions.insert(position);
-                let chunk = self.world.chunk(position).await?;
-                write_message(stream, &ServerMessage::ChunkData(chunk)).await?;
+        let positions = ordered_chunk_positions(request.center, request.radius);
+
+        for (index, position) in positions.into_iter().enumerate() {
+            subscriptions.insert(position);
+            let chunk = self.world.chunk(position).await?;
+            write_message(stream, &ServerMessage::ChunkData(chunk)).await?;
+
+            // Send nearby chunks first and periodically yield so the client can
+            // start rendering before the outer radius finishes streaming.
+            if index > 0 && index % 8 == 0 {
+                yield_now().await;
             }
         }
 
         player_service.set_subscriptions(player_id, subscriptions).await;
         Ok(())
     }
+}
+
+fn ordered_chunk_positions(center: ChunkPos, radius: u8) -> Vec<ChunkPos> {
+    let mut positions = Vec::new();
+    let radius = i32::from(radius);
+
+    positions.push(center);
+
+    for ring in 1..=radius {
+        for dz in -ring..=ring {
+            for dx in -ring..=ring {
+                if dx.abs().max(dz.abs()) != ring {
+                    continue;
+                }
+
+                positions.push(ChunkPos {
+                    x: center.x + dx,
+                    z: center.z + dz,
+                });
+            }
+        }
+    }
+
+    positions
 }
 
 #[derive(Clone)]
@@ -417,5 +444,16 @@ mod tests {
     fn reach_gate_allows_nearby_positions() {
         assert!(within_reach(WorldPos { x: 2, y: 91, z: -3 }));
         assert!(!within_reach(WorldPos { x: 20, y: 91, z: 0 }));
+    }
+
+    #[test]
+    fn chunk_positions_are_ordered_center_first_then_rings() {
+        let ordered = ordered_chunk_positions(ChunkPos { x: 10, z: -4 }, 2);
+
+        assert_eq!(ordered.first(), Some(&ChunkPos { x: 10, z: -4 }));
+        assert!(ordered[..9].contains(&ChunkPos { x: 11, z: -4 }));
+        assert!(ordered[..9].contains(&ChunkPos { x: 9, z: -5 }));
+        assert_eq!(ordered.len(), 25);
+        assert!(ordered[9..].contains(&ChunkPos { x: 12, z: -4 }));
     }
 }

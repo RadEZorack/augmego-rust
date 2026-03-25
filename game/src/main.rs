@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use wgpu_lite::{Mesh, Renderer, Vertex};
@@ -17,6 +18,10 @@ use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::WindowBuilder;
+
+const CHUNK_RADIUS: u8 = 12;
+const CHUNK_WORLD_RADIUS: f32 = (CHUNK_WIDTH as f32) * 0.5;
+const DRAW_DISTANCE_CHUNKS: f32 = 18.0;
 
 fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
@@ -29,9 +34,12 @@ fn main() -> Result<()> {
     let renderer = pollster::block_on(Renderer::new(window))?;
     let (network_tx, network_rx) = mpsc::channel();
     let (command_tx, command_rx) = mpsc::channel();
+    let (mesh_job_tx, mesh_job_rx) = mpsc::channel();
+    let (mesh_result_tx, mesh_result_rx) = mpsc::channel();
     start_network_thread(network_tx, command_rx);
+    start_mesh_workers(mesh_job_rx, mesh_result_tx);
 
-    let mut app = GameApp::new(renderer.size(), network_rx, command_tx);
+    let mut app = GameApp::new(renderer.size(), network_rx, command_tx, mesh_job_tx, mesh_result_rx);
     let mut chunk_meshes: HashMap<ChunkPos, Mesh> = HashMap::new();
     let mut renderer = renderer;
 
@@ -50,15 +58,14 @@ fn main() -> Result<()> {
                 }
                 WindowEvent::RedrawRequested => {
                     app.drain_network();
-
-                    if app.mesh_dirty {
-                        chunk_meshes = rebuild_meshes(&renderer, &app.chunk_cache);
-                        app.mesh_dirty = false;
-                    }
+                    app.process_mesh_updates(&renderer, &mut chunk_meshes, 6);
 
                     app.tick();
                     renderer.update_camera(app.camera_matrix());
-                    let visible_meshes = chunk_meshes.values().collect::<Vec<_>>();
+                    let visible_meshes = chunk_meshes
+                        .iter()
+                        .filter_map(|(position, mesh)| app.chunk_is_visible(*position).then_some(mesh))
+                        .collect::<Vec<_>>();
                     if let Err(error) = renderer.render(&visible_meshes) {
                         eprintln!("render error: {error:?}");
                         target.exit();
@@ -83,26 +90,38 @@ struct GameApp {
     chunk_cache: HashMap<ChunkPos, ChunkData>,
     network_rx: Receiver<NetworkEvent>,
     command_tx: Sender<ClientCommand>,
-    mesh_dirty: bool,
     pressed: HashSet<KeyCode>,
     camera: Camera,
     last_tick: Instant,
     width: u32,
     height: u32,
+    mesh_job_tx: Sender<MeshJob>,
+    mesh_result_rx: Receiver<MeshBuildResult>,
+    inflight_meshes: HashSet<ChunkPos>,
+    dirty_meshes: HashSet<ChunkPos>,
 }
 
 impl GameApp {
-    fn new(size: winit::dpi::PhysicalSize<u32>, network_rx: Receiver<NetworkEvent>, command_tx: Sender<ClientCommand>) -> Self {
+    fn new(
+        size: winit::dpi::PhysicalSize<u32>,
+        network_rx: Receiver<NetworkEvent>,
+        command_tx: Sender<ClientCommand>,
+        mesh_job_tx: Sender<MeshJob>,
+        mesh_result_rx: Receiver<MeshBuildResult>,
+    ) -> Self {
         Self {
             chunk_cache: HashMap::new(),
             network_rx,
             command_tx,
-            mesh_dirty: false,
             pressed: HashSet::new(),
             camera: Camera::default(),
             last_tick: Instant::now(),
             width: size.width.max(1),
             height: size.height.max(1),
+            mesh_job_tx,
+            mesh_result_rx,
+            inflight_meshes: HashSet::new(),
+            dirty_meshes: HashSet::new(),
         }
     }
 
@@ -136,8 +155,9 @@ impl GameApp {
         while let Ok(event) = self.network_rx.try_recv() {
             match event {
                 NetworkEvent::Chunk(chunk) => {
-                    self.chunk_cache.insert(chunk.position, chunk);
-                    self.mesh_dirty = true;
+                    let position = chunk.position;
+                    self.chunk_cache.insert(position, chunk);
+                    self.schedule_mesh(position);
                 }
                 NetworkEvent::Welcome { message, .. } => {
                     println!("{message}");
@@ -191,6 +211,65 @@ impl GameApp {
         let aspect = self.width as f32 / self.height.max(1) as f32;
         self.camera.matrix(aspect)
     }
+
+    fn process_mesh_updates(
+        &mut self,
+        renderer: &Renderer<'_>,
+        chunk_meshes: &mut HashMap<ChunkPos, Mesh>,
+        budget: usize,
+    ) {
+        for _ in 0..budget {
+            let Ok(result) = self.mesh_result_rx.try_recv() else {
+                break;
+            };
+
+            self.inflight_meshes.remove(&result.position);
+            chunk_meshes.insert(result.position, renderer.create_mesh(&result.vertices, &result.indices));
+
+            if self.dirty_meshes.remove(&result.position) {
+                self.schedule_mesh(result.position);
+            }
+        }
+    }
+
+    fn schedule_mesh(&mut self, position: ChunkPos) {
+        if self.inflight_meshes.contains(&position) {
+            self.dirty_meshes.insert(position);
+            return;
+        }
+
+        let Some(chunk) = self.chunk_cache.get(&position).cloned() else {
+            return;
+        };
+
+        if self.mesh_job_tx.send(MeshJob { position, chunk }).is_ok() {
+            self.inflight_meshes.insert(position);
+        }
+    }
+
+    fn chunk_is_visible(&self, position: ChunkPos) -> bool {
+        let center = Vec3::new(
+            position.x as f32 * CHUNK_WIDTH as f32 + CHUNK_WORLD_RADIUS,
+            64.0,
+            position.z as f32 * CHUNK_DEPTH as f32 + CHUNK_WORLD_RADIUS,
+        );
+        let to_chunk = center - self.camera.position;
+        let distance = to_chunk.length();
+        let max_distance = DRAW_DISTANCE_CHUNKS * CHUNK_WIDTH as f32;
+
+        if distance > max_distance {
+            return false;
+        }
+
+        if distance <= CHUNK_WIDTH as f32 * 2.0 {
+            return true;
+        }
+
+        let direction = to_chunk / distance.max(0.001);
+        let chunk_radius = 24.0;
+        let threshold = 0.15 - (chunk_radius / distance).min(0.25);
+        self.camera.forward().dot(direction) >= threshold
+    }
 }
 
 #[derive(Default)]
@@ -209,14 +288,19 @@ impl Camera {
     }
 
     fn matrix(&self, aspect: f32) -> Mat4 {
-        let look = Vec3::new(
-            self.yaw.sin() * self.pitch.cos(),
-            self.pitch.sin(),
-            self.yaw.cos() * self.pitch.cos(),
-        );
+        let look = self.forward();
         let view = Mat4::look_at_rh(self.position, self.position + look, Vec3::Y);
         let proj = Mat4::perspective_rh_gl(60.0_f32.to_radians(), aspect, 0.1, 1_500.0);
         proj * view
+    }
+
+    fn forward(&self) -> Vec3 {
+        Vec3::new(
+            self.yaw.sin() * self.pitch.cos(),
+            self.pitch.sin(),
+            self.yaw.cos() * self.pitch.cos(),
+        )
+        .normalize_or_zero()
     }
 }
 
@@ -234,12 +318,62 @@ enum NetworkEvent {
     Disconnected(String),
 }
 
+struct MeshJob {
+    position: ChunkPos,
+    chunk: ChunkData,
+}
+
+struct MeshBuildResult {
+    position: ChunkPos,
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+}
+
 fn start_network_thread(events: Sender<NetworkEvent>, commands: Receiver<ClientCommand>) {
     thread::spawn(move || {
         if let Err(error) = network_main(events.clone(), commands) {
             let _ = events.send(NetworkEvent::Disconnected(error.to_string()));
         }
     });
+}
+
+fn start_mesh_workers(jobs: Receiver<MeshJob>, results: Sender<MeshBuildResult>) {
+    let worker_count = thread::available_parallelism()
+        .map(|parallelism| parallelism.get().clamp(2, 4))
+        .unwrap_or(2);
+    let shared_jobs = Arc::new(Mutex::new(jobs));
+
+    for index in 0..worker_count {
+        let jobs = Arc::clone(&shared_jobs);
+        let results = results.clone();
+        thread::Builder::new()
+            .name(format!("mesh-worker-{index}"))
+            .spawn(move || {
+                loop {
+                    let job = {
+                        let receiver = jobs.lock().expect("mesh job receiver poisoned");
+                        receiver.recv()
+                    };
+
+                    let Ok(job) = job else {
+                        break;
+                    };
+
+                    let (vertices, indices) = mesh_chunk(&job.chunk);
+                    if results
+                        .send(MeshBuildResult {
+                            position: job.position,
+                            vertices,
+                            indices,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn mesh worker");
+    }
 }
 
 fn network_main(events: Sender<NetworkEvent>, commands: Receiver<ClientCommand>) -> Result<()> {
@@ -275,7 +409,7 @@ fn network_main(events: Sender<NetworkEvent>, commands: Receiver<ClientCommand>)
         &mut stream,
         &ClientMessage::SubscribeChunks(SubscribeChunks {
             center: ChunkPos { x: 0, z: 0 },
-            radius: 8,
+            radius: CHUNK_RADIUS,
         }),
     )?;
 
@@ -348,16 +482,6 @@ fn try_read_server(stream: &mut TcpStream) -> Result<Option<ServerMessage>> {
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::TimedOut => Ok(None),
         Err(error) => Err(error).context("read server packet"),
     }
-}
-
-fn rebuild_meshes(renderer: &Renderer<'_>, chunk_cache: &HashMap<ChunkPos, ChunkData>) -> HashMap<ChunkPos, Mesh> {
-    chunk_cache
-        .iter()
-        .map(|(position, chunk)| {
-            let (vertices, indices) = mesh_chunk(chunk);
-            (*position, renderer.create_mesh(&vertices, &indices))
-        })
-        .collect()
 }
 
 fn mesh_chunk(chunk: &ChunkData) -> (Vec<Vertex>, Vec<u32>) {

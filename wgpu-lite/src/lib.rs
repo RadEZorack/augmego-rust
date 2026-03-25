@@ -200,7 +200,7 @@ pub struct Renderer<'a> {
 impl<'a> Renderer<'a> {
     pub async fn new(window: &'a Window) -> Result<Self> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::default();
+        let instance = create_instance();
         let surface = instance.create_surface(window).context("create surface")?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -216,7 +216,7 @@ impl<'a> Renderer<'a> {
                 &wgpu::DeviceDescriptor {
                     label: Some("wgpu-lite-device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
+                    required_limits: device_limits(),
                 },
                 None,
             )
@@ -448,6 +448,33 @@ impl<'a> Renderer<'a> {
 
     pub fn size(&self) -> PhysicalSize<u32> {
         self.size
+    }
+}
+
+fn device_limits() -> wgpu::Limits {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wgpu::Limits::downlevel_webgl2_defaults()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        wgpu::Limits::downlevel_defaults()
+    }
+}
+
+fn create_instance() -> wgpu::Instance {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::GL,
+            ..Default::default()
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        wgpu::Instance::default()
     }
 }
 

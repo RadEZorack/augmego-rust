@@ -2,6 +2,7 @@
 members = [
     "backend",
     "game",
+    "game-web",
     "shared_content",
     "shared_math",
     "shared_protocol",
@@ -28,4 +29,17 @@ tokio = { version = "1.44", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 winit = "0.29"
-wgpu = "0.20"
+wgpu = { version = "0.20", features = ["webgl"] }
+
+[workspace.dependencies.web-sys]
+version = "0.3"
+features = ["Document", "Element", "HtmlCanvasElement", "Window"]
+
+[workspace.dependencies.wasm-bindgen]
+version = "0.2"
+
+[workspace.dependencies.wasm-bindgen-futures]
+version = "0.4"
+
+[workspace.dependencies.web-time]
+version = "1.1"

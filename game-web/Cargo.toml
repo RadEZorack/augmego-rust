@@ -1,0 +1,23 @@
+[package]
+name = "game-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+console_error_panic_hook = "0.1"
+glam.workspace = true
+shared_math = { path = "../shared_math" }
+shared_world = { path = "../shared_world" }
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys.workspace = true
+web-time.workspace = true
+wgpu-lite = { path = "../wgpu-lite" }
+winit.workspace = true

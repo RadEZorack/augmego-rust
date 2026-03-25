@@ -231,6 +231,7 @@ impl WebApp {
         if !self.mouse_captured {
             self.canvas.request_pointer_lock();
             self.mouse_captured = pointer_is_locked(&self.canvas);
+            return;
         }
 
         let Some(target) = self.current_interaction_target() else {

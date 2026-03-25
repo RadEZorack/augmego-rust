@@ -4,8 +4,9 @@ use anyhow::{Context, Result, anyhow};
 use shared_content::block_definitions;
 use shared_math::{CHUNK_HEIGHT, ChunkPos, WorldPos};
 use shared_protocol::{
-    BlockActionResult, ClientHello, ClientMessage, InventorySnapshot, InventoryStack, LoginResponse,
-    PROTOCOL_VERSION, PlayerStateSnapshot, ServerHello, ServerMessage, SubscribeChunks,
+    BlockActionResult, ChunkUnload, ClientHello, ClientMessage, InventorySnapshot, InventoryStack,
+    LoginResponse, PROTOCOL_VERSION, PlayerStateSnapshot, ServerHello, ServerMessage,
+    SubscribeChunks,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
 use std::collections::{HashMap, HashSet};
@@ -82,10 +83,13 @@ impl PlayerService {
         Some(player.clone())
     }
 
-    async fn set_subscriptions(&self, player_id: u64, subscriptions: HashSet<ChunkPos>) {
-        if let Some(player) = self.players.lock().await.get_mut(&player_id) {
-            player.subscribed_chunks = subscriptions;
+    async fn swap_subscriptions(&self, player_id: u64, subscriptions: HashSet<ChunkPos>) -> HashSet<ChunkPos> {
+        let mut players = self.players.lock().await;
+        if let Some(player) = players.get_mut(&player_id) {
+            return std::mem::replace(&mut player.subscribed_chunks, subscriptions);
         }
+
+        HashSet::new()
     }
 
     async fn remove(&self, player_id: u64) {
@@ -156,7 +160,7 @@ impl ChunkStreamingService {
         Self { world, default_radius }
     }
 
-    pub async fn stream_initial_chunks(
+    pub async fn update_subscription(
         &self,
         stream: &mut TcpStream,
         player_service: &PlayerService,
@@ -168,11 +172,25 @@ impl ChunkStreamingService {
             radius: self.default_radius,
         });
 
-        let mut subscriptions = HashSet::new();
-        let positions = ordered_chunk_positions(request.center, request.radius);
+        let desired = desired_chunk_set(request.center, request.radius);
+        let previous = player_service.swap_subscriptions(player_id, desired.clone()).await;
+        let removals = previous.difference(&desired).copied().collect::<Vec<_>>();
+        let additions = ordered_chunk_positions(request.center, request.radius)
+            .into_iter()
+            .filter(|position| !previous.contains(position))
+            .collect::<Vec<_>>();
 
-        for (index, position) in positions.into_iter().enumerate() {
-            subscriptions.insert(position);
+        if !removals.is_empty() {
+            write_message(
+                stream,
+                &ServerMessage::ChunkUnload(ChunkUnload {
+                    positions: removals,
+                }),
+            )
+            .await?;
+        }
+
+        for (index, position) in additions.into_iter().enumerate() {
             let chunk = self.world.chunk(position).await?;
             write_message(stream, &ServerMessage::ChunkData(chunk)).await?;
 
@@ -183,7 +201,6 @@ impl ChunkStreamingService {
             }
         }
 
-        player_service.set_subscriptions(player_id, subscriptions).await;
         Ok(())
     }
 }
@@ -210,6 +227,10 @@ fn ordered_chunk_positions(center: ChunkPos, radius: u8) -> Vec<ChunkPos> {
     }
 
     positions
+}
+
+fn desired_chunk_set(center: ChunkPos, radius: u8) -> HashSet<ChunkPos> {
+    ordered_chunk_positions(center, radius).into_iter().collect()
 }
 
 #[derive(Clone)]
@@ -329,7 +350,7 @@ impl VoxelServer {
         };
 
         self.chunk_streaming
-            .stream_initial_chunks(&mut stream, &self.player_service, player.id, subscribe)
+            .update_subscription(&mut stream, &self.player_service, player.id, subscribe)
             .await?;
 
         write_message(
@@ -355,7 +376,7 @@ impl VoxelServer {
         match message {
             ClientMessage::SubscribeChunks(request) => {
                 self.chunk_streaming
-                    .stream_initial_chunks(stream, &self.player_service, player_id, Some(request))
+                    .update_subscription(stream, &self.player_service, player_id, Some(request))
                     .await?;
             }
             ClientMessage::PlayerInputTick(input) => {
@@ -455,5 +476,13 @@ mod tests {
         assert!(ordered[..9].contains(&ChunkPos { x: 9, z: -5 }));
         assert_eq!(ordered.len(), 25);
         assert!(ordered[9..].contains(&ChunkPos { x: 12, z: -4 }));
+    }
+
+    #[test]
+    fn desired_chunk_set_matches_square_area() {
+        let set = desired_chunk_set(ChunkPos { x: 0, z: 0 }, 3);
+        assert_eq!(set.len(), 49);
+        assert!(set.contains(&ChunkPos { x: -3, z: 2 }));
+        assert!(set.contains(&ChunkPos { x: 3, z: -3 }));
     }
 }

@@ -38,6 +38,11 @@ pub struct SubscribeChunks {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkUnload {
+    pub positions: Vec<ChunkPos>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerInputTick {
     pub tick: u64,
     pub movement: [f32; 3],
@@ -102,6 +107,7 @@ pub enum ServerMessage {
     ServerHello(ServerHello),
     LoginResponse(LoginResponse),
     ChunkData(ChunkData),
+    ChunkUnload(ChunkUnload),
     ChunkDelta(ChunkDelta),
     PlayerStateSnapshot(PlayerStateSnapshot),
     InventorySnapshot(InventorySnapshot),

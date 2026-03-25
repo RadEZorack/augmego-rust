@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use glam::{Mat4, Vec3};
-use shared_math::{CHUNK_DEPTH, CHUNK_WIDTH, ChunkPos};
+use shared_math::{CHUNK_DEPTH, CHUNK_WIDTH, ChunkPos, WorldPos};
 use shared_protocol::{
-    ClientHello, ClientMessage, LoginRequest, PROTOCOL_VERSION, ServerMessage, SubscribeChunks,
-    decode, frame,
+    ChunkUnload, ClientHello, ClientMessage, LoginRequest, PROTOCOL_VERSION, ServerMessage,
+    SubscribeChunks, decode, frame,
 };
 use shared_world::{BlockId, ChunkData};
 use std::collections::{HashMap, HashSet};
@@ -92,6 +92,7 @@ struct GameApp {
     command_tx: Sender<ClientCommand>,
     pressed: HashSet<KeyCode>,
     camera: Camera,
+    spawned: bool,
     last_tick: Instant,
     width: u32,
     height: u32,
@@ -99,6 +100,7 @@ struct GameApp {
     mesh_result_rx: Receiver<MeshBuildResult>,
     inflight_meshes: HashSet<ChunkPos>,
     dirty_meshes: HashSet<ChunkPos>,
+    current_subscription_center: Option<ChunkPos>,
 }
 
 impl GameApp {
@@ -115,6 +117,7 @@ impl GameApp {
             command_tx,
             pressed: HashSet::new(),
             camera: Camera::default(),
+            spawned: false,
             last_tick: Instant::now(),
             width: size.width.max(1),
             height: size.height.max(1),
@@ -122,6 +125,7 @@ impl GameApp {
             mesh_result_rx,
             inflight_meshes: HashSet::new(),
             dirty_meshes: HashSet::new(),
+            current_subscription_center: None,
         }
     }
 
@@ -159,11 +163,22 @@ impl GameApp {
                     self.chunk_cache.insert(position, chunk);
                     self.schedule_mesh(position);
                 }
+                NetworkEvent::ChunkUnload(unload) => {
+                    for position in unload.positions {
+                        self.chunk_cache.remove(&position);
+                        self.inflight_meshes.remove(&position);
+                        self.dirty_meshes.remove(&position);
+                    }
+                }
                 NetworkEvent::Welcome { message, .. } => {
                     println!("{message}");
                 }
                 NetworkEvent::PlayerState { position } => {
-                    self.camera.position = Vec3::new(position[0], position[1] + 4.0, position[2] + 8.0);
+                    let server_camera = Vec3::new(position[0], position[1] + 4.0, position[2] + 8.0);
+                    if !self.spawned {
+                        self.camera.position = server_camera;
+                        self.spawned = true;
+                    }
                 }
                 NetworkEvent::BlockAction(message) => {
                     println!("block action: {message}");
@@ -201,6 +216,7 @@ impl GameApp {
         }
 
         self.camera.update(dt, movement);
+        self.update_chunk_subscription();
 
         let _ = self.command_tx.send(ClientCommand::Input {
             movement: [movement.x, movement.y, movement.z],
@@ -224,12 +240,18 @@ impl GameApp {
             };
 
             self.inflight_meshes.remove(&result.position);
-            chunk_meshes.insert(result.position, renderer.create_mesh(&result.vertices, &result.indices));
+            if self.chunk_cache.contains_key(&result.position) {
+                chunk_meshes.insert(result.position, renderer.create_mesh(&result.vertices, &result.indices));
+            } else {
+                chunk_meshes.remove(&result.position);
+            }
 
             if self.dirty_meshes.remove(&result.position) {
                 self.schedule_mesh(result.position);
             }
         }
+
+        chunk_meshes.retain(|position, _| self.chunk_cache.contains_key(position));
     }
 
     fn schedule_mesh(&mut self, position: ChunkPos) {
@@ -270,6 +292,18 @@ impl GameApp {
         let threshold = 0.15 - (chunk_radius / distance).min(0.25);
         self.camera.forward().dot(direction) >= threshold
     }
+
+    fn update_chunk_subscription(&mut self) {
+        let center = world_to_chunk(self.camera.position);
+        if self.current_subscription_center == Some(center) {
+            return;
+        }
+
+        self.current_subscription_center = Some(center);
+        let _ = self
+            .command_tx
+            .send(ClientCommand::SubscribeChunks(SubscribeChunks { center, radius: CHUNK_RADIUS }));
+    }
 }
 
 #[derive(Default)]
@@ -307,12 +341,14 @@ impl Camera {
 #[derive(Debug)]
 enum ClientCommand {
     Input { movement: [f32; 3] },
+    SubscribeChunks(SubscribeChunks),
 }
 
 #[derive(Debug)]
 enum NetworkEvent {
     Welcome { message: String },
     Chunk(ChunkData),
+    ChunkUnload(ChunkUnload),
     PlayerState { position: [f32; 3] },
     BlockAction(String),
     Disconnected(String),
@@ -428,6 +464,9 @@ fn network_main(events: Sender<NetworkEvent>, commands: Receiver<ClientCommand>)
                         }),
                     )?;
                 }
+                ClientCommand::SubscribeChunks(request) => {
+                    write_client(&mut stream, &ClientMessage::SubscribeChunks(request))?;
+                }
             }
         }
 
@@ -435,6 +474,9 @@ fn network_main(events: Sender<NetworkEvent>, commands: Receiver<ClientCommand>)
             Ok(Some(message)) => match message {
                 ServerMessage::ChunkData(chunk) => {
                     let _ = events.send(NetworkEvent::Chunk(chunk));
+                }
+                ServerMessage::ChunkUnload(unload) => {
+                    let _ = events.send(NetworkEvent::ChunkUnload(unload));
                 }
                 ServerMessage::PlayerStateSnapshot(state) => {
                     let _ = events.send(NetworkEvent::PlayerState { position: state.position });
@@ -656,6 +698,14 @@ fn atlas_quad(tile: (u32, u32)) -> [[f32; 2]; 4] {
         [max_u, max_v],
         [min_u, max_v],
     ]
+}
+
+fn world_to_chunk(position: Vec3) -> ChunkPos {
+    ChunkPos::from_world(WorldPos {
+        x: position.x.floor() as i64,
+        y: position.y.floor() as i32,
+        z: position.z.floor() as i64,
+    })
 }
 
 fn darken(color: [f32; 3], amount: f32) -> [f32; 3] {

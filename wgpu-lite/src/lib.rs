@@ -550,6 +550,11 @@ fn fill_tile(pixels: &mut [u8], atlas_size: u32, tile_x: u32, tile_y: u32, base:
     let start_x = tile_x * TILE_SIZE;
     let start_y = tile_y * TILE_SIZE;
 
+    if (tile_x, tile_y) == (0, 2) {
+        fill_link_tile(pixels, atlas_size, start_x, start_y);
+        return;
+    }
+
     for y in 0..TILE_SIZE {
         for x in 0..TILE_SIZE {
             let px = start_x + x;
@@ -558,6 +563,36 @@ fn fill_tile(pixels: &mut [u8], atlas_size: u32, tile_x: u32, tile_y: u32, base:
             let checker = ((x / 4) + (y / 4)) % 2;
             let shade = if checker == 0 { 12_i16 } else { -10_i16 };
             pixels[offset..offset + 4].copy_from_slice(&shade_color(base, shade));
+        }
+    }
+}
+
+fn fill_link_tile(pixels: &mut [u8], atlas_size: u32, start_x: u32, start_y: u32) {
+    const TILE_SIZE: u32 = 16;
+
+    for y in 0..TILE_SIZE {
+        for x in 0..TILE_SIZE {
+            let px = start_x + x;
+            let py = start_y + y;
+            let offset = ((py * atlas_size + px) * 4) as usize;
+            let color = if y < 3 {
+                [235, 235, 235, 255]
+            } else if y < 6 {
+                [66, 133, 244, 255]
+            } else if x > 2 && x < 13 && y > 7 && y < 10 {
+                [242, 242, 242, 255]
+            } else if (x, y) == (5, 11) || (x, y) == (6, 11) {
+                [66, 133, 244, 255]
+            } else if (x, y) == (7, 11) || (x, y) == (8, 11) {
+                [219, 68, 55, 255]
+            } else if (x, y) == (9, 11) || (x, y) == (10, 11) {
+                [244, 180, 0, 255]
+            } else if (x, y) == (11, 11) || (x, y) == (12, 11) {
+                [15, 157, 88, 255]
+            } else {
+                [250, 250, 250, 255]
+            };
+            pixels[offset..offset + 4].copy_from_slice(&color);
         }
     }
 }

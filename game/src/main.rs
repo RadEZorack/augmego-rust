@@ -10,6 +10,7 @@ use shared_world::{BlockId, ChunkData};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -36,6 +37,11 @@ const CROSSHAIR_DISTANCE: f32 = 0.6;
 const CROSSHAIR_LENGTH: f32 = 0.035;
 const CROSSHAIR_THICKNESS: f32 = 0.004;
 const TARGET_OUTLINE_THICKNESS: f32 = 0.035;
+const LINK_PANEL_URL: &str = "https://www.google.com";
+const LINK_PANEL_HALF_WIDTH: f32 = 1.2;
+const LINK_PANEL_HALF_HEIGHT: f32 = 0.75;
+const LINK_PANEL_HALF_DEPTH: f32 = 0.03;
+const LINK_PANEL_TILE: (u32, u32) = (0, 2);
 
 fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
@@ -92,6 +98,11 @@ fn main() -> Result<()> {
                         .iter()
                         .filter_map(|(position, mesh)| app.chunk_is_visible(*position).then_some(mesh))
                         .collect::<Vec<_>>();
+                    let link_panel_mesh = app.build_link_panel_mesh(&renderer);
+                    let mut visible_mesh_refs = visible_meshes;
+                    if let Some(mesh) = &link_panel_mesh {
+                        visible_mesh_refs.push(mesh);
+                    }
                     let mut overlay_meshes = Vec::new();
                     if let Some(mesh) = app.build_crosshair_mesh(&renderer) {
                         overlay_meshes.push(mesh);
@@ -100,7 +111,7 @@ fn main() -> Result<()> {
                         overlay_meshes.push(mesh);
                     }
                     let overlay_refs = overlay_meshes.iter().collect::<Vec<_>>();
-                    if let Err(error) = renderer.render(&visible_meshes, &overlay_refs) {
+                    if let Err(error) = renderer.render(&visible_mesh_refs, &overlay_refs) {
                         eprintln!("render error: {error:?}");
                         target.exit();
                     }
@@ -141,6 +152,7 @@ struct GameApp {
     mouse_captured: bool,
     inventory: Vec<InventoryStack>,
     selected_hotbar: usize,
+    link_panel: Option<LinkPanel>,
 }
 
 impl GameApp {
@@ -174,6 +186,7 @@ impl GameApp {
                 InventoryStack { block: BlockId::Planks, count: 32 },
             ],
             selected_hotbar: 0,
+            link_panel: None,
         }
     }
 
@@ -230,32 +243,43 @@ impl GameApp {
             return;
         }
 
-        let Some(hit) = self.current_target() else {
+        let Some(target) = self.current_interaction_target() else {
             return;
         };
 
-        match button {
-            MouseButton::Left => {
-                self.apply_local_block_edit(hit.block, BlockId::Air);
-                let _ = self.command_tx.send(ClientCommand::BreakBlock(hit.block));
+        match target {
+            InteractionTarget::Link if button == MouseButton::Left => {
+                let _ = open_url(LINK_PANEL_URL);
             }
-            MouseButton::Right => {
-                let Some(place_at) = hit.previous_empty else {
-                    return;
-                };
-
-                let selected_block = self.selected_hotbar_block();
-                if player_collides_with_world_pos(&self.chunk_cache, self.camera.position, place_at, selected_block) {
-                    return;
+            InteractionTarget::Block(hit) => match button {
+                MouseButton::Left => {
+                    self.apply_local_block_edit(hit.block, BlockId::Air);
+                    let _ = self.command_tx.send(ClientCommand::BreakBlock(hit.block));
                 }
+                MouseButton::Right => {
+                    let Some(place_at) = hit.previous_empty else {
+                        return;
+                    };
 
-                self.apply_local_block_edit(place_at, selected_block);
-                let _ = self.command_tx.send(ClientCommand::PlaceBlock {
-                    position: place_at,
-                    block: selected_block,
-                });
-            }
-            _ => {}
+                    let selected_block = self.selected_hotbar_block();
+                    if player_collides_with_world_pos(
+                        &self.chunk_cache,
+                        self.camera.position,
+                        place_at,
+                        selected_block,
+                    ) {
+                        return;
+                    }
+
+                    self.apply_local_block_edit(place_at, selected_block);
+                    let _ = self.command_tx.send(ClientCommand::PlaceBlock {
+                        position: place_at,
+                        block: selected_block,
+                    });
+                }
+                _ => {}
+            },
+            InteractionTarget::Link => {}
         }
     }
 
@@ -286,6 +310,7 @@ impl GameApp {
                         self.camera.on_ground = false;
                         self.spawned = true;
                         self.physics_ready = false;
+                        self.link_panel = Some(LinkPanel::near_spawn(spawn_position));
                     }
                 }
                 NetworkEvent::Inventory(snapshot) => {
@@ -373,6 +398,29 @@ impl GameApp {
         raycast_world(&self.chunk_cache, self.camera.position, self.camera.forward(), 6.0)
     }
 
+    fn current_interaction_target(&self) -> Option<InteractionTarget> {
+        let block_hit = self.current_target();
+        let link_hit = self.current_link_target();
+
+        match (block_hit, link_hit) {
+            (Some(block), Some(link)) => {
+                if link.distance < block.distance {
+                    Some(InteractionTarget::Link)
+                } else {
+                    Some(InteractionTarget::Block(block))
+                }
+            }
+            (Some(block), None) => Some(InteractionTarget::Block(block)),
+            (None, Some(_)) => Some(InteractionTarget::Link),
+            (None, None) => None,
+        }
+    }
+
+    fn current_link_target(&self) -> Option<LinkHit> {
+        let panel = self.link_panel?;
+        raycast_link_panel(self.camera.position, self.camera.forward(), panel)
+    }
+
     fn selected_hotbar_block(&self) -> BlockId {
         self.inventory
             .get(self.selected_hotbar)
@@ -382,16 +430,17 @@ impl GameApp {
 
     fn hud_title(&self) -> String {
         let selected = self.selected_hotbar_block();
-        let target = self
-            .current_target()
-            .map(|hit| {
+        let target = match self.current_interaction_target() {
+            Some(InteractionTarget::Block(hit)) => {
                 let block = self
                     .block_at_world(hit.block)
                     .map(|voxel| voxel.block)
                     .unwrap_or(BlockId::Air);
                 format!(" | Target: {:?}", block)
-            })
-            .unwrap_or_default();
+            }
+            Some(InteractionTarget::Link) => format!(" | Target: Link -> {}", LINK_PANEL_URL),
+            None => String::new(),
+        };
         format!(
             "Augmego Voxel Sandbox | Slot {}: {:?} x{}{}",
             self.selected_hotbar + 1,
@@ -441,7 +490,9 @@ impl GameApp {
     }
 
     fn build_target_highlight_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
-        let target = self.current_target()?;
+        let InteractionTarget::Block(target) = self.current_interaction_target()? else {
+            return None;
+        };
         let face = target.face?;
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
@@ -454,6 +505,14 @@ impl GameApp {
             [1.0, 0.95, 0.45],
             (3, 1),
         );
+        Some(renderer.create_mesh(&vertices, &indices))
+    }
+
+    fn build_link_panel_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
+        let panel = self.link_panel?;
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        add_link_panel_mesh(&mut vertices, &mut indices, panel, [1.0, 1.0, 1.0], LINK_PANEL_TILE);
         Some(renderer.create_mesh(&vertices, &indices))
     }
 
@@ -859,10 +918,40 @@ fn block_is_solid(block: BlockId) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug)]
 struct RaycastHit {
     block: WorldPos,
     previous_empty: Option<WorldPos>,
     face: Option<Face>,
+    distance: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LinkPanel {
+    center: Vec3,
+}
+
+impl LinkPanel {
+    fn near_spawn(spawn: WorldPos) -> Self {
+        Self {
+            center: Vec3::new(
+                spawn.x as f32 + 4.0,
+                spawn.y as f32 + 1.8,
+                spawn.z as f32 + 0.5,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LinkHit {
+    distance: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InteractionTarget {
+    Block(RaycastHit),
+    Link,
 }
 
 fn raycast_world(
@@ -893,6 +982,7 @@ fn raycast_world(
                 block: world,
                 previous_empty,
                 face: previous_empty.and_then(|empty| face_from_empty_neighbor(world, empty)),
+                distance: index as f32 * step,
             });
         }
 
@@ -900,6 +990,29 @@ fn raycast_world(
     }
 
     None
+}
+
+fn raycast_link_panel(origin: Vec3, direction: Vec3, panel: LinkPanel) -> Option<LinkHit> {
+    let direction = direction.normalize_or_zero();
+    if direction == Vec3::ZERO || direction.x.abs() < 0.0001 {
+        return None;
+    }
+
+    let t = (panel.center.x - origin.x) / direction.x;
+    if !(0.0..=6.0).contains(&t) {
+        return None;
+    }
+
+    let hit = origin + direction * t;
+    let local = hit - panel.center;
+    if local.y.abs() > LINK_PANEL_HALF_HEIGHT || local.z.abs() > LINK_PANEL_HALF_WIDTH {
+        return None;
+    }
+    if local.x.abs() > LINK_PANEL_HALF_DEPTH + 0.02 {
+        return None;
+    }
+
+    Some(LinkHit { distance: t })
 }
 
 fn face_from_empty_neighbor(block: WorldPos, empty: WorldPos) -> Option<Face> {
@@ -994,6 +1107,53 @@ fn add_face_highlight(
             tile,
         ),
     }
+}
+
+fn add_link_panel_mesh(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    panel: LinkPanel,
+    color: [f32; 3],
+    tile: (u32, u32),
+) {
+    let center = panel.center;
+    let screen_half_depth = 0.006;
+    let frame_half_depth = 0.028;
+    let screen_gap = 0.008;
+    let axis_x = Vec3::new(0.0, 0.0, LINK_PANEL_HALF_WIDTH);
+    let axis_y = Vec3::new(0.0, LINK_PANEL_HALF_HEIGHT, 0.0);
+    let normal = Vec3::new(-1.0, 0.0, 0.0);
+    let screen_center = center + normal * (frame_half_depth + screen_gap + screen_half_depth);
+    let front_center = screen_center + normal * screen_half_depth;
+    let back_center = screen_center - normal * screen_half_depth;
+    let uvs = atlas_quad(tile);
+
+    let front = [
+        front_center - axis_x + axis_y,
+        front_center + axis_x + axis_y,
+        front_center + axis_x - axis_y,
+        front_center - axis_x - axis_y,
+    ];
+    let back = [
+        back_center + axis_x + axis_y,
+        back_center - axis_x + axis_y,
+        back_center - axis_x - axis_y,
+        back_center + axis_x - axis_y,
+    ];
+
+    add_face_indices(vertices, indices, front, color, uvs);
+    add_face_indices(vertices, indices, back, color, uvs);
+
+    add_box_oriented(
+        vertices,
+        indices,
+        center,
+        Vec3::new(frame_half_depth, 0.0, 0.0),
+        Vec3::new(0.0, LINK_PANEL_HALF_HEIGHT + 0.08, 0.0),
+        Vec3::new(0.0, 0.0, LINK_PANEL_HALF_WIDTH + 0.08),
+        [0.22, 0.18, 0.12],
+        (0, 1),
+    );
 }
 
 fn add_box_oriented(
@@ -1367,7 +1527,7 @@ fn shaded_face_color(base: [f32; 3], face: Face, shadow: f32) -> [f32; 3] {
     ]
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Face {
     North,
     South,
@@ -1491,6 +1651,38 @@ fn world_to_chunk(position: Vec3) -> ChunkPos {
         y: position.y.floor() as i32,
         z: position.z.floor() as i64,
     })
+}
+
+fn open_url(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(url)
+            .spawn()
+            .with_context(|| format!("open {url}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .with_context(|| format!("open {url}"))?;
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .with_context(|| format!("open {url}"))?;
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow::anyhow!("opening URLs is unsupported on this platform"))
 }
 
 fn darken(color: [f32; 3], amount: f32) -> [f32; 3] {

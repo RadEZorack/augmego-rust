@@ -319,16 +319,14 @@ impl WebApp {
 
     fn build_target_highlight_mesh(&mut self, renderer: &Renderer<'_>) -> Option<Mesh> {
         let target = self.current_target()?;
-        let min = Vec3::new(target.block.x as f32, target.block.y as f32, target.block.z as f32)
-            - Vec3::splat(TARGET_OUTLINE_THICKNESS * 0.5);
-        let max = min + Vec3::splat(1.0 + TARGET_OUTLINE_THICKNESS);
+        let face = target.face?;
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
-        add_wire_box(
+        add_face_highlight(
             &mut vertices,
             &mut indices,
-            min,
-            max,
+            target.block,
+            face,
             TARGET_OUTLINE_THICKNESS,
             [1.0, 0.95, 0.45],
             (3, 1),
@@ -683,6 +681,7 @@ impl WebApp {
                 return Some(RaycastHit {
                     block: world,
                     previous_empty,
+                    face: previous_empty.and_then(|empty| face_from_empty_neighbor(world, empty)),
                 });
             }
 
@@ -1094,9 +1093,20 @@ struct MeshBuildResult {
     failed: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum Face {
+    North,
+    South,
+    East,
+    West,
+    Up,
+    Down,
+}
+
 struct RaycastHit {
     block: WorldPos,
     previous_empty: Option<WorldPos>,
+    face: Option<Face>,
 }
 
 fn block_is_solid(block: BlockId) -> bool {
@@ -1131,73 +1141,98 @@ fn block_from_id(id: u16) -> BlockId {
     }
 }
 
-fn add_wire_box(
-    vertices: &mut Vec<Vertex>,
-    indices: &mut Vec<u32>,
-    min: Vec3,
-    max: Vec3,
-    thickness: f32,
-    color: [f32; 3],
-    tile: (u32, u32),
-) {
-    let corners = [
-        Vec3::new(min.x, min.y, min.z),
-        Vec3::new(max.x, min.y, min.z),
-        Vec3::new(max.x, max.y, min.z),
-        Vec3::new(min.x, max.y, min.z),
-        Vec3::new(min.x, min.y, max.z),
-        Vec3::new(max.x, min.y, max.z),
-        Vec3::new(max.x, max.y, max.z),
-        Vec3::new(min.x, max.y, max.z),
-    ];
-    let edges = [
-        (0, 1),
-        (1, 2),
-        (2, 3),
-        (3, 0),
-        (4, 5),
-        (5, 6),
-        (6, 7),
-        (7, 4),
-        (0, 4),
-        (1, 5),
-        (2, 6),
-        (3, 7),
-    ];
+fn face_from_empty_neighbor(block: WorldPos, empty: WorldPos) -> Option<Face> {
+    let dx = empty.x - block.x;
+    let dy = empty.y - block.y;
+    let dz = empty.z - block.z;
 
-    for (start, end) in edges {
-        add_edge_prism(vertices, indices, corners[start], corners[end], thickness, color, tile);
+    match (dx, dy, dz) {
+        (0, 0, -1) => Some(Face::North),
+        (0, 0, 1) => Some(Face::South),
+        (1, 0, 0) => Some(Face::East),
+        (-1, 0, 0) => Some(Face::West),
+        (0, 1, 0) => Some(Face::Up),
+        (0, -1, 0) => Some(Face::Down),
+        _ => None,
     }
 }
 
-fn add_edge_prism(
+fn add_face_highlight(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
-    start: Vec3,
-    end: Vec3,
+    block: WorldPos,
+    face: Face,
     thickness: f32,
     color: [f32; 3],
     tile: (u32, u32),
 ) {
-    let delta = end - start;
-    let midpoint = (start + end) * 0.5;
-    let half = delta * 0.5;
-    let axis_x = if delta.x.abs() > 0.0 {
-        Vec3::new(half.x, 0.0, 0.0)
-    } else {
-        Vec3::new(thickness * 0.5, 0.0, 0.0)
-    };
-    let axis_y = if delta.y.abs() > 0.0 {
-        Vec3::new(0.0, half.y, 0.0)
-    } else {
-        Vec3::new(0.0, thickness * 0.5, 0.0)
-    };
-    let axis_z = if delta.z.abs() > 0.0 {
-        Vec3::new(0.0, 0.0, half.z)
-    } else {
-        Vec3::new(0.0, 0.0, thickness * 0.5)
-    };
-    add_box_oriented(vertices, indices, midpoint, axis_x, axis_y, axis_z, color, tile);
+    let min = Vec3::new(block.x as f32, block.y as f32, block.z as f32);
+    let max = min + Vec3::ONE;
+    let inset = 0.04;
+    let half = thickness * 0.5;
+
+    match face {
+        Face::North => add_box_oriented(
+            vertices,
+            indices,
+            Vec3::new((min.x + max.x) * 0.5, (min.y + max.y) * 0.5, min.z - half),
+            Vec3::new(0.5 - inset, 0.0, 0.0),
+            Vec3::new(0.0, 0.5 - inset, 0.0),
+            Vec3::new(0.0, 0.0, half),
+            color,
+            tile,
+        ),
+        Face::South => add_box_oriented(
+            vertices,
+            indices,
+            Vec3::new((min.x + max.x) * 0.5, (min.y + max.y) * 0.5, max.z + half),
+            Vec3::new(0.5 - inset, 0.0, 0.0),
+            Vec3::new(0.0, 0.5 - inset, 0.0),
+            Vec3::new(0.0, 0.0, half),
+            color,
+            tile,
+        ),
+        Face::East => add_box_oriented(
+            vertices,
+            indices,
+            Vec3::new(max.x + half, (min.y + max.y) * 0.5, (min.z + max.z) * 0.5),
+            Vec3::new(0.0, 0.0, 0.5 - inset),
+            Vec3::new(0.0, 0.5 - inset, 0.0),
+            Vec3::new(half, 0.0, 0.0),
+            color,
+            tile,
+        ),
+        Face::West => add_box_oriented(
+            vertices,
+            indices,
+            Vec3::new(min.x - half, (min.y + max.y) * 0.5, (min.z + max.z) * 0.5),
+            Vec3::new(0.0, 0.0, 0.5 - inset),
+            Vec3::new(0.0, 0.5 - inset, 0.0),
+            Vec3::new(half, 0.0, 0.0),
+            color,
+            tile,
+        ),
+        Face::Up => add_box_oriented(
+            vertices,
+            indices,
+            Vec3::new((min.x + max.x) * 0.5, max.y + half, (min.z + max.z) * 0.5),
+            Vec3::new(0.5 - inset, 0.0, 0.0),
+            Vec3::new(0.0, half, 0.0),
+            Vec3::new(0.0, 0.0, 0.5 - inset),
+            color,
+            tile,
+        ),
+        Face::Down => add_box_oriented(
+            vertices,
+            indices,
+            Vec3::new((min.x + max.x) * 0.5, min.y - half, (min.z + max.z) * 0.5),
+            Vec3::new(0.5 - inset, 0.0, 0.0),
+            Vec3::new(0.0, half, 0.0),
+            Vec3::new(0.0, 0.0, 0.5 - inset),
+            color,
+            tile,
+        ),
+    }
 }
 
 fn add_box_oriented(

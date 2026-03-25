@@ -20,8 +20,9 @@ self.onmessage = (event) => {
         z,
         vertices: mesh.vertices.buffer,
         indices: mesh.indices.buffer,
+        heights: mesh.heights.buffer,
       },
-      [mesh.vertices.buffer, mesh.indices.buffer],
+      [mesh.vertices.buffer, mesh.indices.buffer, mesh.heights.buffer],
     );
   } catch (error) {
     self.postMessage({
@@ -34,7 +35,7 @@ self.onmessage = (event) => {
 };
 
 function buildChunkMesh(chunkX, chunkZ) {
-  const voxels = generateChunk(chunkX, chunkZ);
+  const { voxels, heights } = generateChunk(chunkX, chunkZ);
   const vertices = [];
   const indices = [];
   const originX = chunkX * CHUNK_WIDTH;
@@ -56,11 +57,13 @@ function buildChunkMesh(chunkX, chunkZ) {
   return {
     vertices: new Float32Array(vertices),
     indices: new Uint32Array(indices),
+    heights,
   };
 }
 
 function generateChunk(chunkX, chunkZ) {
   const voxels = new Uint16Array(CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_DEPTH);
+  const heights = new Uint16Array(CHUNK_WIDTH * CHUNK_DEPTH);
   const baseX = chunkX * CHUNK_WIDTH;
   const baseZ = chunkZ * CHUNK_DEPTH;
   const chunkCenterX = baseX + CHUNK_WIDTH / 2;
@@ -73,6 +76,7 @@ function generateChunk(chunkX, chunkZ) {
       const worldZ = baseZ + z;
       const columnBiome = biomeAt(worldX, worldZ);
       const surface = heightAt(worldX, worldZ, columnBiome);
+      heights[z * CHUNK_WIDTH + x] = surface;
 
       for (let y = 0; y <= Math.min(surface, CHUNK_HEIGHT - 1); y++) {
         let block;
@@ -93,7 +97,7 @@ function generateChunk(chunkX, chunkZ) {
     }
   }
 
-  return voxels;
+  return { voxels, heights };
 }
 
 function biomeAt(x, z) {

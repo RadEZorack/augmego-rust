@@ -1074,12 +1074,14 @@ impl WebApp {
         let target_player_id = signal.source_player_id;
         match signal.payload {
             WebRtcSignalPayload::Offer { sdp } => {
+                let source_player_id = signal.source_player_id;
                 spawn_local(async move {
                     let description = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
                     description.set_sdp(&sdp);
                     if JsFuture::from(connection.set_remote_description(&description)).await.is_err() {
                         return;
                     }
+                    flush_pending_ice_candidates(source_player_id, &connection);
                     let Ok(answer) = JsFuture::from(connection.create_answer()).await else {
                         return;
                     };
@@ -1103,10 +1105,13 @@ impl WebApp {
                 });
             }
             WebRtcSignalPayload::Answer { sdp } => {
+                let source_player_id = signal.source_player_id;
                 spawn_local(async move {
                     let description = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
                     description.set_sdp(&sdp);
-                    let _ = JsFuture::from(connection.set_remote_description(&description)).await;
+                    if JsFuture::from(connection.set_remote_description(&description)).await.is_ok() {
+                        flush_pending_ice_candidates(source_player_id, &connection);
+                    }
                 });
             }
             WebRtcSignalPayload::IceCandidate {
@@ -1114,6 +1119,26 @@ impl WebApp {
                 sdp_mid,
                 sdp_mline_index,
             } => {
+                let remote_description_ready = js_sys::Reflect::get(
+                    connection.as_ref(),
+                    &JsValue::from_str("remoteDescription"),
+                )
+                .ok()
+                .is_some_and(|value| !value.is_null() && !value.is_undefined());
+                if !remote_description_ready {
+                    PENDING_ICE_REGISTRY.with(|registry| {
+                        registry
+                            .borrow_mut()
+                            .entry(signal.source_player_id)
+                            .or_default()
+                            .push(PendingIceCandidate {
+                                candidate,
+                                sdp_mid,
+                                sdp_mline_index,
+                            });
+                    });
+                    return;
+                }
                 let init = RtcIceCandidateInit::new(&candidate);
                 if let Some(mid) = sdp_mid.as_deref() {
                     init.set_sdp_mid(Some(mid));
@@ -1506,8 +1531,16 @@ struct RemoteMediaRegistration {
     context: CanvasRenderingContext2d,
 }
 
+#[derive(Clone)]
+struct PendingIceCandidate {
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u16>,
+}
+
 thread_local! {
     static REMOTE_MEDIA_REGISTRY: RefCell<HashMap<u64, RemoteMediaRegistration>> = RefCell::new(HashMap::new());
+    static PENDING_ICE_REGISTRY: RefCell<HashMap<u64, Vec<PendingIceCandidate>>> = RefCell::new(HashMap::new());
 }
 
 enum WebcamEvent {
@@ -1669,6 +1702,24 @@ fn attach_local_webcam_overlay(video: &HtmlVideoElement) {
 fn send_client_message_over_websocket(websocket: &WebSocket, message: &ClientMessage) {
     if let Ok(bytes) = encode(message) {
         let _ = websocket.send_with_u8_array(&bytes);
+    }
+}
+
+fn flush_pending_ice_candidates(player_id: u64, connection: &RtcPeerConnection) {
+    let pending = PENDING_ICE_REGISTRY.with(|registry| registry.borrow_mut().remove(&player_id));
+    let Some(pending) = pending else {
+        return;
+    };
+
+    for candidate in pending {
+        let init = RtcIceCandidateInit::new(&candidate.candidate);
+        if let Some(mid) = candidate.sdp_mid.as_deref() {
+            init.set_sdp_mid(Some(mid));
+        }
+        if let Some(index) = candidate.sdp_mline_index {
+            init.set_sdp_m_line_index(Some(index));
+        }
+        let _ = connection.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&init));
     }
 }
 

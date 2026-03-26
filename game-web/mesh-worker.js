@@ -235,7 +235,7 @@ function placeTree(voxels, x, y, z) {
 }
 
 function emitBlockFaces(voxels, vertices, indices, world, x, y, z, block) {
-  const baseColor = [1, 1, 1];
+  const baseColor = blockBaseColor(block);
   const faces = [
     { offset: [0, 0, -1], face: "north" },
     { offset: [0, 0, 1], face: "south" },
@@ -250,7 +250,7 @@ function emitBlockFaces(voxels, vertices, indices, world, x, y, z, block) {
     if (neighbor === null || isTransparent(neighbor)) {
       const shadow = skylightShadow(voxels, x + face.offset[0], y, z + face.offset[2]);
       const color = shadedFaceColor(baseColor, face.face, shadow);
-      const faceVerticesData = faceVertices(world, face.face, color, tileUvs(block, face.face));
+      const faceVerticesData = faceVertices(world, face.face, color, proceduralFaceUvs());
       const base = vertices.length / 11;
       vertices.push(...faceVerticesData.flat());
       indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
@@ -358,51 +358,37 @@ function faceNormal(face) {
   }
 }
 
-function tileUvs(block, face) {
-  return atlasQuad(tileFor(block, face));
-}
-
-function tileFor(block, face) {
+function blockBaseColor(block) {
   switch (block) {
     case 1:
-      return face === "up" ? [1, 0] : face === "down" ? [0, 0] : [1, 1];
+      return [0.43, 0.66, 0.29];
     case 2:
-      return [0, 0];
+      return [0.47, 0.33, 0.22];
     case 3:
-      return [2, 0];
+      return [0.58, 0.58, 0.6];
     case 4:
-      return [3, 0];
+      return [0.82, 0.76, 0.52];
     case 5:
-      return [2, 1];
+      return [0.38, 0.58, 0.78];
     case 6:
-      return face === "up" || face === "down" ? [3, 1] : [0, 1];
+      return [0.52, 0.38, 0.22];
     case 7:
-      return [1, 1];
+      return [0.30, 0.54, 0.24];
     case 8:
-      return [3, 1];
+      return [0.72, 0.56, 0.34];
     case 9:
-      return [2, 1];
+      return [0.78, 0.88, 0.92];
     case 10:
-      return [3, 1];
+      return [0.96, 0.78, 0.36];
     case 11:
-      return [0, 1];
+      return [0.60, 0.42, 0.24];
     default:
-      return [0, 0];
+      return [1, 1, 1];
   }
 }
 
-function atlasQuad(tile) {
-  return atlasQuadSpan(tile, 2);
-}
-
-function atlasQuadSpan(tile, span) {
-  const tileCount = 12;
-  const eps = 0.001;
-  const minU = (tile[0] * span) / tileCount + eps;
-  const maxU = ((tile[0] * span) + span) / tileCount - eps;
-  const minV = (tile[1] * span) / tileCount + eps;
-  const maxV = ((tile[1] * span) + span) / tileCount - eps;
-  return [[minU, minV], [maxU, minV], [maxU, maxV], [minU, maxV]];
+function proceduralFaceUvs() {
+  return [[2, 2], [3, 2], [3, 3], [2, 3]];
 }
 
 function darken(color, amount) {

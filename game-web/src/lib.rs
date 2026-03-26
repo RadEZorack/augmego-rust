@@ -192,6 +192,8 @@ struct WebApp {
     chunk_edits: HashMap<ChunkPos, HashMap<(u8, u8, u8), BlockId>>,
     link_panel: LinkPanel,
     hotbar_slots: Vec<Element>,
+    mouse_lock_prompt: Element,
+    webcam_prompt: Element,
     hotbar_blocks: Vec<BlockId>,
     selected_hotbar: usize,
     player_id: Option<u64>,
@@ -209,6 +211,8 @@ struct WebApp {
     network_rx: Receiver<NetworkEvent>,
     websocket: WebSocket,
     _websocket_bindings: WebSocketBindings,
+    _mouse_lock_prompt_onclick: Closure<dyn FnMut(WebEvent)>,
+    _webcam_prompt_onclick: Closure<dyn FnMut(WebEvent)>,
     mesh_result_rx: Receiver<MeshBuildResult>,
     workers: Vec<Worker>,
     next_worker_index: usize,
@@ -239,6 +243,8 @@ impl WebApp {
             BlockId::Lantern,
         ];
         let hotbar_slots = create_hotbar(&hotbar_blocks);
+        let (mouse_lock_prompt, mouse_lock_prompt_onclick) = create_mouse_lock_prompt(&canvas);
+        let (webcam_prompt, webcam_prompt_onclick) = create_webcam_prompt();
         update_hotbar_ui(&hotbar_slots, &hotbar_blocks, 0);
         let current_chunk = chunk_from_world_position(camera.position);
         let desired_chunks = HashSet::new();
@@ -263,6 +269,8 @@ impl WebApp {
             chunk_edits: HashMap::new(),
             link_panel,
             hotbar_slots,
+            mouse_lock_prompt,
+            webcam_prompt,
             hotbar_blocks,
             selected_hotbar: 0,
             player_id: None,
@@ -280,6 +288,8 @@ impl WebApp {
             network_rx,
             websocket,
             _websocket_bindings: websocket_bindings,
+            _mouse_lock_prompt_onclick: mouse_lock_prompt_onclick,
+            _webcam_prompt_onclick: webcam_prompt_onclick,
             mesh_result_rx,
             workers,
             next_worker_index: 0,
@@ -289,6 +299,18 @@ impl WebApp {
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.size = size;
+    }
+
+    fn sync_pointer_lock_state(&mut self) {
+        self.mouse_captured = pointer_is_locked(&self.canvas);
+        if self.mouse_captured {
+            let _ = self.mouse_lock_prompt.set_attribute("style", "display:none;");
+        } else {
+            let _ = self.mouse_lock_prompt.set_attribute(
+                "style",
+                "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:18px 28px;border-radius:18px;border:1px solid rgba(255,255,255,0.28);background:rgba(18,24,32,0.88);color:#f6f8fb;font:600 18px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 20px 60px rgba(0,0,0,0.35);cursor:pointer;z-index:40;backdrop-filter:blur(10px);",
+            );
+        }
     }
 
     fn handle_key(&mut self, event: KeyEvent) {
@@ -352,7 +374,6 @@ impl WebApp {
         if !self.mouse_captured {
             self.canvas.request_pointer_lock();
             self.mouse_captured = pointer_is_locked(&self.canvas);
-            self.ensure_webcam_requested();
             return;
         }
 
@@ -402,10 +423,21 @@ impl WebApp {
     }
 
     fn process_webcam_events(&mut self) {
+        let should_request_webcam = WEBCAM_PROMPT_QUEUE.with(|queue| {
+            let mut queued = queue.borrow_mut();
+            let should_request = *queued;
+            *queued = false;
+            should_request
+        });
+        if should_request_webcam {
+            self.ensure_webcam_requested();
+        }
+
         while let Ok(event) = self.webcam_rx.try_recv() {
             match event {
                 WebcamEvent::Ready(capture) => {
                     attach_local_webcam_overlay(&capture.video);
+                    let _ = self.webcam_prompt.set_attribute("style", "display:none;");
                     self.webcam = Some(capture);
                     let remote_ids = self.remote_players.keys().copied().collect::<Vec<_>>();
                     for remote_id in remote_ids {
@@ -413,7 +445,9 @@ impl WebApp {
                         self.maybe_enable_peer_media(remote_id);
                     }
                 }
-                WebcamEvent::Failed(_message) => {}
+                WebcamEvent::Failed(_message) => {
+                    self.webcam_requested = false;
+                }
             }
         }
 
@@ -545,7 +579,7 @@ impl WebApp {
     }
 
     fn tick(&mut self) {
-        self.mouse_captured = pointer_is_locked(&self.canvas);
+        self.sync_pointer_lock_state();
         self.drain_network();
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick);
@@ -1541,6 +1575,7 @@ struct PendingIceCandidate {
 thread_local! {
     static REMOTE_MEDIA_REGISTRY: RefCell<HashMap<u64, RemoteMediaRegistration>> = RefCell::new(HashMap::new());
     static PENDING_ICE_REGISTRY: RefCell<HashMap<u64, Vec<PendingIceCandidate>>> = RefCell::new(HashMap::new());
+    static WEBCAM_PROMPT_QUEUE: RefCell<bool> = const { RefCell::new(false) };
 }
 
 enum WebcamEvent {
@@ -1622,6 +1657,57 @@ fn create_hotbar(blocks: &[BlockId]) -> Vec<Element> {
 
     let _ = body.append_child(&root);
     slots
+}
+
+fn create_mouse_lock_prompt(canvas: &HtmlCanvasElement) -> (Element, Closure<dyn FnMut(WebEvent)>) {
+    let Some(document) = document() else {
+        let noop = Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        let fallback = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.create_element("div").ok())
+            .expect("prompt fallback element");
+        return (fallback, noop);
+    };
+    let body = document.body().expect("body");
+    let prompt = document.create_element("button").expect("mouse lock prompt");
+    prompt.set_text_content(Some("Click To Lock Mouse"));
+    let _ = prompt.set_attribute(
+        "style",
+        "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:18px 28px;border-radius:18px;border:1px solid rgba(255,255,255,0.28);background:rgba(18,24,32,0.88);color:#f6f8fb;font:600 18px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 20px 60px rgba(0,0,0,0.35);cursor:pointer;z-index:40;backdrop-filter:blur(10px);",
+    );
+    let canvas = canvas.clone();
+    let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        canvas.request_pointer_lock();
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = prompt.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+    let _ = body.append_child(&prompt);
+    (prompt, onclick)
+}
+
+fn create_webcam_prompt() -> (Element, Closure<dyn FnMut(WebEvent)>) {
+    let Some(document) = document() else {
+        let noop = Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        let fallback = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.create_element("div").ok())
+            .expect("webcam prompt fallback element");
+        return (fallback, noop);
+    };
+    let body = document.body().expect("body");
+    let prompt = document.create_element("button").expect("webcam prompt");
+    prompt.set_text_content(Some("Activate Webcam"));
+    let _ = prompt.set_attribute(
+        "style",
+        "position:fixed;top:16px;right:16px;width:192px;height:144px;border-radius:12px;border:1px solid rgba(255,255,255,0.28);background:rgba(18,24,32,0.88);color:#f6f8fb;font:600 18px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:20;backdrop-filter:blur(10px);",
+    );
+    let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        WEBCAM_PROMPT_QUEUE.with(|queue| {
+            *queue.borrow_mut() = true;
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = prompt.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+    let _ = body.append_child(&prompt);
+    (prompt, onclick)
 }
 
 fn update_hotbar_ui(slots: &[Element], blocks: &[BlockId], selected: usize) {

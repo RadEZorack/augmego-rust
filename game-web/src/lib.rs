@@ -32,6 +32,10 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::web::WindowExtWebSys;
 use winit::window::WindowBuilder;
 
+const FEATURED_MODEL_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/models/Meshy_AI_A_cute_dog_0326155854_texture.glb"
+));
 const WEB_RADIUS: i32 = 6;
 #[allow(dead_code)]
 const INITIAL_WEB_RADIUS: i32 = 1;
@@ -65,6 +69,7 @@ const REMOTE_PLAYER_HALF_WIDTH: f32 = 0.35;
 const REMOTE_PLAYER_HALF_HEIGHT: f32 = 0.9;
 const WEBCAM_PANEL_HALF_WIDTH: f32 = 0.55;
 const WEBCAM_PANEL_HALF_HEIGHT: f32 = 0.40;
+const FEATURED_MODEL_DESIRED_HEIGHT: f32 = 1.5;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -142,15 +147,19 @@ async fn run() -> Result<()> {
                     if let Some(mesh) = &remote_media_placeholder_mesh {
                         visible_mesh_refs.push(mesh);
                     }
+                    app.ensure_featured_model_loaded(&renderer);
                     app.update_remote_media_textures(&renderer);
                     let textured_meshes = app.build_remote_media_meshes(&renderer);
-                    let textured_mesh_refs = textured_meshes.iter().collect::<Vec<_>>();
                     let mut overlay_meshes = Vec::new();
                     if let Some(mesh) = app.build_crosshair_mesh(&renderer) {
                         overlay_meshes.push(mesh);
                     }
                     if let Some(mesh) = app.build_target_highlight_mesh(&renderer) {
                         overlay_meshes.push(mesh);
+                    }
+                    let mut textured_mesh_refs = textured_meshes.iter().collect::<Vec<_>>();
+                    if let Some(featured_model) = app.featured_model.as_ref() {
+                        textured_mesh_refs.push(featured_model);
                     }
                     let overlay_refs = overlay_meshes.iter().collect::<Vec<_>>();
 
@@ -199,6 +208,9 @@ struct WebApp {
     player_id: Option<u64>,
     remote_players: HashMap<u64, [f32; 3]>,
     remote_media: HashMap<u64, RemotePeerMedia>,
+    featured_model: Option<TexturedMesh>,
+    featured_model_attempted: bool,
+    spawn_position: Option<WorldPos>,
     webcam_requested: bool,
     webcam_tx: Sender<WebcamEvent>,
     webcam_rx: Receiver<WebcamEvent>,
@@ -276,6 +288,9 @@ impl WebApp {
             player_id: None,
             remote_players: HashMap::new(),
             remote_media: HashMap::new(),
+            featured_model: None,
+            featured_model_attempted: false,
+            spawn_position: None,
             webcam_requested: false,
             webcam_tx,
             webcam_rx,
@@ -499,6 +514,9 @@ impl WebApp {
                             self.desired_chunks = desired_chunk_set(self.current_chunk, WEB_RADIUS);
                             self.send_chunk_subscription(self.current_chunk);
                             self.link_panel = LinkPanel::near_spawn(self.camera.position);
+                            self.spawn_position = Some(response.spawn_position);
+                            self.featured_model = None;
+                            self.featured_model_attempted = false;
                         }
                     }
                     ServerMessage::ChunkData(chunk) => {
@@ -548,6 +566,8 @@ impl WebApp {
                     self.player_id = None;
                     self.remote_players.clear();
                     self.remote_media.clear();
+                    self.featured_model = None;
+                    self.featured_model_attempted = false;
                     web_sys::console::error_1(&JsValue::from_str(&format!("multiplayer disconnected: {reason}")));
                 }
             }
@@ -837,6 +857,28 @@ impl WebApp {
             meshes.push(renderer.create_textured_mesh(&vertices, &indices, texture));
         }
         meshes
+    }
+
+    fn ensure_featured_model_loaded(&mut self, renderer: &Renderer<'_>) {
+        if self.featured_model.is_some() || self.featured_model_attempted {
+            return;
+        }
+
+        let Some(spawn_position) = self.spawn_position else {
+            return;
+        };
+
+        self.featured_model_attempted = true;
+        match load_featured_model_mesh(renderer, spawn_position) {
+            Ok(mesh) => {
+                self.featured_model = Some(mesh);
+            }
+            Err(error) => {
+                web_sys::console::error_1(&JsValue::from_str(&format!(
+                    "failed to load featured web model: {error:?}"
+                )));
+            }
+        }
     }
 
     fn chunk_is_visible(&self, position: ChunkPos) -> bool {
@@ -1538,6 +1580,185 @@ impl WebApp {
 struct WebcamCapture {
     stream: MediaStream,
     video: HtmlVideoElement,
+}
+
+#[derive(Clone)]
+struct ImportedVertex {
+    position: Vec3,
+    normal: Vec3,
+    uv: [f32; 2],
+}
+
+fn load_featured_model_mesh(renderer: &Renderer<'_>, spawn_position: WorldPos) -> Result<TexturedMesh> {
+    let (mut vertices, indices, image) = load_glb_model(FEATURED_MODEL_BYTES)?;
+    let (min, max) = model_bounds(&vertices).ok_or_else(|| anyhow::anyhow!("featured model has no vertices"))?;
+    let scale = FEATURED_MODEL_DESIRED_HEIGHT / (max.y - min.y).max(0.001);
+    let center_x = (min.x + max.x) * 0.5;
+    let center_z = (min.z + max.z) * 0.5;
+    let anchor = Vec3::new(
+        spawn_position.x as f32 + 7.0,
+        spawn_position.y as f32 + 1.0,
+        spawn_position.z as f32 + 2.0,
+    );
+
+    let vertices = vertices
+        .drain(..)
+        .map(|vertex| {
+            let normalized = Vec3::new(
+                vertex.position.x - center_x,
+                vertex.position.y - min.y,
+                vertex.position.z - center_z,
+            );
+            Vertex {
+                position: (normalized * scale + anchor).to_array(),
+                color: [1.0, 1.0, 1.0],
+                normal: vertex.normal.normalize_or_zero().to_array(),
+                uv: vertex.uv,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let rgba = match image.as_ref() {
+        Some(image) => image_to_rgba_pixels(image)?,
+        None => vec![255, 255, 255, 255],
+    };
+    let (width, height) = image
+        .map(|image| (image.width.max(1), image.height.max(1)))
+        .unwrap_or((1, 1));
+    let texture = renderer.create_dynamic_texture(width, height);
+    renderer.update_dynamic_texture_rgba(&texture, &rgba);
+    Ok(renderer.create_textured_mesh(&vertices, &indices, &texture))
+}
+
+fn load_glb_model(bytes: &[u8]) -> Result<(Vec<ImportedVertex>, Vec<u32>, Option<gltf::image::Data>)> {
+    let (document, buffers, images) = gltf::import_slice(bytes)?;
+    let scene = document
+        .default_scene()
+        .or_else(|| document.scenes().next())
+        .ok_or_else(|| anyhow::anyhow!("glb has no scene"))?;
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut image_index = None;
+
+    for node in scene.nodes() {
+        append_gltf_node_meshes(
+            &node,
+            Mat4::IDENTITY,
+            &buffers,
+            &mut vertices,
+            &mut indices,
+            &mut image_index,
+        );
+    }
+
+    if vertices.is_empty() {
+        anyhow::bail!("glb did not contain any triangle vertices");
+    }
+
+    let image = image_index.and_then(|index| images.get(index).cloned());
+    Ok((vertices, indices, image))
+}
+
+fn append_gltf_node_meshes(
+    node: &gltf::Node<'_>,
+    parent_transform: Mat4,
+    buffers: &[gltf::buffer::Data],
+    vertices: &mut Vec<ImportedVertex>,
+    indices: &mut Vec<u32>,
+    image_index: &mut Option<usize>,
+) {
+    let local = Mat4::from_cols_array_2d(&node.transform().matrix());
+    let transform = parent_transform * local;
+
+    if let Some(mesh) = node.mesh() {
+        for primitive in mesh.primitives() {
+            if primitive.mode() != gltf::mesh::Mode::Triangles {
+                continue;
+            }
+
+            if image_index.is_none() {
+                *image_index = primitive
+                    .material()
+                    .pbr_metallic_roughness()
+                    .base_color_texture()
+                    .map(|texture| texture.texture().source().index());
+            }
+
+            let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()].0));
+            let Some(positions) = reader.read_positions() else {
+                continue;
+            };
+            let primitive_positions = positions.collect::<Vec<_>>();
+            let normals = reader.read_normals().map(|values| values.collect::<Vec<_>>());
+            let texcoords = reader
+                .read_tex_coords(0)
+                .map(|coords| coords.into_f32().collect::<Vec<_>>());
+            let base_vertex = vertices.len() as u32;
+
+            for (index, position) in primitive_positions.iter().enumerate() {
+                let world_position = transform.transform_point3(Vec3::from_array(*position));
+                let normal = normals
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .map(|value| transform.transform_vector3(Vec3::from_array(*value)).normalize_or_zero())
+                    .unwrap_or(Vec3::Y);
+                let uv = texcoords
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .copied()
+                    .unwrap_or([0.5, 0.5]);
+                vertices.push(ImportedVertex {
+                    position: world_position,
+                    normal,
+                    uv,
+                });
+            }
+
+            if let Some(read_indices) = reader.read_indices() {
+                indices.extend(read_indices.into_u32().map(|index| base_vertex + index));
+            } else {
+                indices.extend((0..primitive_positions.len() as u32).map(|index| base_vertex + index));
+            }
+        }
+    }
+
+    for child in node.children() {
+        append_gltf_node_meshes(&child, transform, buffers, vertices, indices, image_index);
+    }
+}
+
+fn model_bounds(vertices: &[ImportedVertex]) -> Option<(Vec3, Vec3)> {
+    let first = vertices.first()?;
+    let mut min = first.position;
+    let mut max = first.position;
+
+    for vertex in &vertices[1..] {
+        min = min.min(vertex.position);
+        max = max.max(vertex.position);
+    }
+
+    Some((min, max))
+}
+
+fn image_to_rgba_pixels(image: &gltf::image::Data) -> Result<Vec<u8>> {
+    use gltf::image::Format;
+
+    let pixels = match image.format {
+        Format::R8G8B8A8 => image.pixels.clone(),
+        Format::R8G8B8 => image
+            .pixels
+            .chunks_exact(3)
+            .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
+            .collect(),
+        Format::R8 => image
+            .pixels
+            .iter()
+            .flat_map(|value| [*value, *value, *value, 255])
+            .collect(),
+        other => anyhow::bail!("unsupported glb image format: {other:?}"),
+    };
+
+    Ok(pixels)
 }
 
 #[derive(Clone, Copy)]

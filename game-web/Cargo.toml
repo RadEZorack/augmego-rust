@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 anyhow.workspace = true
 bytemuck.workspace = true
 console_error_panic_hook = "0.1"
+gltf = "1.4"
 glam.workspace = true
 shared_protocol = { path = "../shared_protocol" }
 shared_math = { path = "../shared_math" }

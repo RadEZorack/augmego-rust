@@ -7,7 +7,7 @@ use shared_content::block_definitions;
 use shared_math::{CHUNK_HEIGHT, ChunkPos, WorldPos};
 use shared_protocol::{
     BlockActionResult, ChunkUnload, ClientHello, ClientMessage, InventorySnapshot, InventoryStack, LoginResponse,
-    PROTOCOL_VERSION, PlayerStateSnapshot, ServerHello, ServerMessage, decode, encode,
+    PROTOCOL_VERSION, PlayerStateSnapshot, ServerHello, ServerMessage, ServerWebRtcSignal, decode, encode,
     SubscribeChunks,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
@@ -151,6 +151,17 @@ impl WebSocketSessionService {
 
         for sender in senders {
             let _ = sender.send(message.clone());
+        }
+    }
+
+    async fn send_to(&self, player_id: u64, message: ServerMessage) {
+        let sender = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&player_id).cloned()
+        };
+
+        if let Some(sender) = sender {
+            let _ = sender.send(message);
         }
     }
 }
@@ -804,6 +815,7 @@ impl VoxelServer {
             ClientMessage::ChatMessage(message) => {
                 write_message(stream, &ServerMessage::ChatMessage(message)).await?;
             }
+            ClientMessage::WebRtcSignal(_) => {}
             ClientMessage::LoginRequest(_) | ClientMessage::ClientHello(_) => {}
         }
 
@@ -893,6 +905,17 @@ impl VoxelServer {
             }
             ClientMessage::ChatMessage(message) => {
                 let _ = sender.send(ServerMessage::ChatMessage(message));
+            }
+            ClientMessage::WebRtcSignal(signal) => {
+                self.websocket_sessions
+                    .send_to(
+                        signal.target_player_id,
+                        ServerMessage::WebRtcSignal(ServerWebRtcSignal {
+                            source_player_id: player_id,
+                            payload: signal.payload,
+                        }),
+                    )
+                    .await;
             }
             ClientMessage::LoginRequest(_) | ClientMessage::ClientHello(_) => {}
         }

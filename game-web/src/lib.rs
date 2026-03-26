@@ -4,10 +4,12 @@ use anyhow::Result;
 use glam::{Mat4, Vec3};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
-    BreakBlockRequest, ClientHello, ClientMessage, InventorySnapshot, LoginRequest, PROTOCOL_VERSION,
-    PlaceBlockRequest, PlayerInputTick, ServerMessage, SubscribeChunks, decode, encode,
+    BreakBlockRequest, ClientHello, ClientMessage, ClientWebRtcSignal, InventorySnapshot, LoginRequest,
+    PROTOCOL_VERSION, PlaceBlockRequest, PlayerInputTick, ServerMessage, ServerWebRtcSignal,
+    SubscribeChunks, WebRtcSignalPayload, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -19,7 +21,8 @@ use web_time::Instant;
 use web_sys::{
     BinaryType, CanvasRenderingContext2d, CloseEvent, Document, Element, ErrorEvent,
     Event as WebEvent, HtmlCanvasElement, HtmlVideoElement, MediaStream, MediaStreamConstraints,
-    MessageEvent, WebSocket, Worker,
+    MessageEvent, RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType,
+    RtcSessionDescriptionInit, RtcTrackEvent, WebSocket, Worker,
 };
 use wgpu_lite::{DynamicTexture, Mesh, Renderer, TexturedMesh, Vertex};
 use winit::dpi::PhysicalSize;
@@ -120,7 +123,6 @@ async fn run() -> Result<()> {
                     app.process_webcam_events();
                     app.process_generation_updates(&renderer, &mut chunk_meshes, DEFAULT_GENERATION_BUDGET_PER_UPDATE);
                     app.tick();
-                    app.update_webcam_texture(&renderer);
                     renderer.update_camera(app.camera_matrix());
                     let visible_meshes = chunk_meshes
                         .iter()
@@ -135,8 +137,13 @@ async fn run() -> Result<()> {
                     if let Some(mesh) = &remote_players_mesh {
                         visible_mesh_refs.push(mesh);
                     }
-                    let webcam_mesh = app.build_webcam_mesh(&renderer);
-                    let textured_mesh_refs = webcam_mesh.iter().collect::<Vec<_>>();
+                    let remote_media_placeholder_mesh = app.build_remote_media_placeholder_mesh(&renderer);
+                    if let Some(mesh) = &remote_media_placeholder_mesh {
+                        visible_mesh_refs.push(mesh);
+                    }
+                    app.update_remote_media_textures(&renderer);
+                    let textured_meshes = app.build_remote_media_meshes(&renderer);
+                    let textured_mesh_refs = textured_meshes.iter().collect::<Vec<_>>();
                     let mut overlay_meshes = Vec::new();
                     if let Some(mesh) = app.build_crosshair_mesh(&renderer) {
                         overlay_meshes.push(mesh);
@@ -188,11 +195,11 @@ struct WebApp {
     selected_hotbar: usize,
     player_id: Option<u64>,
     remote_players: HashMap<u64, [f32; 3]>,
+    remote_media: HashMap<u64, RemotePeerMedia>,
     webcam_requested: bool,
     webcam_tx: Sender<WebcamEvent>,
     webcam_rx: Receiver<WebcamEvent>,
     webcam: Option<WebcamCapture>,
-    webcam_texture: Option<DynamicTexture>,
     last_sent_position: Option<[f32; 3]>,
     last_sent_velocity: Option<[f32; 3]>,
     tick_counter: u64,
@@ -259,11 +266,11 @@ impl WebApp {
             selected_hotbar: 0,
             player_id: None,
             remote_players: HashMap::new(),
+            remote_media: HashMap::new(),
             webcam_requested: false,
             webcam_tx,
             webcam_rx,
             webcam: None,
-            webcam_texture: None,
             last_sent_position: None,
             last_sent_velocity: None,
             tick_counter: 0,
@@ -396,10 +403,28 @@ impl WebApp {
     fn process_webcam_events(&mut self) {
         while let Ok(event) = self.webcam_rx.try_recv() {
             match event {
-                WebcamEvent::Ready(capture) => self.webcam = Some(capture),
+                WebcamEvent::Ready(capture) => {
+                    attach_local_webcam_overlay(&capture.video);
+                    self.webcam = Some(capture);
+                    let remote_ids = self.remote_players.keys().copied().collect::<Vec<_>>();
+                    for remote_id in remote_ids {
+                        self.ensure_peer_connection(remote_id);
+                    }
+                }
                 WebcamEvent::Failed(_message) => {}
             }
         }
+
+        REMOTE_MEDIA_REGISTRY.with(|registry| {
+            let mut registry = registry.borrow_mut();
+            for (player_id, registration) in registry.drain() {
+                if let Some(remote) = self.remote_media.get_mut(&player_id) {
+                    remote.video = Some(registration.video);
+                    remote.canvas = Some(registration.canvas);
+                    remote.context = Some(registration.context);
+                }
+            }
+        });
     }
 
     fn drain_network(&mut self) {
@@ -423,6 +448,7 @@ impl WebApp {
                             self.logged_in = true;
                             self.player_id = Some(response.player_id);
                             self.remote_players.clear();
+                            self.remote_media.clear();
                             self.last_sent_position = None;
                             self.last_sent_velocity = None;
                             self.camera.position = Vec3::new(
@@ -469,8 +495,10 @@ impl WebApp {
                     ServerMessage::PlayerStateSnapshot(snapshot) => {
                         if Some(snapshot.player_id) != self.player_id {
                             self.remote_players.insert(snapshot.player_id, snapshot.position);
+                            self.ensure_peer_connection(snapshot.player_id);
                         }
                     }
+                    ServerMessage::WebRtcSignal(signal) => self.handle_webrtc_signal(signal),
                     ServerMessage::BlockActionResult(result) => {
                         if !result.accepted {
                             web_sys::console::warn_1(&JsValue::from_str(&result.reason));
@@ -483,6 +511,7 @@ impl WebApp {
                     self.logged_in = false;
                     self.player_id = None;
                     self.remote_players.clear();
+                    self.remote_media.clear();
                     web_sys::console::error_1(&JsValue::from_str(&format!("multiplayer disconnected: {reason}")));
                 }
             }
@@ -669,33 +698,6 @@ impl WebApp {
         Some(renderer.create_mesh(&vertices, &indices))
     }
 
-    fn build_webcam_mesh(&self, renderer: &Renderer<'_>) -> Option<TexturedMesh> {
-        if self.webcam_texture.is_none() {
-            return None;
-        }
-
-        let anchor = self.local_player_anchor();
-        let forward = (self.camera.position - anchor.media).normalize_or_zero();
-        let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
-        let up = right.cross(forward).normalize_or_zero();
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
-        add_double_sided_face(
-            &mut vertices,
-            &mut indices,
-            [
-                anchor.media - right * WEBCAM_PANEL_HALF_WIDTH + up * WEBCAM_PANEL_HALF_HEIGHT,
-                anchor.media + right * WEBCAM_PANEL_HALF_WIDTH + up * WEBCAM_PANEL_HALF_HEIGHT,
-                anchor.media + right * WEBCAM_PANEL_HALF_WIDTH - up * WEBCAM_PANEL_HALF_HEIGHT,
-                anchor.media - right * WEBCAM_PANEL_HALF_WIDTH - up * WEBCAM_PANEL_HALF_HEIGHT,
-            ],
-            [1.0, 1.0, 1.0],
-            full_uv_quad(),
-        );
-        let texture = self.webcam_texture.as_ref()?;
-        Some(renderer.create_textured_mesh(&vertices, &indices, texture))
-    }
-
     fn build_target_highlight_mesh(&mut self, renderer: &Renderer<'_>) -> Option<Mesh> {
         let InteractionTarget::Block(target) = self.current_interaction_target()? else {
             return None;
@@ -746,6 +748,57 @@ impl WebApp {
         }
 
         Some(renderer.create_mesh(&vertices, &indices))
+    }
+
+    fn build_remote_media_placeholder_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
+        if self.remote_players.is_empty() {
+            return None;
+        }
+
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for (&player_id, position) in &self.remote_players {
+            if self
+                .remote_media
+                .get(&player_id)
+                .and_then(|media| media.texture.as_ref())
+                .is_some()
+            {
+                continue;
+            }
+
+            let anchor = player_anchor_from_eye(Vec3::new(position[0], position[1], position[2]));
+            add_media_panel_billboard(
+                &mut vertices,
+                &mut indices,
+                anchor.media,
+                self.camera.position,
+                [0.14, 0.14, 0.16],
+            );
+        }
+
+        (!vertices.is_empty()).then(|| renderer.create_mesh(&vertices, &indices))
+    }
+
+    fn build_remote_media_meshes(&self, renderer: &Renderer<'_>) -> Vec<TexturedMesh> {
+        let mut meshes = Vec::new();
+        for (&player_id, position) in &self.remote_players {
+            let Some(texture) = self.remote_media.get(&player_id).and_then(|media| media.texture.as_ref()) else {
+                continue;
+            };
+            let anchor = player_anchor_from_eye(Vec3::new(position[0], position[1], position[2]));
+            let mut vertices = Vec::new();
+            let mut indices = Vec::new();
+            add_media_panel_billboard(
+                &mut vertices,
+                &mut indices,
+                anchor.media,
+                self.camera.position,
+                [1.0, 1.0, 1.0],
+            );
+            meshes.push(renderer.create_textured_mesh(&vertices, &indices, texture));
+        }
+        meshes
     }
 
     fn chunk_is_visible(&self, position: ChunkPos) -> bool {
@@ -821,37 +874,233 @@ impl WebApp {
         }
     }
 
-    fn update_webcam_texture(&mut self, renderer: &Renderer<'_>) {
-        let Some(webcam) = &self.webcam else {
-            return;
-        };
+    fn update_remote_media_textures(&mut self, renderer: &Renderer<'_>) {
+        for media in self.remote_media.values_mut() {
+            let (Some(video), Some(canvas), Some(context)) =
+                (media.video.as_ref(), media.canvas.as_ref(), media.context.as_ref())
+            else {
+                continue;
+            };
+            if video.video_width() == 0 || video.video_height() == 0 {
+                continue;
+            }
+            if media.texture.is_none() {
+                media.texture = Some(
+                    renderer.create_dynamic_texture(WEBCAM_SOURCE_SIZE as u32, WEBCAM_SOURCE_SIZE as u32),
+                );
+            }
 
-        if self.webcam_texture.is_none() {
-            self.webcam_texture = Some(
-                renderer.create_dynamic_texture(WEBCAM_SOURCE_SIZE as u32, WEBCAM_SOURCE_SIZE as u32),
-            );
-        }
-
-        if webcam.video.video_width() == 0 || webcam.video.video_height() == 0 {
-            return;
-        }
-
-        let width = webcam.canvas.width() as f64;
-        let height = webcam.canvas.height() as f64;
-        let _ = webcam
-            .context
-            .draw_image_with_html_video_element_and_dw_and_dh(&webcam.video, 0.0, 0.0, width, height);
-        let Ok(image_data) = webcam.context.get_image_data(0.0, 0.0, width, height) else {
-            return;
-        };
-        if let Some(texture) = &self.webcam_texture {
-            renderer.update_dynamic_texture_rgba(texture, &image_data.data().0);
+            let width = canvas.width() as f64;
+            let height = canvas.height() as f64;
+            let _ = context.draw_image_with_html_video_element_and_dw_and_dh(video, 0.0, 0.0, width, height);
+            let Ok(image_data) = context.get_image_data(0.0, 0.0, width, height) else {
+                continue;
+            };
+            if let Some(texture) = &media.texture {
+                renderer.update_dynamic_texture_rgba(texture, &image_data.data().0);
+            }
         }
     }
 
-    fn local_player_anchor(&self) -> PlayerAnchor {
-        let look = Vec3::new(self.camera.yaw.sin(), 0.0, self.camera.yaw.cos()).normalize_or_zero();
-        player_anchor_from_eye_with_look(self.camera.position, look)
+    fn ensure_peer_connection(&mut self, remote_player_id: u64) {
+        let Some(local_player_id) = self.player_id else {
+            return;
+        };
+        if local_player_id == remote_player_id || self.remote_media.contains_key(&remote_player_id) {
+            return;
+        }
+
+        let Ok(connection) = RtcPeerConnection::new() else {
+            return;
+        };
+
+        if let Some(webcam) = &self.webcam {
+            let tracks = webcam.stream.get_tracks();
+            for index in 0..tracks.length() {
+                if let Ok(track) = tracks.get(index).dyn_into::<web_sys::MediaStreamTrack>() {
+                    let args = js_sys::Array::new();
+                    args.push(&track);
+                    args.push(&webcam.stream);
+                    if let Ok(add_track) =
+                        js_sys::Reflect::get(connection.as_ref(), &JsValue::from_str("addTrack"))
+                    {
+                        if let Ok(add_track) = add_track.dyn_into::<js_sys::Function>() {
+                            let _ = add_track.apply(connection.as_ref(), &args);
+                        }
+                    }
+                }
+            }
+        }
+
+        let ws_for_ice = self.websocket.clone();
+        let onicecandidate = Closure::wrap(Box::new(move |event: RtcPeerConnectionIceEvent| {
+            let Some(candidate) = event.candidate() else {
+                return;
+            };
+            let signal = ClientMessage::WebRtcSignal(ClientWebRtcSignal {
+                target_player_id: remote_player_id,
+                payload: WebRtcSignalPayload::IceCandidate {
+                    candidate: candidate.candidate(),
+                    sdp_mid: candidate.sdp_mid(),
+                    sdp_mline_index: candidate.sdp_m_line_index(),
+                },
+            });
+            send_client_message_over_websocket(&ws_for_ice, &signal);
+        }) as Box<dyn FnMut(RtcPeerConnectionIceEvent)>);
+        connection.set_onicecandidate(Some(onicecandidate.as_ref().unchecked_ref()));
+
+        let ontrack = Closure::wrap(Box::new(move |event: RtcTrackEvent| {
+            let streams = event.streams();
+            if streams.length() == 0 {
+                return;
+            }
+            let Some(window) = web_sys::window() else {
+                return;
+            };
+            let Some(document) = window.document() else {
+                return;
+            };
+            let Ok(video_element) = document.create_element("video") else {
+                return;
+            };
+            let Ok(video) = video_element.dyn_into::<HtmlVideoElement>() else {
+                return;
+            };
+            video.set_autoplay(true);
+            let _ = video.set_attribute("playsinline", "true");
+            let _ = video.set_attribute("style", "display:none;");
+            let stream = streams.get(0);
+            if let Ok(media_stream) = stream.dyn_into::<MediaStream>() {
+                video.set_src_object(Some(&media_stream));
+                let _ = video.play();
+            }
+            let Ok(canvas_element) = document.create_element("canvas") else {
+                return;
+            };
+            let Ok(canvas) = canvas_element.dyn_into::<HtmlCanvasElement>() else {
+                return;
+            };
+            canvas.set_width(WEBCAM_SOURCE_SIZE as u32);
+            canvas.set_height(WEBCAM_SOURCE_SIZE as u32);
+            let options = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&options, &JsValue::from_str("willReadFrequently"), &JsValue::TRUE);
+            let Ok(Some(context_value)) = canvas.get_context_with_context_options("2d", &options) else {
+                return;
+            };
+            let Ok(context) = context_value.dyn_into::<CanvasRenderingContext2d>() else {
+                return;
+            };
+            REMOTE_MEDIA_REGISTRY.with(|registry| {
+                registry.borrow_mut().insert(
+                    remote_player_id,
+                    RemoteMediaRegistration {
+                        video,
+                        canvas,
+                        context,
+                    },
+                );
+            });
+        }) as Box<dyn FnMut(RtcTrackEvent)>);
+        connection.set_ontrack(Some(ontrack.as_ref().unchecked_ref()));
+
+        let remote = RemotePeerMedia {
+            connection: connection.clone(),
+            video: None,
+            canvas: None,
+            context: None,
+            texture: None,
+            _onicecandidate: onicecandidate,
+            _ontrack: ontrack,
+        };
+        self.remote_media.insert(remote_player_id, remote);
+
+        if local_player_id < remote_player_id && self.webcam.is_some() {
+            let ws = self.websocket.clone();
+            spawn_local(async move {
+                let Ok(offer) = JsFuture::from(connection.create_offer()).await else {
+                    return;
+                };
+                let Some(sdp) = js_sys::Reflect::get(&offer, &JsValue::from_str("sdp"))
+                    .ok()
+                    .and_then(|value| value.as_string())
+                else {
+                    return;
+                };
+                let description = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+                description.set_sdp(&sdp);
+                if JsFuture::from(connection.set_local_description(&description)).await.is_ok() {
+                    send_client_message_over_websocket(
+                        &ws,
+                        &ClientMessage::WebRtcSignal(ClientWebRtcSignal {
+                            target_player_id: remote_player_id,
+                            payload: WebRtcSignalPayload::Offer { sdp },
+                        }),
+                    );
+                }
+            });
+        }
+    }
+
+    fn handle_webrtc_signal(&mut self, signal: ServerWebRtcSignal) {
+        self.ensure_peer_connection(signal.source_player_id);
+        let Some(remote) = self.remote_media.get(&signal.source_player_id) else {
+            return;
+        };
+        let connection = remote.connection.clone();
+        let websocket = self.websocket.clone();
+        let target_player_id = signal.source_player_id;
+        match signal.payload {
+            WebRtcSignalPayload::Offer { sdp } => {
+                spawn_local(async move {
+                    let description = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+                    description.set_sdp(&sdp);
+                    if JsFuture::from(connection.set_remote_description(&description)).await.is_err() {
+                        return;
+                    }
+                    let Ok(answer) = JsFuture::from(connection.create_answer()).await else {
+                        return;
+                    };
+                    let Some(answer_sdp) = js_sys::Reflect::get(&answer, &JsValue::from_str("sdp"))
+                        .ok()
+                        .and_then(|value| value.as_string())
+                    else {
+                        return;
+                    };
+                    let answer_description = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
+                    answer_description.set_sdp(&answer_sdp);
+                    if JsFuture::from(connection.set_local_description(&answer_description)).await.is_ok() {
+                        send_client_message_over_websocket(
+                            &websocket,
+                            &ClientMessage::WebRtcSignal(ClientWebRtcSignal {
+                                target_player_id,
+                                payload: WebRtcSignalPayload::Answer { sdp: answer_sdp },
+                            }),
+                        );
+                    }
+                });
+            }
+            WebRtcSignalPayload::Answer { sdp } => {
+                spawn_local(async move {
+                    let description = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
+                    description.set_sdp(&sdp);
+                    let _ = JsFuture::from(connection.set_remote_description(&description)).await;
+                });
+            }
+            WebRtcSignalPayload::IceCandidate {
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+            } => {
+                let init = RtcIceCandidateInit::new(&candidate);
+                if let Some(mid) = sdp_mid.as_deref() {
+                    init.set_sdp_mid(Some(mid));
+                }
+                if let Some(index) = sdp_mline_index {
+                    init.set_sdp_m_line_index(Some(index));
+                }
+                let _ = connection.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&init));
+            }
+        }
     }
 
     fn generation_budget(&self, default_budget: usize) -> usize {
@@ -1205,9 +1454,8 @@ impl WebApp {
 }
 
 struct WebcamCapture {
+    stream: MediaStream,
     video: HtmlVideoElement,
-    canvas: HtmlCanvasElement,
-    context: CanvasRenderingContext2d,
 }
 
 #[derive(Clone, Copy)]
@@ -1215,6 +1463,26 @@ struct PlayerAnchor {
     body: Vec3,
     head: Vec3,
     media: Vec3,
+}
+
+struct RemotePeerMedia {
+    connection: RtcPeerConnection,
+    video: Option<HtmlVideoElement>,
+    canvas: Option<HtmlCanvasElement>,
+    context: Option<CanvasRenderingContext2d>,
+    texture: Option<DynamicTexture>,
+    _onicecandidate: Closure<dyn FnMut(RtcPeerConnectionIceEvent)>,
+    _ontrack: Closure<dyn FnMut(RtcTrackEvent)>,
+}
+
+struct RemoteMediaRegistration {
+    video: HtmlVideoElement,
+    canvas: HtmlCanvasElement,
+    context: CanvasRenderingContext2d,
+}
+
+thread_local! {
+    static REMOTE_MEDIA_REGISTRY: RefCell<HashMap<u64, RemoteMediaRegistration>> = RefCell::new(HashMap::new());
 }
 
 enum WebcamEvent {
@@ -1361,6 +1629,24 @@ fn open_url(url: &str) {
     }
 }
 
+fn attach_local_webcam_overlay(video: &HtmlVideoElement) {
+    let _ = video.set_attribute(
+        "style",
+        "position:fixed;top:16px;right:16px;width:192px;height:144px;object-fit:cover;border:2px solid rgba(255,255,255,0.85);border-radius:12px;box-shadow:0 12px 28px rgba(0,0,0,0.35);z-index:20;pointer-events:none;background:#111;",
+    );
+    if let Some(document) = document() {
+        if let Some(body) = document.body() {
+            let _ = body.append_child(video);
+        }
+    }
+}
+
+fn send_client_message_over_websocket(websocket: &WebSocket, message: &ClientMessage) {
+    if let Ok(bytes) = encode(message) {
+        let _ = websocket.send_with_u8_array(&bytes);
+    }
+}
+
 fn request_webcam_capture(sender: Sender<WebcamEvent>) {
     spawn_local(async move {
         let result = async {
@@ -1398,27 +1684,7 @@ fn request_webcam_capture(sender: Sender<WebcamEvent>) {
             video.set_src_object(Some(&stream));
             let _ = video.play();
 
-            let canvas: HtmlCanvasElement = document
-                .create_element("canvas")
-                .map_err(|error| anyhow::anyhow!("canvas element create failed: {error:?}"))?
-                .dyn_into()
-                .map_err(|_| anyhow::anyhow!("canvas element cast failed"))?;
-            canvas.set_width(WEBCAM_SOURCE_SIZE as u32);
-            canvas.set_height(WEBCAM_SOURCE_SIZE as u32);
-            let options = js_sys::Object::new();
-            let _ = js_sys::Reflect::set(
-                &options,
-                &JsValue::from_str("willReadFrequently"),
-                &JsValue::TRUE,
-            );
-            let context: CanvasRenderingContext2d = canvas
-                .get_context_with_context_options("2d", &options)
-                .map_err(|error| anyhow::anyhow!("2d context failed: {error:?}"))?
-                .ok_or_else(|| anyhow::anyhow!("2d context unavailable"))?
-                .dyn_into()
-                .map_err(|_| anyhow::anyhow!("2d context cast failed"))?;
-
-            Ok::<WebcamCapture, anyhow::Error>(WebcamCapture { video, canvas, context })
+            Ok::<WebcamCapture, anyhow::Error>(WebcamCapture { stream, video })
         }
         .await;
 
@@ -2081,6 +2347,30 @@ fn add_link_panel_mesh(
         Vec3::new(0.0, 0.0, LINK_PANEL_HALF_WIDTH + 0.08),
         [0.22, 0.18, 0.12],
         (0, 1),
+    );
+}
+
+fn add_media_panel_billboard(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: Vec3,
+    camera_position: Vec3,
+    color: [f32; 3],
+) {
+    let forward = (camera_position - center).normalize_or_zero();
+    let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+    add_double_sided_face(
+        vertices,
+        indices,
+        [
+            center - right * WEBCAM_PANEL_HALF_WIDTH + up * WEBCAM_PANEL_HALF_HEIGHT,
+            center + right * WEBCAM_PANEL_HALF_WIDTH + up * WEBCAM_PANEL_HALF_HEIGHT,
+            center + right * WEBCAM_PANEL_HALF_WIDTH - up * WEBCAM_PANEL_HALF_HEIGHT,
+            center - right * WEBCAM_PANEL_HALF_WIDTH - up * WEBCAM_PANEL_HALF_HEIGHT,
+        ],
+        color,
+        full_uv_quad(),
     );
 }
 

@@ -3,7 +3,7 @@ use shared_math::{ChunkPos, WorldPos};
 use shared_world::{BlockId, ChunkData, ChunkDelta};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -94,6 +94,33 @@ pub struct ChatMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WebRtcSignalPayload {
+    Offer {
+        sdp: String,
+    },
+    Answer {
+        sdp: String,
+    },
+    IceCandidate {
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientWebRtcSignal {
+    pub target_player_id: u64,
+    pub payload: WebRtcSignalPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerWebRtcSignal {
+    pub source_player_id: u64,
+    pub payload: WebRtcSignalPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
     ClientHello(ClientHello),
     LoginRequest(LoginRequest),
@@ -102,6 +129,7 @@ pub enum ClientMessage {
     PlaceBlockRequest(PlaceBlockRequest),
     BreakBlockRequest(BreakBlockRequest),
     ChatMessage(ChatMessage),
+    WebRtcSignal(ClientWebRtcSignal),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +143,7 @@ pub enum ServerMessage {
     InventorySnapshot(InventorySnapshot),
     BlockActionResult(BlockActionResult),
     ChatMessage(ChatMessage),
+    WebRtcSignal(ServerWebRtcSignal),
 }
 
 #[derive(Debug, Error)]

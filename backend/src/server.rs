@@ -118,6 +118,23 @@ impl PlayerService {
             .map(|player| player.id)
             .collect()
     }
+
+    async fn players_in_chunks(&self, chunks: &HashSet<ChunkPos>, exclude_player_id: u64) -> Vec<Player> {
+        self.players
+            .lock()
+            .await
+            .values()
+            .filter(|player| {
+                player.id != exclude_player_id
+                    && chunks.contains(&ChunkPos::from_world(WorldPos {
+                        x: player.position[0].floor() as i64,
+                        y: player.position[1].floor() as i32,
+                        z: player.position[2].floor() as i64,
+                    }))
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -419,6 +436,16 @@ impl ChunkStreamingService {
             .into_iter()
             .filter(|position| !previous.contains(position))
             .collect::<Vec<_>>();
+
+        let nearby_players = player_service.players_in_chunks(&desired, player_id).await;
+        for player in nearby_players {
+            let _ = sender.send(ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
+                player_id: player.id,
+                tick: 0,
+                position: player.position,
+                velocity: player.velocity,
+            }));
+        }
 
         if !removals.is_empty() {
             let _ = sender.send(ServerMessage::ChunkUnload(ChunkUnload {

@@ -2556,14 +2556,9 @@ fn player_anchor_from_eye(eye: Vec3) -> PlayerAnchor {
     player_anchor_from_eye_with_look(eye, Vec3::Z)
 }
 
-fn player_anchor_from_eye_with_look(eye: Vec3, look: Vec3) -> PlayerAnchor {
-    let look = if look.length_squared() > 0.0001 {
-        look.normalize()
-    } else {
-        Vec3::Z
-    };
+fn player_anchor_from_eye_with_look(eye: Vec3, _look: Vec3) -> PlayerAnchor {
     let body = eye - Vec3::Y * PLAYER_EYE_HEIGHT;
     let head = body + Vec3::Y * PLAYER_HEIGHT;
-    let media = head + Vec3::Y * 0.75 + look * 1.8;
+    let media = head + Vec3::Y * 0.95;
     PlayerAnchor { body, head, media }
 }

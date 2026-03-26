@@ -1633,7 +1633,7 @@ fn tile_for(block: BlockId, face: Face) -> (u32, u32) {
 }
 
 fn atlas_quad(tile: (u32, u32)) -> [[f32; 2]; 4] {
-    const TILE_COUNT: f32 = 4.0;
+    const TILE_COUNT: f32 = 8.0;
     const EPS: f32 = 0.001;
 
     let min_u = tile.0 as f32 / TILE_COUNT + EPS;

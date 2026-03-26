@@ -56,7 +56,14 @@ const LINK_PANEL_HALF_WIDTH: f32 = 1.2;
 const LINK_PANEL_HALF_HEIGHT: f32 = 0.75;
 const LINK_PANEL_HALF_DEPTH: f32 = 0.03;
 const LINK_PANEL_TILE: (u32, u32) = (0, 2);
-const WEBCAM_TILES: [(u32, u32); 4] = [(1, 2), (2, 2), (1, 3), (2, 3)];
+const WEBCAM_TILE_GRID: usize = 4;
+const WEBCAM_SOURCE_SIZE: usize = 16 * WEBCAM_TILE_GRID;
+const WEBCAM_TILES: [(u32, u32); 16] = [
+    (4, 0), (5, 0), (6, 0), (7, 0),
+    (4, 1), (5, 1), (6, 1), (7, 1),
+    (4, 2), (5, 2), (6, 2), (7, 2),
+    (4, 3), (5, 3), (6, 3), (7, 3),
+];
 const REMOTE_PLAYER_HALF_WIDTH: f32 = 0.35;
 const REMOTE_PLAYER_HALF_HEIGHT: f32 = 0.9;
 const WEBCAM_PANEL_HALF_WIDTH: f32 = 0.55;
@@ -702,7 +709,7 @@ impl WebApp {
             WEBCAM_PANEL_HALF_WIDTH,
             WEBCAM_PANEL_HALF_HEIGHT,
             [1.0, 1.0, 1.0],
-            WEBCAM_TILES,
+            &WEBCAM_TILES,
         );
         Some(renderer.create_mesh(&vertices, &indices))
     }
@@ -853,15 +860,15 @@ impl WebApp {
             return;
         };
         let pixels = image_data.data().0;
-        let mut tile_pixels = [[0_u8; 16 * 16 * 4]; 4];
-        for y in 0..32usize {
-            for x in 0..32usize {
+        let mut tile_pixels = [[0_u8; 16 * 16 * 4]; WEBCAM_TILE_GRID * WEBCAM_TILE_GRID];
+        for y in 0..WEBCAM_SOURCE_SIZE {
+            for x in 0..WEBCAM_SOURCE_SIZE {
                 let tile_x = x / 16;
                 let tile_y = y / 16;
-                let tile_index = tile_y * 2 + tile_x;
+                let tile_index = tile_y * WEBCAM_TILE_GRID + tile_x;
                 let local_x = x % 16;
                 let local_y = y % 16;
-                let src = (y * 32 + x) * 4;
+                let src = (y * WEBCAM_SOURCE_SIZE + x) * 4;
                 let dst = (local_y * 16 + local_x) * 4;
                 tile_pixels[tile_index][dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
             }
@@ -1413,8 +1420,8 @@ fn request_webcam_capture(sender: Sender<WebcamEvent>) {
                 .map_err(|error| anyhow::anyhow!("canvas element create failed: {error:?}"))?
                 .dyn_into()
                 .map_err(|_| anyhow::anyhow!("canvas element cast failed"))?;
-            canvas.set_width(32);
-            canvas.set_height(32);
+            canvas.set_width(WEBCAM_SOURCE_SIZE as u32);
+            canvas.set_height(WEBCAM_SOURCE_SIZE as u32);
             let context: CanvasRenderingContext2d = canvas
                 .get_context("2d")
                 .map_err(|error| anyhow::anyhow!("2d context failed: {error:?}"))?
@@ -2097,65 +2104,39 @@ fn add_tiled_billboard(
     half_width: f32,
     half_height: f32,
     color: [f32; 3],
-    tiles: [(u32, u32); 4],
+    tiles: &[(u32, u32)],
 ) {
-    let left = center - right * half_width;
-    let right_edge = center + right * half_width;
-    let top = center + up * half_height;
-    let bottom = center - up * half_height;
-    let mid_x_left = center;
-    let mid_x_right = center;
-    let mid_y_top = center;
-    let mid_y_bottom = center;
+    let grid = (tiles.len() as f32).sqrt() as usize;
+    if grid == 0 || grid * grid != tiles.len() {
+        return;
+    }
 
-    add_double_sided_face(
-        vertices,
-        indices,
-        [
-            left + (top - center),
-            mid_x_right + (top - center),
-            mid_x_right + (mid_y_bottom - center),
-            left + (mid_y_bottom - center),
-        ],
-        color,
-        atlas_quad(tiles[0]),
-    );
-    add_double_sided_face(
-        vertices,
-        indices,
-        [
-            mid_x_left + (top - center),
-            right_edge + (top - center),
-            right_edge + (mid_y_bottom - center),
-            mid_x_left + (mid_y_bottom - center),
-        ],
-        color,
-        atlas_quad(tiles[1]),
-    );
-    add_double_sided_face(
-        vertices,
-        indices,
-        [
-            left + (mid_y_top - center),
-            mid_x_right + (mid_y_top - center),
-            mid_x_right + (bottom - center),
-            left + (bottom - center),
-        ],
-        color,
-        atlas_quad(tiles[2]),
-    );
-    add_double_sided_face(
-        vertices,
-        indices,
-        [
-            mid_x_left + (mid_y_top - center),
-            right_edge + (mid_y_top - center),
-            right_edge + (bottom - center),
-            mid_x_left + (bottom - center),
-        ],
-        color,
-        atlas_quad(tiles[3]),
-    );
+    for row in 0..grid {
+        let top_t = row as f32 / grid as f32;
+        let bottom_t = (row + 1) as f32 / grid as f32;
+        for col in 0..grid {
+            let left_t = col as f32 / grid as f32;
+            let right_t = (col + 1) as f32 / grid as f32;
+            let x0 = -half_width + left_t * (half_width * 2.0);
+            let x1 = -half_width + right_t * (half_width * 2.0);
+            let y0 = half_height - top_t * (half_height * 2.0);
+            let y1 = half_height - bottom_t * (half_height * 2.0);
+            let tile = tiles[row * grid + col];
+
+            add_double_sided_face(
+                vertices,
+                indices,
+                [
+                    center + right * x0 + up * y0,
+                    center + right * x1 + up * y0,
+                    center + right * x1 + up * y1,
+                    center + right * x0 + up * y1,
+                ],
+                color,
+                atlas_quad(tile),
+            );
+        }
+    }
 }
 
 fn add_double_sided_face(
@@ -2227,7 +2208,7 @@ fn add_face_indices(
 }
 
 fn atlas_quad(tile: (u32, u32)) -> [[f32; 2]; 4] {
-    const TILE_COUNT: f32 = 4.0;
+    const TILE_COUNT: f32 = 8.0;
     const EPS: f32 = 0.001;
 
     let min_u = tile.0 as f32 / TILE_COUNT + EPS;

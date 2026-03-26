@@ -6,7 +6,7 @@ use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
 const TILE_SIZE: u32 = 16;
-const ATLAS_TILES: u32 = 4;
+const ATLAS_TILES: u32 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -601,7 +601,7 @@ fn fill_tile(pixels: &mut [u8], atlas_size: u32, tile_x: u32, tile_y: u32, base:
         return;
     }
 
-    if (tile_x, tile_y) == (1, 2) {
+    if (4..=7).contains(&tile_x) && (0..=3).contains(&tile_y) {
         fill_webcam_tile(pixels, atlas_size, start_x, start_y);
         return;
     }

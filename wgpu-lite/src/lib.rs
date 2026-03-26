@@ -5,6 +5,9 @@ use std::mem;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
+const TILE_SIZE: u32 = 16;
+const ATLAS_TILES: u32 = 4;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct Vertex {
@@ -85,14 +88,13 @@ struct CameraUniform {
 }
 
 struct MaterialTarget {
+    texture: wgpu::Texture,
     layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
 }
 
 impl MaterialTarget {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        const TILE_SIZE: u32 = 16;
-        const ATLAS_TILES: u32 = 4;
         let atlas_size = TILE_SIZE * ATLAS_TILES;
         let mut pixels = vec![0_u8; (atlas_size * atlas_size * 4) as usize];
 
@@ -186,7 +188,11 @@ impl MaterialTarget {
             ],
         });
 
-        Self { layout, bind_group }
+        Self {
+            texture,
+            layout,
+            bind_group,
+        }
     }
 }
 
@@ -434,6 +440,37 @@ impl<'a> Renderer<'a> {
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
+    pub fn update_atlas_tile_rgba(&self, tile: (u32, u32), pixels: &[u8]) {
+        let expected_len = (TILE_SIZE * TILE_SIZE * 4) as usize;
+        if pixels.len() != expected_len || tile.0 >= ATLAS_TILES || tile.1 >= ATLAS_TILES {
+            return;
+        }
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.material.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: tile.0 * TILE_SIZE,
+                    y: tile.1 * TILE_SIZE,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * TILE_SIZE),
+                rows_per_image: Some(TILE_SIZE),
+            },
+            wgpu::Extent3d {
+                width: TILE_SIZE,
+                height: TILE_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     pub fn render(&mut self, meshes: &[&Mesh], overlays: &[&Mesh]) -> Result<()> {
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -556,12 +593,16 @@ fn clamp_surface_size(size: PhysicalSize<u32>, max_extent: u32) -> PhysicalSize<
 }
 
 fn fill_tile(pixels: &mut [u8], atlas_size: u32, tile_x: u32, tile_y: u32, base: [u8; 4]) {
-    const TILE_SIZE: u32 = 16;
     let start_x = tile_x * TILE_SIZE;
     let start_y = tile_y * TILE_SIZE;
 
     if (tile_x, tile_y) == (0, 2) {
         fill_link_tile(pixels, atlas_size, start_x, start_y);
+        return;
+    }
+
+    if (tile_x, tile_y) == (1, 2) {
+        fill_webcam_tile(pixels, atlas_size, start_x, start_y);
         return;
     }
 
@@ -578,8 +619,6 @@ fn fill_tile(pixels: &mut [u8], atlas_size: u32, tile_x: u32, tile_y: u32, base:
 }
 
 fn fill_link_tile(pixels: &mut [u8], atlas_size: u32, start_x: u32, start_y: u32) {
-    const TILE_SIZE: u32 = 16;
-
     for y in 0..TILE_SIZE {
         for x in 0..TILE_SIZE {
             let px = start_x + x;
@@ -601,6 +640,30 @@ fn fill_link_tile(pixels: &mut [u8], atlas_size: u32, start_x: u32, start_y: u32
                 [15, 157, 88, 255]
             } else {
                 [250, 250, 250, 255]
+            };
+            pixels[offset..offset + 4].copy_from_slice(&color);
+        }
+    }
+}
+
+fn fill_webcam_tile(pixels: &mut [u8], atlas_size: u32, start_x: u32, start_y: u32) {
+    for y in 0..TILE_SIZE {
+        for x in 0..TILE_SIZE {
+            let px = start_x + x;
+            let py = start_y + y;
+            let offset = ((py * atlas_size + px) * 4) as usize;
+            let border = x == 0 || y == 0 || x == TILE_SIZE - 1 || y == TILE_SIZE - 1;
+            let color = if border {
+                [28, 28, 32, 255]
+            } else {
+                let u = x as f32 / (TILE_SIZE - 1) as f32;
+                let v = y as f32 / (TILE_SIZE - 1) as f32;
+                [
+                    (40.0 + 130.0 * u) as u8,
+                    (60.0 + 110.0 * (1.0 - v)) as u8,
+                    (90.0 + 90.0 * v) as u8,
+                    255,
+                ]
             };
             pixels[offset..offset + 4].copy_from_slice(&color);
         }

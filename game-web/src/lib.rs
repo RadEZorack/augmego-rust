@@ -9,15 +9,16 @@ use shared_protocol::{
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_time::Instant;
 use web_sys::{
-    BinaryType, CloseEvent, Document, Element, ErrorEvent, Event as WebEvent, HtmlCanvasElement,
+    BinaryType, CanvasRenderingContext2d, CloseEvent, Document, Element, ErrorEvent,
+    Event as WebEvent, HtmlCanvasElement, HtmlVideoElement, MediaStream, MediaStreamConstraints,
     MessageEvent, WebSocket, Worker,
 };
 use wgpu_lite::{Mesh, Renderer, Vertex};
@@ -55,8 +56,11 @@ const LINK_PANEL_HALF_WIDTH: f32 = 1.2;
 const LINK_PANEL_HALF_HEIGHT: f32 = 0.75;
 const LINK_PANEL_HALF_DEPTH: f32 = 0.03;
 const LINK_PANEL_TILE: (u32, u32) = (0, 2);
+const WEBCAM_TILES: [(u32, u32); 4] = [(1, 2), (2, 2), (1, 3), (2, 3)];
 const REMOTE_PLAYER_HALF_WIDTH: f32 = 0.35;
 const REMOTE_PLAYER_HALF_HEIGHT: f32 = 0.9;
+const WEBCAM_PANEL_HALF_WIDTH: f32 = 0.55;
+const WEBCAM_PANEL_HALF_HEIGHT: f32 = 0.40;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -82,6 +86,7 @@ async fn run() -> Result<()> {
     let renderer = Renderer::new(window).await?;
     let (mesh_result_rx, workers, worker_onmessage) = start_mesh_worker_pool(MESH_WORKER_COUNT)?;
     let (network_rx, websocket, websocket_handlers) = start_websocket_client()?;
+    let (webcam_tx, webcam_rx) = mpsc::channel();
     let mut app = WebApp::new(
         renderer.size(),
         canvas,
@@ -91,6 +96,8 @@ async fn run() -> Result<()> {
         network_rx,
         websocket,
         websocket_handlers,
+        webcam_tx,
+        webcam_rx,
     );
     let mut renderer = renderer;
     let mut chunk_meshes = HashMap::new();
@@ -110,8 +117,10 @@ async fn run() -> Result<()> {
                     app.handle_mouse_button(button);
                 }
                 WindowEvent::RedrawRequested => {
+                    app.process_webcam_events();
                     app.process_generation_updates(&renderer, &mut chunk_meshes, DEFAULT_GENERATION_BUDGET_PER_UPDATE);
                     app.tick();
+                    app.update_webcam_texture(&renderer);
                     renderer.update_camera(app.camera_matrix());
                     let visible_meshes = chunk_meshes
                         .iter()
@@ -124,6 +133,10 @@ async fn run() -> Result<()> {
                     }
                     let remote_players_mesh = app.build_remote_players_mesh(&renderer);
                     if let Some(mesh) = &remote_players_mesh {
+                        visible_mesh_refs.push(mesh);
+                    }
+                    let webcam_mesh = app.build_webcam_mesh(&renderer);
+                    if let Some(mesh) = &webcam_mesh {
                         visible_mesh_refs.push(mesh);
                     }
                     let mut overlay_meshes = Vec::new();
@@ -177,6 +190,11 @@ struct WebApp {
     selected_hotbar: usize,
     player_id: Option<u64>,
     remote_players: HashMap<u64, [f32; 3]>,
+    webcam_requested: bool,
+    webcam_tx: Sender<WebcamEvent>,
+    webcam_rx: Receiver<WebcamEvent>,
+    webcam: Option<WebcamCapture>,
+    webcam_anchor: Option<Vec3>,
     last_sent_position: Option<[f32; 3]>,
     last_sent_velocity: Option<[f32; 3]>,
     tick_counter: u64,
@@ -201,6 +219,8 @@ impl WebApp {
         network_rx: Receiver<NetworkEvent>,
         websocket: WebSocket,
         websocket_bindings: WebSocketBindings,
+        webcam_tx: Sender<WebcamEvent>,
+        webcam_rx: Receiver<WebcamEvent>,
     ) -> Self {
         let mut camera = Camera::default();
         camera.position = Vec3::new(0.5, PLAYER_EYE_HEIGHT + 96.0, 0.5);
@@ -241,6 +261,11 @@ impl WebApp {
             selected_hotbar: 0,
             player_id: None,
             remote_players: HashMap::new(),
+            webcam_requested: false,
+            webcam_tx,
+            webcam_rx,
+            webcam: None,
+            webcam_anchor: None,
             last_sent_position: None,
             last_sent_velocity: None,
             tick_counter: 0,
@@ -321,6 +346,7 @@ impl WebApp {
         if !self.mouse_captured {
             self.canvas.request_pointer_lock();
             self.mouse_captured = pointer_is_locked(&self.canvas);
+            self.ensure_webcam_requested();
             return;
         }
 
@@ -358,6 +384,35 @@ impl WebApp {
             },
             InteractionTarget::Link => {}
         }
+    }
+
+    fn ensure_webcam_requested(&mut self) {
+        if self.webcam_requested {
+            return;
+        }
+
+        self.webcam_requested = true;
+        request_webcam_capture(self.webcam_tx.clone());
+    }
+
+    fn process_webcam_events(&mut self) {
+        while let Ok(event) = self.webcam_rx.try_recv() {
+            match event {
+                WebcamEvent::Ready(capture) => {
+                    self.webcam = Some(capture);
+                    if self.webcam_anchor.is_none() {
+                        self.webcam_anchor = Some(self.default_webcam_anchor());
+                    }
+                }
+                WebcamEvent::Failed(_message) => {}
+            }
+        }
+    }
+
+    fn default_webcam_anchor(&self) -> Vec3 {
+        let forward = Vec3::new(self.camera.yaw.sin(), 0.0, self.camera.yaw.cos()).normalize_or_zero();
+        let body = self.camera.position - Vec3::Y * PLAYER_EYE_HEIGHT;
+        body + forward * 3.0 + Vec3::Y * 2.6
     }
 
     fn drain_network(&mut self) {
@@ -627,6 +682,31 @@ impl WebApp {
         Some(renderer.create_mesh(&vertices, &indices))
     }
 
+    fn build_webcam_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
+        let anchor = self.webcam_anchor?;
+        if self.webcam.is_none() {
+            return None;
+        }
+
+        let forward = (self.camera.position - anchor).normalize_or_zero();
+        let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        add_tiled_billboard(
+            &mut vertices,
+            &mut indices,
+            anchor,
+            right,
+            up,
+            WEBCAM_PANEL_HALF_WIDTH,
+            WEBCAM_PANEL_HALF_HEIGHT,
+            [1.0, 1.0, 1.0],
+            WEBCAM_TILES,
+        );
+        Some(renderer.create_mesh(&vertices, &indices))
+    }
+
     fn build_target_highlight_mesh(&mut self, renderer: &Renderer<'_>) -> Option<Mesh> {
         let InteractionTarget::Block(target) = self.current_interaction_target()? else {
             return None;
@@ -752,6 +832,42 @@ impl WebApp {
             dispatch_chunk_mesh_job(&self.workers[worker_index], &chunk);
             self.next_worker_index = (self.next_worker_index + 1) % self.workers.len();
             self.inflight_generation.insert(position);
+        }
+    }
+
+    fn update_webcam_texture(&mut self, renderer: &Renderer<'_>) {
+        let Some(webcam) = &self.webcam else {
+            return;
+        };
+
+        if webcam.video.video_width() == 0 || webcam.video.video_height() == 0 {
+            return;
+        }
+
+        let width = webcam.canvas.width() as f64;
+        let height = webcam.canvas.height() as f64;
+        let _ = webcam
+            .context
+            .draw_image_with_html_video_element_and_dw_and_dh(&webcam.video, 0.0, 0.0, width, height);
+        let Ok(image_data) = webcam.context.get_image_data(0.0, 0.0, width, height) else {
+            return;
+        };
+        let pixels = image_data.data().0;
+        let mut tile_pixels = [[0_u8; 16 * 16 * 4]; 4];
+        for y in 0..32usize {
+            for x in 0..32usize {
+                let tile_x = x / 16;
+                let tile_y = y / 16;
+                let tile_index = tile_y * 2 + tile_x;
+                let local_x = x % 16;
+                let local_y = y % 16;
+                let src = (y * 32 + x) * 4;
+                let dst = (local_y * 16 + local_x) * 4;
+                tile_pixels[tile_index][dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
+            }
+        }
+        for (tile, rgba) in WEBCAM_TILES.into_iter().zip(tile_pixels.iter()) {
+            renderer.update_atlas_tile_rgba(tile, rgba);
         }
     }
 
@@ -1105,6 +1221,17 @@ impl WebApp {
     }
 }
 
+struct WebcamCapture {
+    video: HtmlVideoElement,
+    canvas: HtmlCanvasElement,
+    context: CanvasRenderingContext2d,
+}
+
+enum WebcamEvent {
+    Ready(WebcamCapture),
+    Failed(String),
+}
+
 #[derive(Default)]
 struct Camera {
     position: Vec3,
@@ -1242,6 +1369,68 @@ fn open_url(url: &str) {
     if let Some(window) = web_sys::window() {
         let _ = window.open_with_url_and_target(url, "_blank");
     }
+}
+
+fn request_webcam_capture(sender: Sender<WebcamEvent>) {
+    spawn_local(async move {
+        let result = async {
+            let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
+            let media_devices = window
+                .navigator()
+                .media_devices()
+                .map_err(|error| anyhow::anyhow!("media devices unavailable: {error:?}"))?;
+
+            let constraints = MediaStreamConstraints::new();
+            constraints.set_video(&JsValue::TRUE);
+            constraints.set_audio(&JsValue::FALSE);
+
+            let stream_value = JsFuture::from(
+                media_devices
+                    .get_user_media_with_constraints(&constraints)
+                    .map_err(|error| anyhow::anyhow!("getUserMedia failed: {error:?}"))?,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("getUserMedia rejected: {error:?}"))?;
+            let stream: MediaStream = stream_value
+                .dyn_into()
+                .map_err(|_| anyhow::anyhow!("media stream cast failed"))?;
+
+            let document = window.document().ok_or_else(|| anyhow::anyhow!("document unavailable"))?;
+            let video: HtmlVideoElement = document
+                .create_element("video")
+                .map_err(|error| anyhow::anyhow!("video element create failed: {error:?}"))?
+                .dyn_into()
+                .map_err(|_| anyhow::anyhow!("video element cast failed"))?;
+            video.set_autoplay(true);
+            video.set_muted(true);
+            video.set_attribute("playsinline", "true")
+                .map_err(|error| anyhow::anyhow!("playsinline failed: {error:?}"))?;
+            video.set_src_object(Some(&stream));
+            let _ = video.play();
+
+            let canvas: HtmlCanvasElement = document
+                .create_element("canvas")
+                .map_err(|error| anyhow::anyhow!("canvas element create failed: {error:?}"))?
+                .dyn_into()
+                .map_err(|_| anyhow::anyhow!("canvas element cast failed"))?;
+            canvas.set_width(32);
+            canvas.set_height(32);
+            let context: CanvasRenderingContext2d = canvas
+                .get_context("2d")
+                .map_err(|error| anyhow::anyhow!("2d context failed: {error:?}"))?
+                .ok_or_else(|| anyhow::anyhow!("2d context unavailable"))?
+                .dyn_into()
+                .map_err(|_| anyhow::anyhow!("2d context cast failed"))?;
+
+            Ok::<WebcamCapture, anyhow::Error>(WebcamCapture { video, canvas, context })
+        }
+        .await;
+
+        let _ = match result {
+            Ok(capture) => sender.send(WebcamEvent::Ready(capture)),
+            Err(error) => sender.send(WebcamEvent::Failed(error.to_string())),
+        };
+    });
 }
 
 #[allow(dead_code)]
@@ -1896,6 +2085,93 @@ fn add_link_panel_mesh(
         Vec3::new(0.0, 0.0, LINK_PANEL_HALF_WIDTH + 0.08),
         [0.22, 0.18, 0.12],
         (0, 1),
+    );
+}
+
+fn add_tiled_billboard(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: Vec3,
+    right: Vec3,
+    up: Vec3,
+    half_width: f32,
+    half_height: f32,
+    color: [f32; 3],
+    tiles: [(u32, u32); 4],
+) {
+    let left = center - right * half_width;
+    let right_edge = center + right * half_width;
+    let top = center + up * half_height;
+    let bottom = center - up * half_height;
+    let mid_x_left = center;
+    let mid_x_right = center;
+    let mid_y_top = center;
+    let mid_y_bottom = center;
+
+    add_double_sided_face(
+        vertices,
+        indices,
+        [
+            left + (top - center),
+            mid_x_right + (top - center),
+            mid_x_right + (mid_y_bottom - center),
+            left + (mid_y_bottom - center),
+        ],
+        color,
+        atlas_quad(tiles[0]),
+    );
+    add_double_sided_face(
+        vertices,
+        indices,
+        [
+            mid_x_left + (top - center),
+            right_edge + (top - center),
+            right_edge + (mid_y_bottom - center),
+            mid_x_left + (mid_y_bottom - center),
+        ],
+        color,
+        atlas_quad(tiles[1]),
+    );
+    add_double_sided_face(
+        vertices,
+        indices,
+        [
+            left + (mid_y_top - center),
+            mid_x_right + (mid_y_top - center),
+            mid_x_right + (bottom - center),
+            left + (bottom - center),
+        ],
+        color,
+        atlas_quad(tiles[2]),
+    );
+    add_double_sided_face(
+        vertices,
+        indices,
+        [
+            mid_x_left + (mid_y_top - center),
+            right_edge + (mid_y_top - center),
+            right_edge + (bottom - center),
+            mid_x_left + (bottom - center),
+        ],
+        color,
+        atlas_quad(tiles[3]),
+    );
+}
+
+fn add_double_sided_face(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    positions: [Vec3; 4],
+    color: [f32; 3],
+    uvs: [[f32; 2]; 4],
+) {
+    add_face_indices(vertices, indices, positions, color, uvs);
+    add_face_indices(
+        vertices,
+        indices,
+        [positions[1], positions[0], positions[3], positions[2]],
+        color,
+        [uvs[1], uvs[0], uvs[3], uvs[2]],
     );
 }
 

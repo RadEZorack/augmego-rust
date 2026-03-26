@@ -59,6 +59,7 @@ const LINK_PANEL_HALF_WIDTH: f32 = 1.2;
 const LINK_PANEL_HALF_HEIGHT: f32 = 0.75;
 const LINK_PANEL_HALF_DEPTH: f32 = 0.03;
 const LINK_PANEL_TILE: (u32, u32) = (8, 4);
+const REMOTE_MEDIA_PLACEHOLDER_TILE: (u32, u32) = (0, 0);
 const WEBCAM_SOURCE_SIZE: usize = 64;
 const REMOTE_PLAYER_HALF_WIDTH: f32 = 0.35;
 const REMOTE_PLAYER_HALF_HEIGHT: f32 = 0.9;
@@ -409,6 +410,7 @@ impl WebApp {
                     let remote_ids = self.remote_players.keys().copied().collect::<Vec<_>>();
                     for remote_id in remote_ids {
                         self.ensure_peer_connection(remote_id);
+                        self.maybe_enable_peer_media(remote_id);
                     }
                 }
                 WebcamEvent::Failed(_message) => {}
@@ -774,6 +776,7 @@ impl WebApp {
                 anchor.media,
                 self.camera.position,
                 [0.14, 0.14, 0.16],
+                atlas_quad_raw(REMOTE_MEDIA_PLACEHOLDER_TILE),
             );
         }
 
@@ -795,6 +798,7 @@ impl WebApp {
                 anchor.media,
                 self.camera.position,
                 [1.0, 1.0, 1.0],
+                full_uv_quad(),
             );
             meshes.push(renderer.create_textured_mesh(&vertices, &indices, texture));
         }
@@ -902,19 +906,15 @@ impl WebApp {
         }
     }
 
-    fn ensure_peer_connection(&mut self, remote_player_id: u64) {
-        let Some(local_player_id) = self.player_id else {
+    fn maybe_enable_peer_media(&mut self, remote_player_id: u64) {
+        let (Some(local_player_id), Some(webcam)) = (self.player_id, self.webcam.as_ref()) else {
             return;
         };
-        if local_player_id == remote_player_id || self.remote_media.contains_key(&remote_player_id) {
-            return;
-        }
-
-        let Ok(connection) = RtcPeerConnection::new() else {
+        let Some(remote) = self.remote_media.get_mut(&remote_player_id) else {
             return;
         };
 
-        if let Some(webcam) = &self.webcam {
+        if !remote.local_tracks_attached {
             let tracks = webcam.stream.get_tracks();
             for index in 0..tracks.length() {
                 if let Ok(track) = tracks.get(index).dyn_into::<web_sys::MediaStreamTrack>() {
@@ -922,15 +922,61 @@ impl WebApp {
                     args.push(&track);
                     args.push(&webcam.stream);
                     if let Ok(add_track) =
-                        js_sys::Reflect::get(connection.as_ref(), &JsValue::from_str("addTrack"))
+                        js_sys::Reflect::get(remote.connection.as_ref(), &JsValue::from_str("addTrack"))
                     {
                         if let Ok(add_track) = add_track.dyn_into::<js_sys::Function>() {
-                            let _ = add_track.apply(connection.as_ref(), &args);
+                            let _ = add_track.apply(remote.connection.as_ref(), &args);
                         }
                     }
                 }
             }
+            remote.local_tracks_attached = true;
         }
+
+        if local_player_id < remote_player_id && !remote.offer_started {
+            remote.offer_started = true;
+            let connection = remote.connection.clone();
+            let ws = self.websocket.clone();
+            spawn_local(async move {
+                let Ok(offer) = JsFuture::from(connection.create_offer()).await else {
+                    return;
+                };
+                let Some(sdp) = js_sys::Reflect::get(&offer, &JsValue::from_str("sdp"))
+                    .ok()
+                    .and_then(|value| value.as_string())
+                else {
+                    return;
+                };
+                let description = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+                description.set_sdp(&sdp);
+                if JsFuture::from(connection.set_local_description(&description)).await.is_ok() {
+                    send_client_message_over_websocket(
+                        &ws,
+                        &ClientMessage::WebRtcSignal(ClientWebRtcSignal {
+                            target_player_id: remote_player_id,
+                            payload: WebRtcSignalPayload::Offer { sdp },
+                        }),
+                    );
+                }
+            });
+        }
+    }
+
+    fn ensure_peer_connection(&mut self, remote_player_id: u64) {
+        let Some(local_player_id) = self.player_id else {
+            return;
+        };
+        if local_player_id == remote_player_id {
+            return;
+        }
+        if self.remote_media.contains_key(&remote_player_id) {
+            self.maybe_enable_peer_media(remote_player_id);
+            return;
+        }
+
+        let Ok(connection) = RtcPeerConnection::new() else {
+            return;
+        };
 
         let ws_for_ice = self.websocket.clone();
         let onicecandidate = Closure::wrap(Box::new(move |event: RtcPeerConnectionIceEvent| {
@@ -1009,36 +1055,13 @@ impl WebApp {
             canvas: None,
             context: None,
             texture: None,
+            local_tracks_attached: false,
+            offer_started: false,
             _onicecandidate: onicecandidate,
             _ontrack: ontrack,
         };
         self.remote_media.insert(remote_player_id, remote);
-
-        if local_player_id < remote_player_id && self.webcam.is_some() {
-            let ws = self.websocket.clone();
-            spawn_local(async move {
-                let Ok(offer) = JsFuture::from(connection.create_offer()).await else {
-                    return;
-                };
-                let Some(sdp) = js_sys::Reflect::get(&offer, &JsValue::from_str("sdp"))
-                    .ok()
-                    .and_then(|value| value.as_string())
-                else {
-                    return;
-                };
-                let description = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
-                description.set_sdp(&sdp);
-                if JsFuture::from(connection.set_local_description(&description)).await.is_ok() {
-                    send_client_message_over_websocket(
-                        &ws,
-                        &ClientMessage::WebRtcSignal(ClientWebRtcSignal {
-                            target_player_id: remote_player_id,
-                            payload: WebRtcSignalPayload::Offer { sdp },
-                        }),
-                    );
-                }
-            });
-        }
+        self.maybe_enable_peer_media(remote_player_id);
     }
 
     fn handle_webrtc_signal(&mut self, signal: ServerWebRtcSignal) {
@@ -1471,6 +1494,8 @@ struct RemotePeerMedia {
     canvas: Option<HtmlCanvasElement>,
     context: Option<CanvasRenderingContext2d>,
     texture: Option<DynamicTexture>,
+    local_tracks_attached: bool,
+    offer_started: bool,
     _onicecandidate: Closure<dyn FnMut(RtcPeerConnectionIceEvent)>,
     _ontrack: Closure<dyn FnMut(RtcTrackEvent)>,
 }
@@ -2356,6 +2381,7 @@ fn add_media_panel_billboard(
     center: Vec3,
     camera_position: Vec3,
     color: [f32; 3],
+    uvs: [[f32; 2]; 4],
 ) {
     let forward = (camera_position - center).normalize_or_zero();
     let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
@@ -2370,7 +2396,7 @@ fn add_media_panel_billboard(
             center - right * WEBCAM_PANEL_HALF_WIDTH - up * WEBCAM_PANEL_HALF_HEIGHT,
         ],
         color,
-        full_uv_quad(),
+        uvs,
     );
 }
 

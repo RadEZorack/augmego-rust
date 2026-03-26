@@ -392,12 +392,16 @@ function tileFor(block, face) {
 }
 
 function atlasQuad(tile) {
-  const tileCount = 4;
+  return atlasQuadSpan(tile, 2);
+}
+
+function atlasQuadSpan(tile, span) {
+  const tileCount = 12;
   const eps = 0.001;
-  const minU = tile[0] / tileCount + eps;
-  const maxU = (tile[0] + 1) / tileCount - eps;
-  const minV = tile[1] / tileCount + eps;
-  const maxV = (tile[1] + 1) / tileCount - eps;
+  const minU = (tile[0] * span) / tileCount + eps;
+  const maxU = ((tile[0] * span) + span) / tileCount - eps;
+  const minV = (tile[1] * span) / tileCount + eps;
+  const maxV = ((tile[1] * span) + span) / tileCount - eps;
   return [[minU, minV], [maxU, minV], [maxU, maxV], [minU, maxV]];
 }
 

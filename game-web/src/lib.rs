@@ -21,7 +21,7 @@ use web_sys::{
     Event as WebEvent, HtmlCanvasElement, HtmlVideoElement, MediaStream, MediaStreamConstraints,
     MessageEvent, WebSocket, Worker,
 };
-use wgpu_lite::{Mesh, Renderer, Vertex};
+use wgpu_lite::{DynamicTexture, Mesh, Renderer, TexturedMesh, Vertex};
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -55,15 +55,8 @@ const LINK_PANEL_LABEL_URL: &str = "google.com";
 const LINK_PANEL_HALF_WIDTH: f32 = 1.2;
 const LINK_PANEL_HALF_HEIGHT: f32 = 0.75;
 const LINK_PANEL_HALF_DEPTH: f32 = 0.03;
-const LINK_PANEL_TILE: (u32, u32) = (0, 2);
-const WEBCAM_TILE_GRID: usize = 4;
-const WEBCAM_SOURCE_SIZE: usize = 16 * WEBCAM_TILE_GRID;
-const WEBCAM_TILES: [(u32, u32); 16] = [
-    (4, 0), (5, 0), (6, 0), (7, 0),
-    (4, 1), (5, 1), (6, 1), (7, 1),
-    (4, 2), (5, 2), (6, 2), (7, 2),
-    (4, 3), (5, 3), (6, 3), (7, 3),
-];
+const LINK_PANEL_TILE: (u32, u32) = (8, 4);
+const WEBCAM_SOURCE_SIZE: usize = 64;
 const REMOTE_PLAYER_HALF_WIDTH: f32 = 0.35;
 const REMOTE_PLAYER_HALF_HEIGHT: f32 = 0.9;
 const WEBCAM_PANEL_HALF_WIDTH: f32 = 0.55;
@@ -143,9 +136,7 @@ async fn run() -> Result<()> {
                         visible_mesh_refs.push(mesh);
                     }
                     let webcam_mesh = app.build_webcam_mesh(&renderer);
-                    if let Some(mesh) = &webcam_mesh {
-                        visible_mesh_refs.push(mesh);
-                    }
+                    let textured_mesh_refs = webcam_mesh.iter().collect::<Vec<_>>();
                     let mut overlay_meshes = Vec::new();
                     if let Some(mesh) = app.build_crosshair_mesh(&renderer) {
                         overlay_meshes.push(mesh);
@@ -155,7 +146,7 @@ async fn run() -> Result<()> {
                     }
                     let overlay_refs = overlay_meshes.iter().collect::<Vec<_>>();
 
-                    if let Err(error) = renderer.render(&visible_mesh_refs, &overlay_refs) {
+                    if let Err(error) = renderer.render(&visible_mesh_refs, &textured_mesh_refs, &overlay_refs) {
                         panic!("{error:?}");
                     }
                 }
@@ -201,7 +192,7 @@ struct WebApp {
     webcam_tx: Sender<WebcamEvent>,
     webcam_rx: Receiver<WebcamEvent>,
     webcam: Option<WebcamCapture>,
-    webcam_anchor: Option<Vec3>,
+    webcam_texture: Option<DynamicTexture>,
     last_sent_position: Option<[f32; 3]>,
     last_sent_velocity: Option<[f32; 3]>,
     tick_counter: u64,
@@ -272,7 +263,7 @@ impl WebApp {
             webcam_tx,
             webcam_rx,
             webcam: None,
-            webcam_anchor: None,
+            webcam_texture: None,
             last_sent_position: None,
             last_sent_velocity: None,
             tick_counter: 0,
@@ -405,21 +396,10 @@ impl WebApp {
     fn process_webcam_events(&mut self) {
         while let Ok(event) = self.webcam_rx.try_recv() {
             match event {
-                WebcamEvent::Ready(capture) => {
-                    self.webcam = Some(capture);
-                    if self.webcam_anchor.is_none() {
-                        self.webcam_anchor = Some(self.default_webcam_anchor());
-                    }
-                }
+                WebcamEvent::Ready(capture) => self.webcam = Some(capture),
                 WebcamEvent::Failed(_message) => {}
             }
         }
-    }
-
-    fn default_webcam_anchor(&self) -> Vec3 {
-        let forward = Vec3::new(self.camera.yaw.sin(), 0.0, self.camera.yaw.cos()).normalize_or_zero();
-        let body = self.camera.position - Vec3::Y * PLAYER_EYE_HEIGHT;
-        body + forward * 3.0 + Vec3::Y * 2.6
     }
 
     fn drain_network(&mut self) {
@@ -689,29 +669,31 @@ impl WebApp {
         Some(renderer.create_mesh(&vertices, &indices))
     }
 
-    fn build_webcam_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
-        let anchor = self.webcam_anchor?;
-        if self.webcam.is_none() {
+    fn build_webcam_mesh(&self, renderer: &Renderer<'_>) -> Option<TexturedMesh> {
+        if self.webcam_texture.is_none() {
             return None;
         }
 
-        let forward = (self.camera.position - anchor).normalize_or_zero();
+        let anchor = self.local_player_anchor();
+        let forward = (self.camera.position - anchor.media).normalize_or_zero();
         let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
         let up = right.cross(forward).normalize_or_zero();
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
-        add_tiled_billboard(
+        add_double_sided_face(
             &mut vertices,
             &mut indices,
-            anchor,
-            right,
-            up,
-            WEBCAM_PANEL_HALF_WIDTH,
-            WEBCAM_PANEL_HALF_HEIGHT,
+            [
+                anchor.media - right * WEBCAM_PANEL_HALF_WIDTH + up * WEBCAM_PANEL_HALF_HEIGHT,
+                anchor.media + right * WEBCAM_PANEL_HALF_WIDTH + up * WEBCAM_PANEL_HALF_HEIGHT,
+                anchor.media + right * WEBCAM_PANEL_HALF_WIDTH - up * WEBCAM_PANEL_HALF_HEIGHT,
+                anchor.media - right * WEBCAM_PANEL_HALF_WIDTH - up * WEBCAM_PANEL_HALF_HEIGHT,
+            ],
             [1.0, 1.0, 1.0],
-            &WEBCAM_TILES,
+            full_uv_quad(),
         );
-        Some(renderer.create_mesh(&vertices, &indices))
+        let texture = self.webcam_texture.as_ref()?;
+        Some(renderer.create_textured_mesh(&vertices, &indices, texture))
     }
 
     fn build_target_highlight_mesh(&mut self, renderer: &Renderer<'_>) -> Option<Mesh> {
@@ -749,11 +731,8 @@ impl WebApp {
         let mut indices = Vec::new();
         for (&player_id, position) in &self.remote_players {
             let tint = remote_player_color(player_id);
-            let center = Vec3::new(
-                position[0],
-                position[1] + REMOTE_PLAYER_HALF_HEIGHT,
-                position[2],
-            );
+            let anchor = player_anchor_from_eye(Vec3::new(position[0], position[1], position[2]));
+            let center = (anchor.body + anchor.head) * 0.5;
             add_box_oriented(
                 &mut vertices,
                 &mut indices,
@@ -847,6 +826,12 @@ impl WebApp {
             return;
         };
 
+        if self.webcam_texture.is_none() {
+            self.webcam_texture = Some(
+                renderer.create_dynamic_texture(WEBCAM_SOURCE_SIZE as u32, WEBCAM_SOURCE_SIZE as u32),
+            );
+        }
+
         if webcam.video.video_width() == 0 || webcam.video.video_height() == 0 {
             return;
         }
@@ -859,23 +844,14 @@ impl WebApp {
         let Ok(image_data) = webcam.context.get_image_data(0.0, 0.0, width, height) else {
             return;
         };
-        let pixels = image_data.data().0;
-        let mut tile_pixels = [[0_u8; 16 * 16 * 4]; WEBCAM_TILE_GRID * WEBCAM_TILE_GRID];
-        for y in 0..WEBCAM_SOURCE_SIZE {
-            for x in 0..WEBCAM_SOURCE_SIZE {
-                let tile_x = x / 16;
-                let tile_y = y / 16;
-                let tile_index = tile_y * WEBCAM_TILE_GRID + tile_x;
-                let local_x = x % 16;
-                let local_y = y % 16;
-                let src = (y * WEBCAM_SOURCE_SIZE + x) * 4;
-                let dst = (local_y * 16 + local_x) * 4;
-                tile_pixels[tile_index][dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
-            }
+        if let Some(texture) = &self.webcam_texture {
+            renderer.update_dynamic_texture_rgba(texture, &image_data.data().0);
         }
-        for (tile, rgba) in WEBCAM_TILES.into_iter().zip(tile_pixels.iter()) {
-            renderer.update_atlas_tile_rgba(tile, rgba);
-        }
+    }
+
+    fn local_player_anchor(&self) -> PlayerAnchor {
+        let look = Vec3::new(self.camera.yaw.sin(), 0.0, self.camera.yaw.cos()).normalize_or_zero();
+        player_anchor_from_eye_with_look(self.camera.position, look)
     }
 
     fn generation_budget(&self, default_budget: usize) -> usize {
@@ -1234,6 +1210,13 @@ struct WebcamCapture {
     context: CanvasRenderingContext2d,
 }
 
+#[derive(Clone, Copy)]
+struct PlayerAnchor {
+    body: Vec3,
+    head: Vec3,
+    media: Vec3,
+}
+
 enum WebcamEvent {
     Ready(WebcamCapture),
     Failed(String),
@@ -1422,8 +1405,14 @@ fn request_webcam_capture(sender: Sender<WebcamEvent>) {
                 .map_err(|_| anyhow::anyhow!("canvas element cast failed"))?;
             canvas.set_width(WEBCAM_SOURCE_SIZE as u32);
             canvas.set_height(WEBCAM_SOURCE_SIZE as u32);
+            let options = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(
+                &options,
+                &JsValue::from_str("willReadFrequently"),
+                &JsValue::TRUE,
+            );
             let context: CanvasRenderingContext2d = canvas
-                .get_context("2d")
+                .get_context_with_context_options("2d", &options)
                 .map_err(|error| anyhow::anyhow!("2d context failed: {error:?}"))?
                 .ok_or_else(|| anyhow::anyhow!("2d context unavailable"))?
                 .dyn_into()
@@ -2065,7 +2054,7 @@ fn add_link_panel_mesh(
     let screen_center = center + normal * (frame_half_depth + screen_gap + screen_half_depth);
     let front_center = screen_center + normal * screen_half_depth;
     let back_center = screen_center - normal * screen_half_depth;
-    let uvs = atlas_quad(tile);
+    let uvs = atlas_quad_raw(tile);
 
     let front = [
         front_center - axis_x + axis_y,
@@ -2093,50 +2082,6 @@ fn add_link_panel_mesh(
         [0.22, 0.18, 0.12],
         (0, 1),
     );
-}
-
-fn add_tiled_billboard(
-    vertices: &mut Vec<Vertex>,
-    indices: &mut Vec<u32>,
-    center: Vec3,
-    right: Vec3,
-    up: Vec3,
-    half_width: f32,
-    half_height: f32,
-    color: [f32; 3],
-    tiles: &[(u32, u32)],
-) {
-    let grid = (tiles.len() as f32).sqrt() as usize;
-    if grid == 0 || grid * grid != tiles.len() {
-        return;
-    }
-
-    for row in 0..grid {
-        let top_t = row as f32 / grid as f32;
-        let bottom_t = (row + 1) as f32 / grid as f32;
-        for col in 0..grid {
-            let left_t = col as f32 / grid as f32;
-            let right_t = (col + 1) as f32 / grid as f32;
-            let x0 = -half_width + left_t * (half_width * 2.0);
-            let x1 = -half_width + right_t * (half_width * 2.0);
-            let y0 = half_height - top_t * (half_height * 2.0);
-            let y1 = half_height - bottom_t * (half_height * 2.0);
-            let tile = tiles[row * grid + col];
-
-            add_double_sided_face(
-                vertices,
-                indices,
-                [
-                    center + right * x0 + up * y0,
-                    center + right * x1 + up * y0,
-                    center + right * x1 + up * y1,
-                    center + right * x0 + up * y1,
-                ],
-                color,
-                atlas_quad(tile),
-            );
-        }
-    }
 }
 
 fn add_double_sided_face(
@@ -2208,13 +2153,26 @@ fn add_face_indices(
 }
 
 fn atlas_quad(tile: (u32, u32)) -> [[f32; 2]; 4] {
-    const TILE_COUNT: f32 = 8.0;
+    atlas_quad_span(tile, 2)
+}
+
+fn atlas_quad_raw(tile: (u32, u32)) -> [[f32; 2]; 4] {
+    atlas_quad_span(tile, 1)
+}
+
+fn full_uv_quad() -> [[f32; 2]; 4] {
+    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+}
+
+fn atlas_quad_span(tile: (u32, u32), span: u32) -> [[f32; 2]; 4] {
+    const TILE_COUNT: f32 = 12.0;
     const EPS: f32 = 0.001;
 
-    let min_u = tile.0 as f32 / TILE_COUNT + EPS;
-    let max_u = (tile.0 + 1) as f32 / TILE_COUNT - EPS;
-    let min_v = tile.1 as f32 / TILE_COUNT + EPS;
-    let max_v = (tile.1 + 1) as f32 / TILE_COUNT - EPS;
+    let span = span as f32;
+    let min_u = (tile.0 as f32 * span) / TILE_COUNT + EPS;
+    let max_u = ((tile.0 as f32 * span) + span) / TILE_COUNT - EPS;
+    let min_v = (tile.1 as f32 * span) / TILE_COUNT + EPS;
+    let max_v = ((tile.1 as f32 * span) + span) / TILE_COUNT - EPS;
 
     [[min_u, min_v], [max_u, min_v], [max_u, max_v], [min_u, max_v]]
 }
@@ -2225,4 +2183,20 @@ fn remote_player_color(player_id: u64) -> [f32; 3] {
     let g = 0.45 + 0.4 * ((hue + 0.33) * std::f32::consts::TAU).sin().abs();
     let b = 0.45 + 0.4 * ((hue + 0.66) * std::f32::consts::TAU).sin().abs();
     [r, g, b]
+}
+
+fn player_anchor_from_eye(eye: Vec3) -> PlayerAnchor {
+    player_anchor_from_eye_with_look(eye, Vec3::Z)
+}
+
+fn player_anchor_from_eye_with_look(eye: Vec3, look: Vec3) -> PlayerAnchor {
+    let look = if look.length_squared() > 0.0001 {
+        look.normalize()
+    } else {
+        Vec3::Z
+    };
+    let body = eye - Vec3::Y * PLAYER_EYE_HEIGHT;
+    let head = body + Vec3::Y * PLAYER_HEIGHT;
+    let media = head + Vec3::Y * 0.75 + look * 1.8;
+    PlayerAnchor { body, head, media }
 }

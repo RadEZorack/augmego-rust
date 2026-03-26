@@ -6,7 +6,7 @@ use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
 const TILE_SIZE: u32 = 16;
-const ATLAS_TILES: u32 = 8;
+const ATLAS_TILES: u32 = 12;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -52,6 +52,19 @@ pub struct Mesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+}
+
+pub struct DynamicTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    width: u32,
+    height: u32,
+}
+
+pub struct TexturedMesh {
+    mesh: Mesh,
+    bind_group: wgpu::BindGroup,
 }
 
 struct DepthTarget {
@@ -193,6 +206,25 @@ impl MaterialTarget {
             layout,
             bind_group,
         }
+    }
+}
+
+impl DynamicTexture {
+    fn bind_group(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dynamic-texture-bind-group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        })
     }
 }
 
@@ -432,6 +464,81 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    pub fn create_dynamic_texture(&self, width: u32, height: u32) -> DynamicTexture {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dynamic-rgba-texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("dynamic-texture-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        DynamicTexture {
+            texture,
+            view,
+            sampler,
+            width: width.max(1),
+            height: height.max(1),
+        }
+    }
+
+    pub fn update_dynamic_texture_rgba(&self, texture: &DynamicTexture, pixels: &[u8]) {
+        let expected_len = (texture.width * texture.height * 4) as usize;
+        if pixels.len() != expected_len {
+            return;
+        }
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * texture.width),
+                rows_per_image: Some(texture.height),
+            },
+            wgpu::Extent3d {
+                width: texture.width,
+                height: texture.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    pub fn create_textured_mesh(
+        &self,
+        vertices: &[Vertex],
+        indices: &[u32],
+        texture: &DynamicTexture,
+    ) -> TexturedMesh {
+        TexturedMesh {
+            mesh: self.create_mesh(vertices, indices),
+            bind_group: texture.bind_group(&self.device, &self.material.layout),
+        }
+    }
+
     pub fn update_camera(&self, view_projection: Mat4) {
         let uniform = CameraUniform {
             view_proj: view_projection.to_cols_array_2d(),
@@ -471,7 +578,7 @@ impl<'a> Renderer<'a> {
         );
     }
 
-    pub fn render(&mut self, meshes: &[&Mesh], overlays: &[&Mesh]) -> Result<()> {
+    pub fn render(&mut self, meshes: &[&Mesh], textured_meshes: &[&TexturedMesh], overlays: &[&Mesh]) -> Result<()> {
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -522,6 +629,12 @@ impl<'a> Renderer<'a> {
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+            for textured in textured_meshes {
+                pass.set_bind_group(1, &textured.bind_group, &[]);
+                pass.set_vertex_buffer(0, textured.mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(textured.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..textured.mesh.index_count, 0, 0..1);
             }
         }
 
@@ -596,16 +709,26 @@ fn fill_tile(pixels: &mut [u8], atlas_size: u32, tile_x: u32, tile_y: u32, base:
     let start_x = tile_x * TILE_SIZE;
     let start_y = tile_y * TILE_SIZE;
 
-    if (tile_x, tile_y) == (0, 2) {
+    if (tile_x, tile_y) == (8, 4) {
         fill_link_tile(pixels, atlas_size, start_x, start_y);
         return;
     }
 
-    if (4..=7).contains(&tile_x) && (0..=3).contains(&tile_y) {
+    if (8..=11).contains(&tile_x) && (0..=3).contains(&tile_y) {
         fill_webcam_tile(pixels, atlas_size, start_x, start_y);
         return;
     }
 
+    if tile_x < 8 && tile_y < 8 {
+        let base = tile_color(tile_x / 2, tile_y / 2);
+        fill_checker_tile(pixels, atlas_size, start_x, start_y, base);
+        return;
+    }
+
+    fill_checker_tile(pixels, atlas_size, start_x, start_y, base);
+}
+
+fn fill_checker_tile(pixels: &mut [u8], atlas_size: u32, start_x: u32, start_y: u32, base: [u8; 4]) {
     for y in 0..TILE_SIZE {
         for x in 0..TILE_SIZE {
             let px = start_x + x;

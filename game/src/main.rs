@@ -41,7 +41,7 @@ const LINK_PANEL_URL: &str = "https://www.google.com";
 const LINK_PANEL_HALF_WIDTH: f32 = 1.2;
 const LINK_PANEL_HALF_HEIGHT: f32 = 0.75;
 const LINK_PANEL_HALF_DEPTH: f32 = 0.03;
-const LINK_PANEL_TILE: (u32, u32) = (0, 2);
+const LINK_PANEL_TILE: (u32, u32) = (8, 4);
 
 fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
@@ -111,7 +111,7 @@ fn main() -> Result<()> {
                         overlay_meshes.push(mesh);
                     }
                     let overlay_refs = overlay_meshes.iter().collect::<Vec<_>>();
-                    if let Err(error) = renderer.render(&visible_mesh_refs, &overlay_refs) {
+                    if let Err(error) = renderer.render(&visible_mesh_refs, &[], &overlay_refs) {
                         eprintln!("render error: {error:?}");
                         target.exit();
                     }
@@ -1128,7 +1128,7 @@ fn add_link_panel_mesh(
     let screen_center = center + normal * (frame_half_depth + screen_gap + screen_half_depth);
     let front_center = screen_center + normal * screen_half_depth;
     let back_center = screen_center - normal * screen_half_depth;
-    let uvs = atlas_quad(tile);
+    let uvs = atlas_quad_raw(tile);
 
     let front = [
         front_center - axis_x + axis_y,
@@ -1633,13 +1633,22 @@ fn tile_for(block: BlockId, face: Face) -> (u32, u32) {
 }
 
 fn atlas_quad(tile: (u32, u32)) -> [[f32; 2]; 4] {
-    const TILE_COUNT: f32 = 8.0;
+    atlas_quad_span(tile, 2)
+}
+
+fn atlas_quad_raw(tile: (u32, u32)) -> [[f32; 2]; 4] {
+    atlas_quad_span(tile, 1)
+}
+
+fn atlas_quad_span(tile: (u32, u32), span: u32) -> [[f32; 2]; 4] {
+    const TILE_COUNT: f32 = 12.0;
     const EPS: f32 = 0.001;
 
-    let min_u = tile.0 as f32 / TILE_COUNT + EPS;
-    let max_u = (tile.0 + 1) as f32 / TILE_COUNT - EPS;
-    let min_v = tile.1 as f32 / TILE_COUNT + EPS;
-    let max_v = (tile.1 + 1) as f32 / TILE_COUNT - EPS;
+    let span = span as f32;
+    let min_u = (tile.0 as f32 * span) / TILE_COUNT + EPS;
+    let max_u = ((tile.0 as f32 * span) + span) / TILE_COUNT - EPS;
+    let min_v = (tile.1 as f32 * span) / TILE_COUNT + EPS;
+    let max_v = ((tile.1 as f32 * span) + span) / TILE_COUNT - EPS;
 
     [
         [min_u, min_v],

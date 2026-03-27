@@ -22,6 +22,12 @@ Start Postgres:
 docker compose -f docker-compose.dev.yml up -d postgres
 ```
 
+Start the local HTTPS reverse proxy for `https://dev.augmego.ca`:
+
+```bash
+docker compose -f docker-compose.dev.yml up -d dev-proxy
+```
+
 Start the Bun API from [`bun-backend`](/Users/travismiller/Documents/augmego-rust/bun-backend):
 
 ```bash
@@ -30,31 +36,40 @@ bun run db:generate
 bun run dev
 ```
 
+If Bun does not accept connections through `dev.augmego.ca`, make sure it is listening on all interfaces in your local dev setup.
+
 Start the Rust voxel backend:
 
 ```bash
-cargo run -p backend
+BACKEND_BIND_ADDR=0.0.0.0:4000 BACKEND_WS_BIND_ADDR=0.0.0.0:4001 cargo run -p backend
 ```
 
 Start the web client:
 
 ```bash
 cd game-web
-trunk serve --port 3002 --open
+trunk serve --address 0.0.0.0 --port 3002 --open
 ```
 
-The local Trunk dev server proxies:
+Then open `https://dev.augmego.ca`.
 
-- `/api/*` -> `http://127.0.0.1:3000`
-- `/ws` -> `ws://127.0.0.1:4001`
+Local dev now works like this:
 
-If you want a public dev URL, start ngrok:
+- nginx in Docker terminates HTTPS for `dev.augmego.ca`
+- `/` proxies to local `trunk serve` on `http://127.0.0.1:3002`
+- `/api/*` proxies to local Bun on `http://127.0.0.1:3000`
+- `/ws` proxies to local voxel WebSocket on `ws://127.0.0.1:4001`
 
-```bash
-NGROK_AUTHTOKEN=your_token docker compose -f docker-compose.dev.yml up -d ngrok
-```
+Before this works, you need:
 
-That exposes your local frontend running on `http://localhost:3002`, and you can inspect the tunnel at `http://localhost:4040`.
+1. A hosts entry:
+   `127.0.0.1 dev.augmego.ca`
+2. Local TLS certs at [`dev-proxy/README.md`](/Users/travismiller/Documents/augmego-rust/dev-proxy/README.md)
+3. Bun auth env values matching:
+   `WEB_BASE_URL="https://dev.augmego.ca"`
+   `WEB_ORIGINS="https://dev.augmego.ca"`
+
+Use [`bun-backend/.env.example`](/Users/travismiller/Documents/augmego-rust/bun-backend/.env.example) as the starting point for the SSO callback URLs and cookie settings.
 
 ## Docker Compose
 
@@ -91,3 +106,9 @@ This is the production-oriented stack. It builds the release web bundle with `tr
 - async mesh jobs and transparent/opaque mesh separation
 - inventories, crafting interactions, storage blocks, and hotbar UI
 - richer biomes, landmarks, weather, and traversal tools
+
+
+docker compose -f docker-compose.dev.yml up -d postgres dev-proxy
+cd bun-backend && bun install && bun run db:generate && bun run dev
+BACKEND_BIND_ADDR=0.0.0.0:4000 BACKEND_WS_BIND_ADDR=0.0.0.0:4001 cargo run -p backend
+cd game-web && trunk serve --address 0.0.0.0 --port 3002 --open

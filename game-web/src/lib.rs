@@ -2372,10 +2372,10 @@ fn api_base_url() -> Result<String> {
     let protocol = location
         .protocol()
         .map_err(|_| anyhow::anyhow!("window location protocol unavailable"))?;
-    let hostname = location
-        .hostname()
-        .map_err(|_| anyhow::anyhow!("window location hostname unavailable"))?;
-    Ok(format!("{protocol}//{hostname}:3000/api/v1"))
+    let host = location
+        .host()
+        .map_err(|_| anyhow::anyhow!("window location host unavailable"))?;
+    Ok(format!("{protocol}//{host}/api/v1"))
 }
 
 async fn fetch_auth_user() -> Result<Option<AuthUser>> {
@@ -2823,8 +2823,14 @@ fn expand_chunk_voxels(chunk: &ChunkData) -> Vec<u16> {
 fn websocket_url() -> Result<String> {
     let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window"))?;
     let location = window.location();
-    let host = location.hostname().unwrap_or_else(|_| "127.0.0.1".to_string());
-    Ok(format!("ws://{host}:4001"))
+    let protocol = location
+        .protocol()
+        .unwrap_or_else(|_| "http:".to_string());
+    let host = location
+        .host()
+        .unwrap_or_else(|_| "127.0.0.1:3001".to_string());
+    let ws_protocol = if protocol == "https:" { "wss" } else { "ws" };
+    Ok(format!("{ws_protocol}://{host}/ws"))
 }
 
 fn ordered_chunk_positions(radius: i32) -> Vec<ChunkPos> {

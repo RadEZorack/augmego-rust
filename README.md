@@ -46,6 +46,20 @@ Published ports:
 
 The compose stack uses local Docker volumes for Postgres data, Bun storage, and voxel world persistence. OAuth providers are optional; if you want Google/Apple/LinkedIn login to work, add the corresponding credentials to the `bun-backend` service environment in [`docker-compose.yml`](/Users/travismiller/Documents/augmego-rust/docker-compose.yml).
 
+To expose the web client and Bun API through ngrok, start the optional profile:
+
+```bash
+NGROK_AUTHTOKEN=your_token docker compose --profile ngrok up --build
+```
+
+This starts one public frontend tunnel to `game-web:80`.
+The web container reverse-proxies:
+
+- `/api/*` -> `bun-backend:3000`
+- `/ws` -> `voxel-backend:4001`
+
+Inspect the tunnel in the ngrok admin UI at `http://localhost:4040`.
+
 ## Current Slice
 
 - authoritative seeded terrain generation on the backend

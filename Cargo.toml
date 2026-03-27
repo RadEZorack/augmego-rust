@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "backend",
-    "game.deprecated",
     "game-web",
     "shared_content",
     "shared_math",

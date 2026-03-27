@@ -1,0 +1,6 @@
+version: 2
+tunnels:
+  web:
+    proto: http
+    addr: game-web:80
+    pooling_enabled: true

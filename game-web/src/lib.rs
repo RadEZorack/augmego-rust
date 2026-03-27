@@ -44,6 +44,9 @@ const CHUNK_WORLD_RADIUS: f32 = (CHUNK_WIDTH as f32) * 0.5;
 const DRAW_DISTANCE_CHUNKS: f32 = 14.0;
 const MESH_WORKER_COUNT: usize = 3;
 const DEFAULT_GENERATION_BUDGET_PER_UPDATE: usize = 6;
+const DEFAULT_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 2;
+const MAX_IDLE_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 4;
+const PENDING_REPRIORITIZE_DOT_THRESHOLD: f32 = 0.985;
 const PLAYER_RADIUS: f32 = 0.35;
 const PLAYER_HEIGHT: f32 = 1.8;
 const PLAYER_EYE_HEIGHT: f32 = 1.62;
@@ -195,6 +198,9 @@ struct WebApp {
     pending_generation: VecDeque<ChunkPos>,
     inflight_generation: HashSet<ChunkPos>,
     dirty_generation: HashSet<ChunkPos>,
+    completed_meshes: VecDeque<MeshBuildResult>,
+    last_reprioritize_chunk: ChunkPos,
+    last_reprioritize_forward: Vec3,
     movement_active: bool,
     mouse_captured: bool,
     spawn_settled: bool,
@@ -262,6 +268,7 @@ impl WebApp {
         let current_chunk = chunk_from_world_position(camera.position);
         let desired_chunks = HashSet::new();
         let pending_generation = VecDeque::new();
+        let last_reprioritize_forward = camera.forward();
 
         Self {
             canvas,
@@ -276,6 +283,9 @@ impl WebApp {
             pending_generation,
             inflight_generation: HashSet::new(),
             dirty_generation: HashSet::new(),
+            completed_meshes: VecDeque::new(),
+            last_reprioritize_chunk: current_chunk,
+            last_reprioritize_forward,
             movement_active: false,
             mouse_captured: false,
             spawn_settled: false,
@@ -513,6 +523,9 @@ impl WebApp {
                             self.spawn_settled = false;
                             self.current_chunk = chunk_from_world_position(self.camera.position);
                             self.desired_chunks = desired_chunk_set(self.current_chunk, WEB_RADIUS);
+                            self.completed_meshes.clear();
+                            self.last_reprioritize_chunk = self.current_chunk;
+                            self.last_reprioritize_forward = self.camera.forward();
                             self.send_chunk_subscription(self.current_chunk);
                             self.link_panel = LinkPanel::near_spawn(self.camera.position);
                             self.spawn_position = Some(response.spawn_position);
@@ -535,6 +548,7 @@ impl WebApp {
                             self.pending_generation.retain(|pending| *pending != position);
                             self.inflight_generation.remove(&position);
                             self.dirty_generation.remove(&position);
+                            self.completed_meshes.retain(|mesh| mesh.position != position);
                         }
                     }
                     ServerMessage::InventorySnapshot(InventorySnapshot { slots }) => {
@@ -914,6 +928,15 @@ impl WebApp {
         self.update_streaming_window(chunk_meshes);
 
         while let Ok(result) = self.mesh_result_rx.try_recv() {
+            self.completed_meshes.push_back(result);
+        }
+
+        let completed_budget = self.mesh_upload_budget();
+        for _ in 0..completed_budget {
+            let Some(result) = self.completed_meshes.pop_front() else {
+                break;
+            };
+
             self.inflight_generation.remove(&result.position);
             if result.failed {
                 if self.desired_chunks.contains(&result.position) {
@@ -925,7 +948,10 @@ impl WebApp {
             if self.desired_chunks.contains(&result.position) {
                 self.collision_voxels
                     .insert(result.position, result.voxels.clone());
-                chunk_meshes.insert(result.position, renderer.create_mesh(&result.vertices, &result.indices));
+                chunk_meshes.insert(
+                    result.position,
+                    renderer.create_mesh(&result.vertices(), &result.indices),
+                );
             }
 
             if self.dirty_generation.remove(&result.position) {
@@ -933,7 +959,7 @@ impl WebApp {
             }
         }
 
-        self.reprioritize_pending_generation(chunk_meshes);
+        self.reprioritize_pending_generation();
 
         let budget = self.generation_budget(default_budget);
         for _ in 0..budget {
@@ -1240,6 +1266,18 @@ impl WebApp {
         default_budget
     }
 
+    fn mesh_upload_budget(&self) -> usize {
+        if self.completed_meshes.is_empty() {
+            return 0;
+        }
+
+        if self.movement_active {
+            DEFAULT_MESH_UPLOAD_BUDGET_PER_UPDATE
+        } else {
+            MAX_IDLE_MESH_UPLOAD_BUDGET_PER_UPDATE
+        }
+    }
+
     fn update_streaming_window(&mut self, chunk_meshes: &mut HashMap<ChunkPos, Mesh>) {
         let next_chunk = chunk_from_world_position(self.camera.position);
         if next_chunk == self.current_chunk {
@@ -1262,20 +1300,40 @@ impl WebApp {
             .retain(|position| self.desired_chunks.contains(position));
         self.dirty_generation
             .retain(|position| self.desired_chunks.contains(position));
+        self.completed_meshes
+            .retain(|mesh| self.desired_chunks.contains(&mesh.position));
     }
 
-    fn reprioritize_pending_generation(&mut self, _chunk_meshes: &HashMap<ChunkPos, Mesh>) {
+    fn reprioritize_pending_generation(&mut self) {
         if self.pending_generation.len() <= 1 {
             return;
         }
 
         let forward = self.camera.forward();
+        if !self.should_reprioritize_pending_generation(forward) {
+            return;
+        }
+
         let mut pending = self.pending_generation.drain(..).collect::<Vec<_>>();
         pending.sort_by(|a, b| {
             chunk_priority(*a, self.current_chunk, self.camera.position, forward)
                 .total_cmp(&chunk_priority(*b, self.current_chunk, self.camera.position, forward))
         });
         self.pending_generation = pending.into();
+        self.last_reprioritize_chunk = self.current_chunk;
+        self.last_reprioritize_forward = forward;
+    }
+
+    fn should_reprioritize_pending_generation(&self, forward: Vec3) -> bool {
+        if self.current_chunk != self.last_reprioritize_chunk {
+            return true;
+        }
+
+        if self.last_reprioritize_forward == Vec3::ZERO || forward == Vec3::ZERO {
+            return true;
+        }
+
+        self.last_reprioritize_forward.dot(forward) < PENDING_REPRIORITIZE_DOT_THRESHOLD
     }
 
     fn update_camera_physics(&mut self, dt: Duration, local_movement: Vec3, jump: bool, sprint: bool) {
@@ -2235,7 +2293,7 @@ fn start_mesh_worker_pool(
                 )));
                 let _ = tx.send(MeshBuildResult {
                     position: ChunkPos { x, z },
-                    vertices: Vec::new(),
+                    vertex_floats: Vec::new(),
                     indices: Vec::new(),
                     voxels: Vec::new(),
                     failed: true,
@@ -2249,20 +2307,10 @@ fn start_mesh_worker_pool(
             let vertex_floats = js_sys::Float32Array::new(&vertices_value).to_vec();
             let indices = js_sys::Uint32Array::new(&indices_value).to_vec();
             let voxels = js_sys::Uint16Array::new(&voxels_value).to_vec();
-            let vertices = vertex_floats
-                .chunks_exact(12)
-                .map(|values| Vertex {
-                    position: [values[0], values[1], values[2]],
-                    color: [values[3], values[4], values[5]],
-                    normal: [values[6], values[7], values[8]],
-                    uv: [values[9], values[10]],
-                    material_id: values[11],
-                })
-                .collect::<Vec<_>>();
 
             let _ = tx.send(MeshBuildResult {
                 position: ChunkPos { x, z },
-                vertices,
+                vertex_floats,
                 indices,
                 voxels,
                 failed: false,
@@ -2479,10 +2527,25 @@ fn chunk_priority(position: ChunkPos, camera_chunk: ChunkPos, camera_position: V
 
 struct MeshBuildResult {
     position: ChunkPos,
-    vertices: Vec<Vertex>,
+    vertex_floats: Vec<f32>,
     indices: Vec<u32>,
     voxels: Vec<u16>,
     failed: bool,
+}
+
+impl MeshBuildResult {
+    fn vertices(&self) -> Vec<Vertex> {
+        self.vertex_floats
+            .chunks_exact(12)
+            .map(|values| Vertex {
+                position: [values[0], values[1], values[2]],
+                color: [values[3], values[4], values[5]],
+                normal: [values[6], values[7], values[8]],
+                uv: [values[9], values[10]],
+                material_id: values[11],
+            })
+            .collect()
+    }
 }
 
 #[allow(dead_code)]

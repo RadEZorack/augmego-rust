@@ -1,0 +1,308 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PartyMemberRole {
+  MEMBER
+  MANAGER
+}
+
+enum WorldAssetGenerationStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+}
+
+enum WorldAssetVisibility {
+  PUBLIC
+  PRIVATE
+}
+
+model Example {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now())
+  name      String
+}
+
+model User {
+  id         String    @id @default(uuid()) @db.Uuid
+  linkedinId String?   @unique
+  googleId   String?   @unique
+  appleId    String?   @unique
+  email      String?   @unique
+  name       String?
+  avatarUrl  String?
+  playerAvatarStationaryModelUrl String?
+  playerAvatarMoveModelUrl       String?
+  playerAvatarSpecialModelUrl    String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  sessions   Session[]
+  partyMembership PartyMember?
+  ledParties      Party[]      @relation("PartyLeader")
+  ownedWorldAssets WorldAsset[] @relation("WorldAssetOwner")
+  createdWorldAssets WorldAsset[] @relation("WorldAssetCreator")
+  createdWorldAssetVersions WorldAssetVersion[] @relation("WorldAssetVersionCreator")
+  ownedWorldPlacements WorldPlacement[] @relation("WorldPlacementOwner")
+  createdWorldPlacements WorldPlacement[] @relation("WorldPlacementCreator")
+  ownedWorldPosts WorldPost[] @relation("WorldPostOwner")
+  createdWorldPosts WorldPost[] @relation("WorldPostCreator")
+  ownedWorldPhotoWalls WorldPhotoWall[] @relation("WorldPhotoWallOwner")
+  createdWorldPhotoWalls WorldPhotoWall[] @relation("WorldPhotoWallCreator")
+  ownedWorldCameras WorldCamera[] @relation("WorldCameraOwner")
+  createdWorldCameras WorldCamera[] @relation("WorldCameraCreator")
+  ownedWorldPostComments WorldPostComment[]
+  createdWorldPostComments WorldPostComment[] @relation("WorldPostCommentCreator")
+  ownedWorldAssetGenerationTasks WorldAssetGenerationTask[] @relation("WorldAssetGenerationOwner")
+  createdWorldAssetGenerationTasks WorldAssetGenerationTask[] @relation("WorldAssetGenerationCreator")
+  ownedWorldTimelineExportTasks WorldTimelineExportTask[] @relation("WorldTimelineExportOwner")
+  createdWorldTimelineExportTasks WorldTimelineExportTask[] @relation("WorldTimelineExportCreator")
+}
+
+model Session {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+}
+
+model Party {
+  id        String       @id @default(uuid()) @db.Uuid
+  leaderId  String       @db.Uuid
+  name      String       @default("Untitled World")
+  description String?
+  isPublic  Boolean      @default(false)
+  portalLat Float        @default(43.090003)
+  portalLng Float        @default(-79.068051)
+  portalCityKey String?
+  portalCityName String?
+  portalCountryName String?
+  portalTimezone String?
+  portalFictionalAddress String?
+  timelineFrames Json @default("[]")
+  portalIsPublic Boolean @default(true)
+  leader    User         @relation("PartyLeader", fields: [leaderId], references: [id], onDelete: Cascade)
+  members   PartyMember[]
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+}
+
+model PartyMember {
+  id        String   @id @default(uuid()) @db.Uuid
+  partyId   String   @db.Uuid
+  userId    String   @unique @db.Uuid
+  role      PartyMemberRole @default(MEMBER)
+  party     Party    @relation(fields: [partyId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@index([partyId])
+}
+
+model WorldAsset {
+  id               String              @id @default(uuid()) @db.Uuid
+  worldOwnerId     String              @db.Uuid
+  createdById      String              @db.Uuid
+  name             String
+  visibility       WorldAssetVisibility @default(PUBLIC)
+  currentVersionId String?             @unique @db.Uuid
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+  worldOwner       User                @relation("WorldAssetOwner", fields: [worldOwnerId], references: [id], onDelete: Cascade)
+  createdBy        User                @relation("WorldAssetCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  currentVersion   WorldAssetVersion?  @relation("WorldAssetCurrentVersion", fields: [currentVersionId], references: [id], onDelete: SetNull)
+  versions         WorldAssetVersion[] @relation("WorldAssetVersions")
+  placements       WorldPlacement[]
+
+  @@index([worldOwnerId, updatedAt])
+}
+
+model WorldAssetVersion {
+  id              String      @id @default(uuid()) @db.Uuid
+  assetId         String      @db.Uuid
+  createdById     String      @db.Uuid
+  version         Int
+  storageKey      String      @unique
+  originalName    String
+  contentType     String
+  sizeBytes       Int
+  createdAt       DateTime    @default(now())
+  asset           WorldAsset  @relation("WorldAssetVersions", fields: [assetId], references: [id], onDelete: Cascade)
+  createdBy       User        @relation("WorldAssetVersionCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  currentForAsset WorldAsset? @relation("WorldAssetCurrentVersion")
+
+  @@unique([assetId, version])
+  @@index([assetId, createdAt])
+}
+
+model WorldPlacement {
+  id           String    @id @default(uuid()) @db.Uuid
+  worldOwnerId String    @db.Uuid
+  assetId      String    @db.Uuid
+  createdById  String    @db.Uuid
+  positionX    Float
+  positionY    Float
+  positionZ    Float
+  rotationX    Float     @default(0)
+  rotationY    Float     @default(0)
+  rotationZ    Float     @default(0)
+  scaleX       Float     @default(1)
+  scaleY       Float     @default(1)
+  scaleZ       Float     @default(1)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  worldOwner   User      @relation("WorldPlacementOwner", fields: [worldOwnerId], references: [id], onDelete: Cascade)
+  asset        WorldAsset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  createdBy    User      @relation("WorldPlacementCreator", fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([worldOwnerId, updatedAt])
+  @@index([assetId])
+}
+
+model WorldPost {
+  id           String   @id @default(uuid()) @db.Uuid
+  worldOwnerId String   @db.Uuid
+  createdById  String   @db.Uuid
+  imageUrl     String
+  imageStorageKey String?
+  imageContentType String?
+  message      String
+  positionX    Float
+  positionY    Float
+  positionZ    Float
+  isMinimized  Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  worldOwner   User     @relation("WorldPostOwner", fields: [worldOwnerId], references: [id], onDelete: Cascade)
+  createdBy    User     @relation("WorldPostCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  comments     WorldPostComment[]
+
+  @@index([worldOwnerId, updatedAt])
+}
+
+model WorldPostComment {
+  id           String   @id @default(uuid()) @db.Uuid
+  postId       String   @db.Uuid
+  worldOwnerId String   @db.Uuid
+  createdById  String   @db.Uuid
+  message      String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  post         WorldPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  worldOwner   User      @relation(fields: [worldOwnerId], references: [id], onDelete: Cascade)
+  createdBy    User      @relation("WorldPostCommentCreator", fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([postId, createdAt])
+  @@index([worldOwnerId, createdAt])
+}
+
+model WorldPhotoWall {
+  id               String   @id @default(uuid()) @db.Uuid
+  worldOwnerId     String   @db.Uuid
+  createdById      String   @db.Uuid
+  imageUrl         String
+  imageStorageKey  String?
+  imageContentType String?
+  positionX        Float
+  positionY        Float
+  positionZ        Float
+  rotationX        Float    @default(0)
+  rotationY        Float    @default(0)
+  rotationZ        Float    @default(0)
+  scaleX           Float    @default(1)
+  scaleY           Float    @default(1)
+  scaleZ           Float    @default(1)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  worldOwner       User     @relation("WorldPhotoWallOwner", fields: [worldOwnerId], references: [id], onDelete: Cascade)
+  createdBy        User     @relation("WorldPhotoWallCreator", fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([worldOwnerId, updatedAt])
+}
+
+model WorldCamera {
+  id           String   @id @default(uuid()) @db.Uuid
+  worldOwnerId String   @db.Uuid
+  createdById  String   @db.Uuid
+  name         String?
+  positionX    Float
+  positionY    Float
+  positionZ    Float
+  lookAtX      Float    @default(0)
+  lookAtY      Float    @default(0)
+  lookAtZ      Float    @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  worldOwner   User     @relation("WorldCameraOwner", fields: [worldOwnerId], references: [id], onDelete: Cascade)
+  createdBy    User     @relation("WorldCameraCreator", fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([worldOwnerId, updatedAt])
+}
+
+model WorldAssetGenerationTask {
+  id                 String                     @id @default(uuid()) @db.Uuid
+  worldOwnerId       String                     @db.Uuid
+  createdById        String                     @db.Uuid
+  status             WorldAssetGenerationStatus @default(PENDING)
+  generationType     String                     @default("OBJECT")
+  generationSource   String                     @default("TEXT")
+  enhancedGraphics   Boolean                    @default(true)
+  visibility         WorldAssetVisibility       @default(PUBLIC)
+  prompt             String
+  modelName          String
+  sourceImageUrl     String?
+  sourceImageStorageKey String?
+  sourceImageContentType String?
+  meshyTaskId        String?                    @unique
+  meshyStatus        String?
+  meshyRiggingTaskId String?
+  meshyRiggedModelUrl String?
+  meshyAnimationIndex Int                       @default(0)
+  generatedAssetId   String?                    @db.Uuid
+  generatedVersionId String?                    @db.Uuid
+  failureReason      String?
+  attempts           Int                        @default(0)
+  startedAt          DateTime?
+  completedAt        DateTime?
+  createdAt          DateTime                   @default(now())
+  updatedAt          DateTime                   @updatedAt
+  worldOwner         User                       @relation("WorldAssetGenerationOwner", fields: [worldOwnerId], references: [id], onDelete: Cascade)
+  createdBy          User                       @relation("WorldAssetGenerationCreator", fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([status, updatedAt])
+  @@index([worldOwnerId, createdAt])
+  @@index([createdById, createdAt])
+}
+
+model WorldTimelineExportTask {
+  id                 String                     @id @default(uuid()) @db.Uuid
+  worldOwnerId       String                     @db.Uuid
+  createdById        String                     @db.Uuid
+  status             WorldAssetGenerationStatus @default(PENDING)
+  sourceStorageKey   String
+  sourceContentType  String?
+  outputStorageKey   String?
+  outputContentType  String?
+  outputFileName     String?
+  processingStatus   String?
+  failureReason      String?
+  attempts           Int                        @default(0)
+  startedAt          DateTime?
+  completedAt        DateTime?
+  createdAt          DateTime                   @default(now())
+  updatedAt          DateTime                   @updatedAt
+  worldOwner         User                       @relation("WorldTimelineExportOwner", fields: [worldOwnerId], references: [id], onDelete: Cascade)
+  createdBy          User                       @relation("WorldTimelineExportCreator", fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([status, updatedAt])
+  @@index([worldOwnerId, createdAt])
+  @@index([createdById, createdAt])
+}

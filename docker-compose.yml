@@ -63,22 +63,6 @@ services:
     ports:
       - "3001:80"
 
-  ngrok:
-    image: ngrok/ngrok:latest
-    container_name: augmego-ngrok
-    profiles: ["ngrok"]
-    depends_on:
-      game-web:
-        condition: service_started
-    environment:
-      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
-    command: ["start", "--all", "--config", "/etc/ngrok.yml"]
-    volumes:
-      - ./ngrok/ngrok.yml:/etc/ngrok.yml:ro
-    ports:
-      - "4040:4040"
-    restart: unless-stopped
-
 volumes:
   postgres-data:
   bun-storage:

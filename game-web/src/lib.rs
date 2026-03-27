@@ -78,7 +78,7 @@ const WEBCAM_PANEL_HALF_WIDTH: f32 = 0.55;
 const WEBCAM_PANEL_HALF_HEIGHT: f32 = 0.40;
 const FEATURED_MODEL_DESIRED_HEIGHT: f32 = 1.5;
 const AUTH_STATUS_CHECKING: &str = "Checking your sign-in session...";
-const AUTH_STATUS_SIGNED_OUT: &str = "Sign in with SSO to enter the shared world.";
+const AUTH_STATUS_SIGNED_OUT: &str = "Sign in with SSO, or continue as a guest.";
 
 #[derive(Clone, Debug)]
 struct AuthUser {
@@ -88,6 +88,15 @@ struct AuthUser {
 }
 
 impl AuthUser {
+    fn guest() -> Self {
+        let guest_id = format!("guest-{}", js_sys::Math::random().to_bits());
+        Self {
+            id: guest_id.clone(),
+            name: Some(format!("Guest {}", &guest_id[6..guest_id.len().min(12)])),
+            email: None,
+        }
+    }
+
     fn display_name(&self) -> String {
         self.name
             .clone()
@@ -106,6 +115,10 @@ enum AuthStatus {
 
 enum AuthEvent {
     Resolved(std::result::Result<Option<AuthUser>, String>),
+}
+
+thread_local! {
+    static AUTH_GUEST_QUEUE: RefCell<bool> = const { RefCell::new(false) };
 }
 
 #[wasm_bindgen(start)]
@@ -717,6 +730,17 @@ impl WebApp {
                     }
                 },
             }
+        }
+
+        let continue_as_guest = AUTH_GUEST_QUEUE.with(|queue| {
+            let mut queued = queue.borrow_mut();
+            let should_continue = *queued;
+            *queued = false;
+            should_continue
+        });
+        if continue_as_guest {
+            self.auth_user = Some(AuthUser::guest());
+            self.auth_status = AuthStatus::SignedIn;
         }
 
         self.sync_auth_overlay();
@@ -2257,6 +2281,23 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
         let _ = buttons.append_child(&button);
         onclicks.push(onclick);
     }
+
+    let guest_button = document.create_element("button").expect("auth guest button");
+    guest_button.set_text_content(Some("Continue As Guest"));
+    let _ = guest_button.set_attribute(
+        "style",
+        "width:100%;padding:14px 16px;border-radius:16px;border:1px solid rgba(247,215,148,0.35);background:rgba(247,215,148,0.12);color:#f7d794;font:600 15px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;transition:transform 120ms ease,background 120ms ease;",
+    );
+    let guest_onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        AUTH_GUEST_QUEUE.with(|queue| {
+            *queue.borrow_mut() = true;
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = guest_button
+        .add_event_listener_with_callback("click", guest_onclick.as_ref().unchecked_ref());
+    let _ = buttons.append_child(&guest_button);
+    onclicks.push(guest_onclick);
+
     let _ = card.append_child(&buttons);
 
     let footnote = document.create_element("p").expect("auth footnote");

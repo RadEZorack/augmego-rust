@@ -1,9 +1,23 @@
-FROM rust:1.88-bookworm AS builder
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.88-bookworm AS toolchain
 
 WORKDIR /app
 
 RUN rustup target add wasm32-unknown-unknown
-RUN cargo install --locked trunk
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    cargo install --locked trunk
+
+FROM toolchain AS dev
+
+WORKDIR /workspace/game-web
+
+CMD ["trunk", "serve", "--address", "0.0.0.0", "--port", "80"]
+
+FROM toolchain AS builder
+
+WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY assets ./assets
@@ -19,7 +33,10 @@ RUN sed -i '/"backend",/d' Cargo.toml \
 
 WORKDIR /app/game-web
 
-RUN trunk build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    --mount=type=cache,target=/app/target \
+    trunk build --release
 
 FROM nginx:1.27-alpine
 

@@ -98,7 +98,7 @@ impl PaletteSection {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkData {
     pub position: ChunkPos,
     pub biome: BiomeId,

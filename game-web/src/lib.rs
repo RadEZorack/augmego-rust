@@ -43,10 +43,11 @@ const SPAWN_READY_RADIUS: i32 = 1;
 const CHUNK_WORLD_RADIUS: f32 = (CHUNK_WIDTH as f32) * 0.5;
 const DRAW_DISTANCE_CHUNKS: f32 = 14.0;
 const MESH_WORKER_COUNT: usize = 3;
-const DEFAULT_GENERATION_BUDGET_PER_UPDATE: usize = 6;
-const DEFAULT_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 2;
-const MAX_IDLE_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 4;
+const DEFAULT_GENERATION_BUDGET_PER_UPDATE: usize = 4;
+const DEFAULT_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 1;
+const MAX_IDLE_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 2;
 const PENDING_REPRIORITIZE_DOT_THRESHOLD: f32 = 0.985;
+const WEB_RENDER_SCALE: f32 = 0.8;
 const PLAYER_RADIUS: f32 = 0.35;
 const PLAYER_HEIGHT: f32 = 1.8;
 const PLAYER_EYE_HEIGHT: f32 = 1.62;
@@ -95,7 +96,8 @@ async fn run() -> Result<()> {
     let canvas = window.canvas().expect("winit web canvas");
     attach_canvas(canvas.clone());
 
-    let renderer = Renderer::new(window).await?;
+    let initial_window_size = window.inner_size();
+    let renderer = Renderer::new_with_size(window, scaled_render_size(initial_window_size)).await?;
     let (mesh_result_rx, workers, worker_onmessage) = start_mesh_worker_pool(MESH_WORKER_COUNT)?;
     let (network_rx, websocket, websocket_handlers) = start_websocket_client()?;
     let (webcam_tx, webcam_rx) = mpsc::channel();
@@ -121,7 +123,7 @@ async fn run() -> Result<()> {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => target.exit(),
                 WindowEvent::Resized(size) => {
-                    renderer.resize(size);
+                    renderer.resize(scaled_render_size(size));
                     app.resize(size);
                 }
                 WindowEvent::KeyboardInput { event, .. } => app.handle_key(event),
@@ -535,8 +537,13 @@ impl WebApp {
                     }
                     ServerMessage::ChunkData(chunk) => {
                         let position = chunk.position;
+                        let changed = self
+                            .authoritative_chunks
+                            .get(&position)
+                            .map(|existing| existing != &chunk)
+                            .unwrap_or(true);
                         self.authoritative_chunks.insert(position, chunk);
-                        if self.desired_chunks.contains(&position) {
+                        if changed && self.desired_chunks.contains(&position) {
                             self.schedule_chunk_rebuild(position);
                         }
                     }
@@ -2471,6 +2478,12 @@ fn chunk_from_world_position(position: Vec3) -> ChunkPos {
         x: (position.x / CHUNK_WIDTH as f32).floor() as i32,
         z: (position.z / CHUNK_DEPTH as f32).floor() as i32,
     }
+}
+
+fn scaled_render_size(size: PhysicalSize<u32>) -> PhysicalSize<u32> {
+    let width = ((size.width.max(1) as f32) * WEB_RENDER_SCALE).round().max(1.0) as u32;
+    let height = ((size.height.max(1) as f32) * WEB_RENDER_SCALE).round().max(1.0) as u32;
+    PhysicalSize::new(width, height)
 }
 
 fn desired_chunk_set(center: ChunkPos, radius: i32) -> HashSet<ChunkPos> {

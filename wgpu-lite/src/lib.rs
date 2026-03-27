@@ -251,7 +251,10 @@ pub struct Renderer<'a> {
 
 impl<'a> Renderer<'a> {
     pub async fn new(window: &'a Window) -> Result<Self> {
-        let size = window.inner_size();
+        Self::new_with_size(window, window.inner_size()).await
+    }
+
+    pub async fn new_with_size(window: &'a Window, size: PhysicalSize<u32>) -> Result<Self> {
         let instance = create_instance();
         let surface = instance.create_surface(window).context("create surface")?;
         let adapter = instance

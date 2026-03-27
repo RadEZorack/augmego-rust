@@ -473,6 +473,29 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    pub fn create_mesh_from_f32(&self, vertex_floats: &[f32], indices: &[u32]) -> Mesh {
+        if !vertex_floats.len().is_multiple_of(12) {
+            return self.create_mesh(&[], &[]);
+        }
+
+        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh-vertex-buffer"),
+            contents: bytemuck::cast_slice(vertex_floats),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh-index-buffer"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        Mesh {
+            vertex_buffer,
+            index_buffer,
+            index_count: indices.len() as u32,
+        }
+    }
+
     pub fn create_dynamic_texture(&self, width: u32, height: u32) -> DynamicTexture {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("dynamic-rgba-texture"),

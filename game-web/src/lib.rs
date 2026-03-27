@@ -43,7 +43,7 @@ const SPAWN_READY_RADIUS: i32 = 1;
 const CHUNK_WORLD_RADIUS: f32 = (CHUNK_WIDTH as f32) * 0.5;
 const DRAW_DISTANCE_CHUNKS: f32 = 14.0;
 const MESH_WORKER_COUNT: usize = 3;
-const DEFAULT_GENERATION_BUDGET_PER_UPDATE: usize = 4;
+const DEFAULT_GENERATION_BUDGET_PER_UPDATE: usize = 2;
 const DEFAULT_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 1;
 const MAX_IDLE_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 2;
 const PENDING_REPRIORITIZE_DOT_THRESHOLD: f32 = 0.985;
@@ -957,7 +957,7 @@ impl WebApp {
                     .insert(result.position, result.voxels.clone());
                 chunk_meshes.insert(
                     result.position,
-                    renderer.create_mesh(&result.vertices(), &result.indices),
+                    renderer.create_mesh_from_f32(&result.vertex_floats, &result.indices),
                 );
             }
 
@@ -2544,21 +2544,6 @@ struct MeshBuildResult {
     indices: Vec<u32>,
     voxels: Vec<u16>,
     failed: bool,
-}
-
-impl MeshBuildResult {
-    fn vertices(&self) -> Vec<Vertex> {
-        self.vertex_floats
-            .chunks_exact(12)
-            .map(|values| Vertex {
-                position: [values[0], values[1], values[2]],
-                color: [values[3], values[4], values[5]],
-                normal: [values[6], values[7], values[8]],
-                uv: [values[9], values[10]],
-                material_id: values[11],
-            })
-            .collect()
-    }
 }
 
 #[allow(dead_code)]

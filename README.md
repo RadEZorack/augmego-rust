@@ -16,6 +16,12 @@ An MMO-oriented Minecraft-style voxel sandbox prototype in Rust.
 
 Use native commands for day-to-day development and keep Docker for infrastructure only.
 
+Quick start:
+
+```bash
+./scripts/dev-up.sh
+```
+
 Start Postgres:
 
 ```bash
@@ -36,7 +42,7 @@ bun run db:generate
 bun run dev
 ```
 
-If Bun does not accept connections through `dev.augmego.ca`, make sure it is listening on all interfaces in your local dev setup.
+The Bun API now respects `HOST` or `BUN_HOST`. For the local HTTPS proxy flow, use `HOST="0.0.0.0"` in your Bun env.
 
 Start the Rust voxel backend:
 
@@ -70,6 +76,12 @@ Before this works, you need:
    `WEB_ORIGINS="https://dev.augmego.ca"`
 
 Use [`bun-backend/.env.example`](/Users/travismiller/Documents/augmego-rust/bun-backend/.env.example) as the starting point for the SSO callback URLs and cookie settings.
+
+You can sanity-check the local setup with:
+
+```bash
+./scripts/dev-check.sh
+```
 
 ## Docker Compose
 

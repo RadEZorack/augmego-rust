@@ -5498,6 +5498,7 @@ const api = new Elysia({ prefix: "/api/v1" })
   });
 
 const port = Number(process.env.PORT) || 3000;
+const host = process.env.HOST || process.env.BUN_HOST || "127.0.0.1";
 
 void startWorldAssetGenerationWorker();
 void startWorldTimelineExportWorker();
@@ -5519,9 +5520,12 @@ const app = registerRealtimeWs(
   }
 )
   .use(api)
-  .listen(port);
+  .listen({
+    port,
+    hostname: host
+  });
 
-console.log(`Elysia server running on port ${port}`);
+console.log(`Elysia server running on http://${host}:${port}`);
 console.log(
   `[world-storage] provider=${effectiveWorldStorageProvider} namespace=${WORLD_STORAGE_NAMESPACE}`
 );

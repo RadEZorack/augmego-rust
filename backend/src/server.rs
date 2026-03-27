@@ -214,6 +214,18 @@ impl WorldService {
         Ok(loaded)
     }
 
+    pub async fn chunk_override(&self, position: ChunkPos) -> Result<Option<ChunkData>> {
+        if let Some(existing) = self.chunks.read().await.get(&position).cloned() {
+            return Ok((existing.revision > 0).then_some(existing));
+        }
+
+        let Some(saved) = self.persistence.load_chunk(position).await? else {
+            return Ok(None);
+        };
+        self.chunks.write().await.insert(position, saved.clone());
+        Ok(Some(saved))
+    }
+
     pub async fn apply_block_edit(&self, position: WorldPos, block: BlockId) -> Result<(BlockActionResult, Option<ChunkData>)> {
         if !(0..CHUNK_HEIGHT).contains(&position.y) {
             return Ok((
@@ -404,8 +416,9 @@ impl ChunkStreamingService {
         }
 
         for (index, position) in additions.into_iter().enumerate() {
-            let chunk = self.world.chunk(position).await?;
-            write_message(stream, &ServerMessage::ChunkData(chunk)).await?;
+            if let Some(chunk) = self.world.chunk_override(position).await? {
+                write_message(stream, &ServerMessage::ChunkData(chunk)).await?;
+            }
 
             // Send nearby chunks first and periodically yield so the client can
             // start rendering before the outer radius finishes streaming.
@@ -454,8 +467,9 @@ impl ChunkStreamingService {
         }
 
         for (index, position) in additions.into_iter().enumerate() {
-            let chunk = self.world.chunk(position).await?;
-            let _ = sender.send(ServerMessage::ChunkData(chunk));
+            if let Some(chunk) = self.world.chunk_override(position).await? {
+                let _ = sender.send(ServerMessage::ChunkData(chunk));
+            }
 
             if index > 0 && index % 8 == 0 {
                 yield_now().await;

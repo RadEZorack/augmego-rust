@@ -2,6 +2,7 @@ const CHUNK_WIDTH = 32;
 const CHUNK_HEIGHT = 256;
 const CHUNK_DEPTH = 32;
 const CHUNK_WORLD_RADIUS = CHUNK_WIDTH * 0.5;
+const DEFAULT_WORLD_SEED = 0xA66DE601n;
 
 self.onmessage = (event) => {
   const data = event.data;
@@ -14,7 +15,12 @@ self.onmessage = (event) => {
   try {
     let mesh;
     if (kind === "build") {
-      mesh = buildChunkMesh(x, z, Array.isArray(data.edits) ? data.edits : []);
+      mesh = buildChunkMesh(
+        x,
+        z,
+        Array.isArray(data.edits) ? data.edits : [],
+        parseWorldSeed(data.worldSeed),
+      );
     } else if (kind === "mesh_chunk") {
       mesh = buildChunkMeshFromVoxels(x, z, new Uint16Array(data.voxels));
     } else {
@@ -43,8 +49,8 @@ self.onmessage = (event) => {
   }
 };
 
-function buildChunkMesh(chunkX, chunkZ, edits) {
-  const { voxels, heights } = generateChunk(chunkX, chunkZ);
+function buildChunkMesh(chunkX, chunkZ, edits, worldSeed) {
+  const { voxels, heights } = generateChunk(chunkX, chunkZ, worldSeed);
   applyEdits(voxels, heights, edits);
   return buildChunkMeshFromVoxels(chunkX, chunkZ, voxels);
 }
@@ -79,21 +85,21 @@ function buildChunkMeshFromVoxels(chunkX, chunkZ, voxelsInput) {
   };
 }
 
-function generateChunk(chunkX, chunkZ) {
+function generateChunk(chunkX, chunkZ, worldSeed) {
   const voxels = new Uint16Array(CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_DEPTH);
   const heights = new Uint16Array(CHUNK_WIDTH * CHUNK_DEPTH);
   const baseX = chunkX * CHUNK_WIDTH;
   const baseZ = chunkZ * CHUNK_DEPTH;
   const chunkCenterX = baseX + CHUNK_WIDTH / 2;
   const chunkCenterZ = baseZ + CHUNK_DEPTH / 2;
-  const biome = biomeAt(chunkCenterX, chunkCenterZ);
+  const biome = biomeAt(chunkCenterX, chunkCenterZ, worldSeed);
 
   for (let x = 0; x < CHUNK_WIDTH; x++) {
     for (let z = 0; z < CHUNK_DEPTH; z++) {
       const worldX = baseX + x;
       const worldZ = baseZ + z;
-      const columnBiome = biomeAt(worldX, worldZ);
-      const surface = heightAt(worldX, worldZ, columnBiome);
+      const columnBiome = biomeAt(worldX, worldZ, worldSeed);
+      const surface = heightAt(worldX, worldZ, columnBiome, worldSeed);
       heights[z * CHUNK_WIDTH + x] = surface;
 
       for (let y = 0; y <= Math.min(surface, CHUNK_HEIGHT - 1); y++) {
@@ -109,7 +115,7 @@ function generateChunk(chunkX, chunkZ) {
         voxels[linearIndex(x, y, z)] = block;
       }
 
-      if (columnBiome === 1 && hash(worldX, worldZ, 99) % 23n === 0n) {
+      if (columnBiome === 1 && hash(worldSeed, worldX, worldZ, 99) % 23n === 0n) {
         placeTree(voxels, x, surface + 1, z);
       }
     }
@@ -151,10 +157,10 @@ function recomputeHeights(voxels, heights) {
   }
 }
 
-function biomeAt(x, z) {
-  const temperature = valueNoise(x, z, 144, 7);
-  const moisture = valueNoise(x, z, 144, 17);
-  const elevation = valueNoise(x, z, 220, 23);
+function biomeAt(x, z, worldSeed) {
+  const temperature = valueNoise(x, z, 144, 7, worldSeed);
+  const moisture = valueNoise(x, z, 144, 17, worldSeed);
+  const elevation = valueNoise(x, z, 220, 23, worldSeed);
 
   if (elevation > 0.7) {
     return 3;
@@ -168,33 +174,33 @@ function biomeAt(x, z) {
   return 0;
 }
 
-function heightAt(x, z, biome) {
-  const broad = valueNoise(x, z, 96, 13);
-  const rolling = valueNoise(x, z, 42, 29);
-  const detail = valueNoise(x, z, 18, 41);
+function heightAt(x, z, biome, worldSeed) {
+  const broad = valueNoise(x, z, 96, 13, worldSeed);
+  const rolling = valueNoise(x, z, 42, 29, worldSeed);
+  const detail = valueNoise(x, z, 18, 41, worldSeed);
   const biomeOffset = biome === 0 ? 60 : biome === 1 ? 63 : biome === 2 ? 58 : 70;
   const biomeScale = biome === 0 ? 7 : biome === 1 ? 9 : biome === 2 ? 6 : 14;
   return Math.round(biomeOffset + broad * biomeScale + rolling * 5 + detail * 2);
 }
 
-function valueNoise(x, z, scale, salt) {
+function valueNoise(x, z, scale, salt, worldSeed) {
   const scaledX = x / scale;
   const scaledZ = z / scale;
   const gx = Math.floor(scaledX);
   const gz = Math.floor(scaledZ);
   const fx = smoothstep(scaledX - gx);
   const fz = smoothstep(scaledZ - gz);
-  const n00 = noiseValue(gx, gz, salt);
-  const n10 = noiseValue(gx + 1, gz, salt);
-  const n01 = noiseValue(gx, gz + 1, salt);
-  const n11 = noiseValue(gx + 1, gz + 1, salt);
+  const n00 = noiseValue(gx, gz, salt, worldSeed);
+  const n10 = noiseValue(gx + 1, gz, salt, worldSeed);
+  const n01 = noiseValue(gx, gz + 1, salt, worldSeed);
+  const n11 = noiseValue(gx + 1, gz + 1, salt, worldSeed);
   const nx0 = lerp(n00, n10, fx);
   const nx1 = lerp(n01, n11, fx);
   return lerp(nx0, nx1, fz);
 }
 
-function noiseValue(x, z, salt) {
-  return Number(hash(x, z, salt)) / Number((1n << 64n) - 1n);
+function noiseValue(x, z, salt, worldSeed) {
+  return Number(hash(worldSeed, x, z, salt)) / Number((1n << 64n) - 1n);
 }
 
 function lerp(a, b, t) {
@@ -405,17 +411,34 @@ function linearIndex(x, y, z) {
   return y * CHUNK_WIDTH * CHUNK_DEPTH + z * CHUNK_WIDTH + x;
 }
 
-function hash(x, z, salt) {
-  const seed = 0xA66DE601n;
-  let value = seed ^ BigInt(salt);
-  value ^= BigInt.asUintN(64, BigInt(x)) * 0x9E3779B97F4A7C15n;
+function hash(worldSeed, x, z, salt) {
+  let value = wrapU64(worldSeed ^ BigInt(salt));
+  value = wrapU64(value ^ wrapMulU64(BigInt(x), 0x9E3779B97F4A7C15n));
   value = rotateLeft64(value, 17n);
-  value ^= BigInt.asUintN(64, BigInt(z)) * 0xBF58476D1CE4E5B9n;
-  value ^= value >> 31n;
-  value = BigInt.asUintN(64, value * 0x94D049BB133111EBn);
-  return BigInt.asUintN(64, value ^ (value >> 30n));
+  value = wrapU64(value ^ wrapMulU64(BigInt(z), 0xBF58476D1CE4E5B9n));
+  value = wrapU64(value ^ (value >> 31n));
+  value = wrapMulU64(value, 0x94D049BB133111EBn);
+  return wrapU64(value ^ (value >> 30n));
+}
+
+function parseWorldSeed(worldSeed) {
+  if (typeof worldSeed === "string" && worldSeed.length > 0) {
+    return BigInt(worldSeed);
+  }
+  if (typeof worldSeed === "number" && Number.isFinite(worldSeed)) {
+    return BigInt(Math.trunc(worldSeed));
+  }
+  return DEFAULT_WORLD_SEED;
 }
 
 function rotateLeft64(value, bits) {
   return BigInt.asUintN(64, (value << bits) | (value >> (64n - bits)));
+}
+
+function wrapU64(value) {
+  return BigInt.asUintN(64, value);
+}
+
+function wrapMulU64(a, b) {
+  return wrapU64(wrapU64(a) * wrapU64(b));
 }

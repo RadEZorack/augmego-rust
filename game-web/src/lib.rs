@@ -36,6 +36,7 @@ const FEATURED_MODEL_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../assets/models/Meshy_AI_A_cute_dog_0326155854_texture.glb"
 ));
+const DEFAULT_WORLD_SEED: u64 = 0xA66D_E601;
 const WEB_RADIUS: i32 = 6;
 #[allow(dead_code)]
 const INITIAL_WEB_RADIUS: i32 = 1;
@@ -46,6 +47,7 @@ const MESH_WORKER_COUNT: usize = 3;
 const DEFAULT_GENERATION_BUDGET_PER_UPDATE: usize = 2;
 const DEFAULT_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 1;
 const MAX_IDLE_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 2;
+const DEFAULT_NETWORK_MESSAGE_BUDGET_PER_TICK: usize = 8;
 const PENDING_REPRIORITIZE_DOT_THRESHOLD: f32 = 0.985;
 const WEB_RENDER_SCALE: f32 = 0.8;
 const PLAYER_RADIUS: f32 = 0.35;
@@ -219,6 +221,7 @@ struct WebApp {
     featured_model: Option<TexturedMesh>,
     featured_model_attempted: bool,
     spawn_position: Option<WorldPos>,
+    world_seed: u64,
     webcam_requested: bool,
     webcam_tx: Sender<WebcamEvent>,
     webcam_rx: Receiver<WebcamEvent>,
@@ -229,6 +232,7 @@ struct WebApp {
     transport_open: bool,
     logged_in: bool,
     network_rx: Receiver<NetworkEvent>,
+    pending_network_events: VecDeque<NetworkEvent>,
     websocket: WebSocket,
     _websocket_bindings: WebSocketBindings,
     _mouse_lock_prompt_onclick: Closure<dyn FnMut(WebEvent)>,
@@ -304,6 +308,7 @@ impl WebApp {
             featured_model: None,
             featured_model_attempted: false,
             spawn_position: None,
+            world_seed: DEFAULT_WORLD_SEED,
             webcam_requested: false,
             webcam_tx,
             webcam_rx,
@@ -314,6 +319,7 @@ impl WebApp {
             transport_open: false,
             logged_in: false,
             network_rx,
+            pending_network_events: VecDeque::new(),
             websocket,
             _websocket_bindings: websocket_bindings,
             _mouse_lock_prompt_onclick: mouse_lock_prompt_onclick,
@@ -493,6 +499,11 @@ impl WebApp {
 
     fn drain_network(&mut self) {
         while let Ok(event) = self.network_rx.try_recv() {
+            self.pending_network_events.push_back(event);
+        }
+
+        let mut processed_server_messages = 0usize;
+        while let Some(event) = self.pending_network_events.pop_front() {
             match event {
                 NetworkEvent::Opened => {
                     self.transport_open = true;
@@ -501,8 +512,34 @@ impl WebApp {
                         client_name: "game-web".to_string(),
                     }));
                 }
-                NetworkEvent::Server(message) => match message {
-                    ServerMessage::ServerHello(_) => {
+                NetworkEvent::ServerBytes(bytes) => {
+                    if processed_server_messages >= DEFAULT_NETWORK_MESSAGE_BUDGET_PER_TICK {
+                        self.pending_network_events
+                            .push_front(NetworkEvent::ServerBytes(bytes));
+                        break;
+                    }
+                    processed_server_messages += 1;
+
+                    let message = match decode::<ServerMessage>(&bytes) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            self.transport_open = false;
+                            self.logged_in = false;
+                            self.player_id = None;
+                            self.remote_players.clear();
+                            self.remote_media.clear();
+                            self.featured_model = None;
+                            self.featured_model_attempted = false;
+                            web_sys::console::error_1(&JsValue::from_str(&format!(
+                                "multiplayer disconnected: decode websocket message: {error}"
+                            )));
+                            break;
+                        }
+                    };
+
+                    match message {
+                    ServerMessage::ServerHello(hello) => {
+                        self.world_seed = hello.world_seed;
                         self.send_client_message(&ClientMessage::LoginRequest(LoginRequest {
                             name: "Web Player".to_string(),
                         }));
@@ -511,6 +548,7 @@ impl WebApp {
                         if response.accepted {
                             self.logged_in = true;
                             self.player_id = Some(response.player_id);
+                            self.pending_network_events.clear();
                             self.remote_players.clear();
                             self.remote_media.clear();
                             self.last_sent_position = None;
@@ -528,6 +566,13 @@ impl WebApp {
                             self.completed_meshes.clear();
                             self.last_reprioritize_chunk = self.current_chunk;
                             self.last_reprioritize_forward = self.camera.forward();
+                            self.pending_generation.clear();
+                            self.inflight_generation.clear();
+                            self.dirty_generation.clear();
+                            let desired_positions = self.desired_chunks.iter().copied().collect::<Vec<_>>();
+                            for position in desired_positions {
+                                self.schedule_chunk_rebuild(position);
+                            }
                             self.send_chunk_subscription(self.current_chunk);
                             self.link_panel = LinkPanel::near_spawn(self.camera.position);
                             self.spawn_position = Some(response.spawn_position);
@@ -537,6 +582,7 @@ impl WebApp {
                     }
                     ServerMessage::ChunkData(chunk) => {
                         let position = chunk.position;
+                        self.chunk_edits.remove(&position);
                         let changed = self
                             .authoritative_chunks
                             .get(&position)
@@ -581,11 +627,13 @@ impl WebApp {
                         }
                     }
                     ServerMessage::ChunkDelta(_) | ServerMessage::ChatMessage(_) => {}
-                },
+                    }
+                }
                 NetworkEvent::Disconnected(reason) => {
                     self.transport_open = false;
                     self.logged_in = false;
                     self.player_id = None;
+                    self.pending_network_events.clear();
                     self.remote_players.clear();
                     self.remote_media.clear();
                     self.featured_model = None;
@@ -978,11 +1026,17 @@ impl WebApp {
                 continue;
             }
 
-            let Some(chunk) = self.authoritative_chunks.get(&position).cloned() else {
-                continue;
-            };
             let worker_index = self.next_worker_index % self.workers.len();
-            dispatch_chunk_mesh_job(&self.workers[worker_index], &chunk);
+            if let Some(chunk) = self.authoritative_chunks.get(&position).cloned() {
+                dispatch_chunk_mesh_job(&self.workers[worker_index], &chunk);
+            } else {
+                dispatch_mesh_job(
+                    &self.workers[worker_index],
+                    position,
+                    self.chunk_edits.get(&position),
+                    self.world_seed,
+                );
+            }
             self.next_worker_index = (self.next_worker_index + 1) % self.workers.len();
             self.inflight_generation.insert(position);
         }
@@ -1291,6 +1345,7 @@ impl WebApp {
             return;
         }
 
+        let previous_desired = self.desired_chunks.clone();
         self.current_chunk = next_chunk;
         self.desired_chunks = desired_chunk_set(self.current_chunk, WEB_RADIUS);
         self.send_chunk_subscription(self.current_chunk);
@@ -1309,6 +1364,14 @@ impl WebApp {
             .retain(|position| self.desired_chunks.contains(position));
         self.completed_meshes
             .retain(|mesh| self.desired_chunks.contains(&mesh.position));
+        for position in self
+            .desired_chunks
+            .difference(&previous_desired)
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            self.schedule_chunk_rebuild(position);
+        }
     }
 
     fn reprioritize_pending_generation(&mut self) {
@@ -1579,6 +1642,9 @@ impl WebApp {
 
         if let Some(chunk) = self.authoritative_chunks.get_mut(&chunk_pos) {
             chunk.set_voxel(local, shared_world::Voxel { block });
+        } else {
+            let edits = self.chunk_edits.entry(chunk_pos).or_default();
+            edits.insert((local.x, local.y, local.z), block);
         }
         self.schedule_chunk_rebuild(chunk_pos);
 
@@ -2348,14 +2414,7 @@ fn start_websocket_client() -> Result<(Receiver<NetworkEvent>, WebSocket, WebSoc
     let message_tx = tx.clone();
     let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
         let bytes = js_sys::Uint8Array::new(&event.data()).to_vec();
-        match decode::<ServerMessage>(&bytes) {
-            Ok(message) => {
-                let _ = message_tx.send(NetworkEvent::Server(message));
-            }
-            Err(error) => {
-                let _ = message_tx.send(NetworkEvent::Disconnected(format!("decode websocket message: {error}")));
-            }
-        }
+        let _ = message_tx.send(NetworkEvent::ServerBytes(bytes));
     }) as Box<dyn FnMut(MessageEvent)>);
     websocket.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
 
@@ -2391,11 +2450,17 @@ fn dispatch_mesh_job(
     worker: &Worker,
     position: ChunkPos,
     edits: Option<&HashMap<(u8, u8, u8), BlockId>>,
+    world_seed: u64,
 ) {
     let job = js_sys::Object::new();
     let _ = js_sys::Reflect::set(&job, &JsValue::from_str("kind"), &JsValue::from_str("build"));
     let _ = js_sys::Reflect::set(&job, &JsValue::from_str("x"), &JsValue::from_f64(f64::from(position.x)));
     let _ = js_sys::Reflect::set(&job, &JsValue::from_str("z"), &JsValue::from_f64(f64::from(position.z)));
+    let _ = js_sys::Reflect::set(
+        &job,
+        &JsValue::from_str("worldSeed"),
+        &JsValue::from_str(&world_seed.to_string()),
+    );
     let edits_array = js_sys::Array::new();
     if let Some(edits) = edits {
         for (&(x, y, z), &block) in edits {
@@ -2556,7 +2621,7 @@ struct WebSocketBindings {
 
 enum NetworkEvent {
     Opened,
-    Server(ServerMessage),
+    ServerBytes(Vec<u8>),
     Disconnected(String),
 }
 

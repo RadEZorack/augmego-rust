@@ -61,7 +61,7 @@ fn material_palette(material_id: f32) -> MaterialPalette {
     }
 
     if material_id < 1.5 {
-        return MaterialPalette(vec3<f32>(0.43, 0.66, 0.29), vec3<f32>(0.27, 0.44, 0.16), 0.18);
+        return MaterialPalette(vec3<f32>(0.43, 0.66, 0.29), vec3<f32>(0.36, 0.52, 0.86), 0.05);
     }
     if material_id < 2.5 {
         return MaterialPalette(vec3<f32>(0.47, 0.33, 0.22), vec3<f32>(0.34, 0.22, 0.14), 0.12);
@@ -79,7 +79,7 @@ fn material_palette(material_id: f32) -> MaterialPalette {
         return MaterialPalette(vec3<f32>(0.52, 0.38, 0.22), vec3<f32>(0.71, 0.57, 0.36), 0.16);
     }
     if material_id < 7.5 {
-        return MaterialPalette(vec3<f32>(0.30, 0.54, 0.24), vec3<f32>(0.18, 0.34, 0.12), 0.22);
+        return MaterialPalette(vec3<f32>(0.30, 0.54, 0.24), vec3<f32>(0.82, 0.18, 0.16), 0.07);
     }
     if material_id < 8.5 {
         return MaterialPalette(vec3<f32>(0.72, 0.56, 0.34), vec3<f32>(0.52, 0.38, 0.21), 0.12);

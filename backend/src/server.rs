@@ -38,11 +38,18 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "127.0.0.1:4000".to_string(),
-            ws_bind_addr: "127.0.0.1:4001".to_string(),
-            world_seed: 0xA66D_E601,
-            save_path: PathBuf::from("world"),
-            view_radius: 12,
+            bind_addr: std::env::var("BACKEND_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:4000".to_string()),
+            ws_bind_addr: std::env::var("BACKEND_WS_BIND_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:4001".to_string()),
+            world_seed: std::env::var("BACKEND_WORLD_SEED")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0xA66D_E601),
+            save_path: PathBuf::from(std::env::var("BACKEND_SAVE_PATH").unwrap_or_else(|_| "world".to_string())),
+            view_radius: std::env::var("BACKEND_VIEW_RADIUS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(12),
         }
     }
 }

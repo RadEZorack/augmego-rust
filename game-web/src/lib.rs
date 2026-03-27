@@ -21,7 +21,8 @@ use web_time::Instant;
 use web_sys::{
     BinaryType, CanvasRenderingContext2d, CloseEvent, Document, Element, ErrorEvent,
     Event as WebEvent, HtmlCanvasElement, HtmlVideoElement, MediaStream, MediaStreamConstraints,
-    MessageEvent, RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType,
+    MessageEvent, Request, RequestCredentials, RequestInit, RequestMode, Response,
+    RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType,
     RtcSessionDescriptionInit, RtcTrackEvent, WebSocket, Worker,
 };
 use wgpu_lite::{DynamicTexture, Mesh, Renderer, TexturedMesh, Vertex};
@@ -76,6 +77,36 @@ const REMOTE_PLAYER_HALF_HEIGHT: f32 = 0.9;
 const WEBCAM_PANEL_HALF_WIDTH: f32 = 0.55;
 const WEBCAM_PANEL_HALF_HEIGHT: f32 = 0.40;
 const FEATURED_MODEL_DESIRED_HEIGHT: f32 = 1.5;
+const AUTH_STATUS_CHECKING: &str = "Checking your sign-in session...";
+const AUTH_STATUS_SIGNED_OUT: &str = "Sign in with SSO to enter the shared world.";
+
+#[derive(Clone, Debug)]
+struct AuthUser {
+    id: String,
+    name: Option<String>,
+    email: Option<String>,
+}
+
+impl AuthUser {
+    fn display_name(&self) -> String {
+        self.name
+            .clone()
+            .or_else(|| self.email.clone())
+            .unwrap_or_else(|| format!("Player {}", &self.id[..self.id.len().min(8)]))
+    }
+}
+
+#[derive(Debug)]
+enum AuthStatus {
+    Checking,
+    SignedOut,
+    SignedIn,
+    Failed(String),
+}
+
+enum AuthEvent {
+    Resolved(std::result::Result<Option<AuthUser>, String>),
+}
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -237,6 +268,14 @@ struct WebApp {
     _websocket_bindings: WebSocketBindings,
     _mouse_lock_prompt_onclick: Closure<dyn FnMut(WebEvent)>,
     _webcam_prompt_onclick: Closure<dyn FnMut(WebEvent)>,
+    auth_status: AuthStatus,
+    auth_user: Option<AuthUser>,
+    auth_rx: Receiver<AuthEvent>,
+    auth_overlay: Element,
+    auth_overlay_status: Element,
+    server_ready_for_login: bool,
+    login_request_sent: bool,
+    _auth_button_onclicks: Vec<Closure<dyn FnMut(WebEvent)>>,
     mesh_result_rx: Receiver<MeshBuildResult>,
     workers: Vec<Worker>,
     next_worker_index: usize,
@@ -270,6 +309,8 @@ impl WebApp {
         let hotbar_slots = create_hotbar(&hotbar_blocks);
         let (mouse_lock_prompt, mouse_lock_prompt_onclick) = create_mouse_lock_prompt(&canvas);
         let (webcam_prompt, webcam_prompt_onclick) = create_webcam_prompt();
+        let auth_rx = request_auth_session();
+        let (auth_overlay, auth_overlay_status, auth_button_onclicks) = create_auth_overlay();
         update_hotbar_ui(&hotbar_slots, &hotbar_blocks, 0);
         let current_chunk = chunk_from_world_position(camera.position);
         let desired_chunks = HashSet::new();
@@ -324,6 +365,14 @@ impl WebApp {
             _websocket_bindings: websocket_bindings,
             _mouse_lock_prompt_onclick: mouse_lock_prompt_onclick,
             _webcam_prompt_onclick: webcam_prompt_onclick,
+            auth_status: AuthStatus::Checking,
+            auth_user: None,
+            auth_rx,
+            auth_overlay,
+            auth_overlay_status,
+            server_ready_for_login: false,
+            login_request_sent: false,
+            _auth_button_onclicks: auth_button_onclicks,
             mesh_result_rx,
             workers,
             next_worker_index: 0,
@@ -507,6 +556,8 @@ impl WebApp {
             match event {
                 NetworkEvent::Opened => {
                     self.transport_open = true;
+                    self.server_ready_for_login = false;
+                    self.login_request_sent = false;
                     self.send_client_message(&ClientMessage::ClientHello(ClientHello {
                         protocol_version: PROTOCOL_VERSION,
                         client_name: "game-web".to_string(),
@@ -525,6 +576,8 @@ impl WebApp {
                         Err(error) => {
                             self.transport_open = false;
                             self.logged_in = false;
+                            self.server_ready_for_login = false;
+                            self.login_request_sent = false;
                             self.player_id = None;
                             self.remote_players.clear();
                             self.remote_media.clear();
@@ -540,13 +593,13 @@ impl WebApp {
                     match message {
                     ServerMessage::ServerHello(hello) => {
                         self.world_seed = hello.world_seed;
-                        self.send_client_message(&ClientMessage::LoginRequest(LoginRequest {
-                            name: "Web Player".to_string(),
-                        }));
+                        self.server_ready_for_login = true;
+                        self.maybe_send_login_request();
                     }
                     ServerMessage::LoginResponse(response) => {
                         if response.accepted {
                             self.logged_in = true;
+                            self.login_request_sent = false;
                             self.player_id = Some(response.player_id);
                             self.pending_network_events.clear();
                             self.remote_players.clear();
@@ -632,6 +685,8 @@ impl WebApp {
                 NetworkEvent::Disconnected(reason) => {
                     self.transport_open = false;
                     self.logged_in = false;
+                    self.server_ready_for_login = false;
+                    self.login_request_sent = false;
                     self.player_id = None;
                     self.pending_network_events.clear();
                     self.remote_players.clear();
@@ -642,6 +697,67 @@ impl WebApp {
                 }
             }
         }
+    }
+
+    fn process_auth_events(&mut self) {
+        while let Ok(event) = self.auth_rx.try_recv() {
+            match event {
+                AuthEvent::Resolved(result) => match result {
+                    Ok(Some(user)) => {
+                        self.auth_user = Some(user);
+                        self.auth_status = AuthStatus::SignedIn;
+                    }
+                    Ok(None) => {
+                        self.auth_user = None;
+                        self.auth_status = AuthStatus::SignedOut;
+                    }
+                    Err(message) => {
+                        self.auth_user = None;
+                        self.auth_status = AuthStatus::Failed(message);
+                    }
+                },
+            }
+        }
+
+        self.sync_auth_overlay();
+        self.maybe_send_login_request();
+    }
+
+    fn sync_auth_overlay(&self) {
+        match &self.auth_status {
+            AuthStatus::Checking => {
+                let _ = self.auth_overlay.set_attribute("style", auth_overlay_style());
+                self.auth_overlay_status
+                    .set_text_content(Some(AUTH_STATUS_CHECKING));
+            }
+            AuthStatus::SignedOut => {
+                let _ = self.auth_overlay.set_attribute("style", auth_overlay_style());
+                self.auth_overlay_status
+                    .set_text_content(Some(AUTH_STATUS_SIGNED_OUT));
+            }
+            AuthStatus::SignedIn => {
+                let _ = self.auth_overlay.set_attribute("style", "display:none;");
+            }
+            AuthStatus::Failed(message) => {
+                let _ = self.auth_overlay.set_attribute("style", auth_overlay_style());
+                self.auth_overlay_status.set_text_content(Some(message));
+            }
+        }
+    }
+
+    fn maybe_send_login_request(&mut self) {
+        if !self.transport_open || !self.server_ready_for_login || self.logged_in || self.login_request_sent {
+            return;
+        }
+
+        let Some(user) = self.auth_user.as_ref() else {
+            return;
+        };
+
+        self.send_client_message(&ClientMessage::LoginRequest(LoginRequest {
+            name: user.display_name(),
+        }));
+        self.login_request_sent = true;
     }
 
     fn send_client_message(&self, message: &ClientMessage) {
@@ -670,6 +786,7 @@ impl WebApp {
 
     fn tick(&mut self) {
         self.sync_pointer_lock_state();
+        self.process_auth_events();
         self.drain_network();
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick);
@@ -2064,6 +2181,121 @@ fn create_webcam_prompt() -> (Element, Closure<dyn FnMut(WebEvent)>) {
     (prompt, onclick)
 }
 
+fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>) {
+    let Some(document) = document() else {
+        return (fallback_element(), fallback_element(), Vec::new());
+    };
+    let Some(body) = document.body() else {
+        return (fallback_element(), fallback_element(), Vec::new());
+    };
+
+    let root = document.create_element("div").expect("auth overlay");
+    let _ = root.set_attribute("style", auth_overlay_style());
+
+    let card = document.create_element("div").expect("auth card");
+    let _ = card.set_attribute(
+        "style",
+        "width:min(92vw,460px);padding:28px;border-radius:24px;background:linear-gradient(180deg,rgba(18,24,32,0.92),rgba(8,12,18,0.96));border:1px solid rgba(255,255,255,0.12);box-shadow:0 30px 90px rgba(0,0,0,0.45);color:#f6f8fb;font-family:ui-sans-serif,system-ui,sans-serif;",
+    );
+
+    let eyebrow = document.create_element("div").expect("auth eyebrow");
+    let _ = eyebrow.set_attribute(
+        "style",
+        "font-size:11px;letter-spacing:0.22em;text-transform:uppercase;color:rgba(183,230,255,0.72);margin-bottom:10px;",
+    );
+    eyebrow.set_text_content(Some("Augmego Login"));
+    let _ = card.append_child(&eyebrow);
+
+    let title = document.create_element("h1").expect("auth title");
+    let _ = title.set_attribute(
+        "style",
+        "margin:0 0 10px 0;font:700 34px/1.05 Georgia,'Times New Roman',serif;",
+    );
+    title.set_text_content(Some("Enter the shared world"));
+    let _ = card.append_child(&title);
+
+    let body_copy = document.create_element("p").expect("auth body");
+    let _ = body_copy.set_attribute(
+        "style",
+        "margin:0 0 18px 0;color:rgba(230,237,243,0.78);font-size:15px;line-height:1.5;",
+    );
+    body_copy.set_text_content(Some(
+        "Use the existing Bun auth service to sign in before the web client joins multiplayer.",
+    ));
+    let _ = card.append_child(&body_copy);
+
+    let status = document.create_element("p").expect("auth status");
+    let _ = status.set_attribute(
+        "style",
+        "margin:0 0 18px 0;color:#f7d794;font-size:14px;line-height:1.4;",
+    );
+    status.set_text_content(Some(AUTH_STATUS_CHECKING));
+    let _ = card.append_child(&status);
+
+    let buttons = document.create_element("div").expect("auth buttons");
+    let _ = buttons.set_attribute("style", "display:grid;gap:10px;");
+
+    let mut onclicks = Vec::new();
+    for (provider, label) in [
+        ("google", "Continue With Google"),
+        ("apple", "Continue With Apple"),
+        ("linkedin", "Continue With LinkedIn"),
+    ] {
+        let button = document.create_element("button").expect("auth provider button");
+        button.set_text_content(Some(label));
+        let _ = button.set_attribute(
+            "style",
+            "width:100%;padding:14px 16px;border-radius:16px;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.06);color:#f6f8fb;font:600 15px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;transition:transform 120ms ease,background 120ms ease;",
+        );
+        let provider = provider.to_string();
+        let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+            if let Ok(base_url) = api_base_url() {
+                navigate_current_tab(&format!("{base_url}/auth/{provider}"));
+            }
+        }) as Box<dyn FnMut(WebEvent)>);
+        let _ = button.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+        let _ = buttons.append_child(&button);
+        onclicks.push(onclick);
+    }
+    let _ = card.append_child(&buttons);
+
+    let footnote = document.create_element("p").expect("auth footnote");
+    let _ = footnote.set_attribute(
+        "style",
+        "margin:18px 0 0 0;color:rgba(230,237,243,0.56);font-size:12px;line-height:1.45;",
+    );
+    footnote.set_text_content(Some(
+        "OAuth callbacks return to this page, then the game continues automatically.",
+    ));
+    let _ = card.append_child(&footnote);
+
+    let _ = root.append_child(&card);
+    let _ = body.append_child(&root);
+    (root, status, onclicks)
+}
+
+fn auth_overlay_style() -> &'static str {
+    "position:fixed;inset:0;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at top,rgba(62,118,158,0.24),transparent 45%),rgba(5,8,12,0.72);backdrop-filter:blur(10px);z-index:60;"
+}
+
+fn fallback_element() -> Element {
+    web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.create_element("div").ok())
+        .expect("fallback element")
+}
+
+fn request_auth_session() -> Receiver<AuthEvent> {
+    let (tx, rx) = mpsc::channel();
+    spawn_local(async move {
+        let result = fetch_auth_user()
+            .await
+            .map_err(|error| format!("Unable to load login session: {error}"));
+        let _ = tx.send(AuthEvent::Resolved(result));
+    });
+    rx
+}
+
 fn update_hotbar_ui(slots: &[Element], blocks: &[BlockId], selected: usize) {
     for (index, slot) in slots.iter().enumerate() {
         let active = index == selected;
@@ -2126,6 +2358,82 @@ fn open_url(url: &str) {
     if let Some(window) = web_sys::window() {
         let _ = window.open_with_url_and_target(url, "_blank");
     }
+}
+
+fn navigate_current_tab(url: &str) {
+    if let Some(window) = web_sys::window() {
+        let _ = window.location().set_href(url);
+    }
+}
+
+fn api_base_url() -> Result<String> {
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
+    let location = window.location();
+    let protocol = location
+        .protocol()
+        .map_err(|_| anyhow::anyhow!("window location protocol unavailable"))?;
+    let hostname = location
+        .hostname()
+        .map_err(|_| anyhow::anyhow!("window location hostname unavailable"))?;
+    Ok(format!("{protocol}//{hostname}:3000/api/v1"))
+}
+
+async fn fetch_auth_user() -> Result<Option<AuthUser>> {
+    let init = RequestInit::new();
+    init.set_method("GET");
+    init.set_mode(RequestMode::Cors);
+    init.set_credentials(RequestCredentials::Include);
+
+    let request = Request::new_with_str_and_init(&format!("{}/auth/me", api_base_url()?), &init)
+        .map_err(|error| anyhow::anyhow!("build auth request: {error:?}"))?;
+    request
+        .headers()
+        .set("Accept", "application/json")
+        .map_err(|error| anyhow::anyhow!("set auth headers: {error:?}"))?;
+
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
+    let response_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| anyhow::anyhow!("fetch auth session: {error:?}"))?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("convert auth response"))?;
+
+    if !response.ok() {
+        return Err(anyhow::anyhow!("auth endpoint returned HTTP {}", response.status()));
+    }
+
+    let body = JsFuture::from(
+        response
+            .json()
+            .map_err(|error| anyhow::anyhow!("read auth response body: {error:?}"))?,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("parse auth response body: {error:?}"))?;
+
+    Ok(parse_auth_user(&body))
+}
+
+fn parse_auth_user(body: &JsValue) -> Option<AuthUser> {
+    let user = js_get(body, "user")?;
+    Some(AuthUser {
+        id: js_get_string(&user, "id")?,
+        name: js_get_string(&user, "name"),
+        email: js_get_string(&user, "email"),
+    })
+}
+
+fn js_get(value: &JsValue, key: &str) -> Option<JsValue> {
+    let value = js_sys::Reflect::get(value, &JsValue::from_str(key)).ok()?;
+    if value.is_null() || value.is_undefined() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn js_get_string(value: &JsValue, key: &str) -> Option<String> {
+    js_get(value, key)?.as_string()
 }
 
 fn attach_local_webcam_overlay(video: &HtmlVideoElement) {

@@ -26,6 +26,26 @@ Start the client in another terminal:
 cargo run -p game
 ```
 
+## Docker Compose
+
+Bring up the browser client, Bun API, Rust voxel server, and Postgres together:
+
+```bash
+docker compose up --build
+```
+
+Then open `http://localhost:3001`.
+
+Published ports:
+
+- `3001`: web client
+- `3000`: Bun auth/API server
+- `4000`: Rust TCP backend
+- `4001`: Rust WebSocket backend
+- `5432`: Postgres
+
+The compose stack uses local Docker volumes for Postgres data, Bun storage, and voxel world persistence. OAuth providers are optional; if you want Google/Apple/LinkedIn login to work, add the corresponding credentials to the `bun-backend` service environment in [`docker-compose.yml`](/Users/travismiller/Documents/augmego-rust/docker-compose.yml).
+
 ## Current Slice
 
 - authoritative seeded terrain generation on the backend

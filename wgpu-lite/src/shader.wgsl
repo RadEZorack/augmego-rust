@@ -52,9 +52,11 @@ fn procedural_voxel_albedo(world_position: vec3<f32>, normal: vec3<f32>, uv: vec
     let pixel = floor(local_uv * 16.0);
     let coarse_noise = hash13(block_origin * 0.73 + vec3<f32>(pixel, 0.0));
     let fine_noise = hash13(block_origin * 1.91 + vec3<f32>(pixel.yx, pixel.x + pixel.y));
-    let grain = (coarse_noise - 0.5) * 0.16 + (fine_noise - 0.5) * 0.08;
-    let face_bias = (hash13(block_origin + normal * 3.17) - 0.5) * 0.05;
-    let tint = clamp(1.0 + grain + face_bias, 0.78, 1.22);
+    let macro_noise = hash13(block_origin * 0.37 + vec3<f32>(pixel * 0.5, pixel.x - pixel.y));
+    let grain = (coarse_noise - 0.5) * 0.34 + (fine_noise - 0.5) * 0.22;
+    let patches = (macro_noise - 0.5) * 0.28;
+    let face_bias = (hash13(block_origin + normal * 3.17) - 0.5) * 0.10;
+    let tint = clamp(1.0 + grain + patches + face_bias, 0.56, 1.46);
     return vec3<f32>(tint);
 }
 

@@ -13,14 +13,11 @@ COPY package.json bun.lock ./
 # Install dependencies
 RUN bun install --frozen-lockfile
 
-# Copy Prisma schema first (for layer caching)
-COPY prisma ./prisma
-
-# Generate Prisma client at build time.
-RUN bun run db:generate
-
-# Copy source
+# Copy app source
 COPY . .
+
+# Generate Prisma client from the final copied schema/source state.
+RUN bun run db:generate
 
 # Expose port (DO injects PORT)
 EXPOSE 8080

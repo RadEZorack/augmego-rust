@@ -15,6 +15,7 @@ pub struct Vertex {
     pub color: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    pub material_id: f32,
 }
 
 impl Vertex {
@@ -42,6 +43,11 @@ impl Vertex {
                     offset: mem::size_of::<[f32; 9]>() as u64,
                     shader_location: 3,
                     format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 11]>() as u64,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Float32,
                 },
             ],
         }

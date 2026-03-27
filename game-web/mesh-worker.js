@@ -250,8 +250,8 @@ function emitBlockFaces(voxels, vertices, indices, world, x, y, z, block) {
     if (neighbor === null || isTransparent(neighbor)) {
       const shadow = skylightShadow(voxels, x + face.offset[0], y, z + face.offset[2]);
       const color = shadedFaceColor(baseColor, face.face, shadow);
-      const faceVerticesData = faceVertices(world, face.face, color, proceduralFaceUvs());
-      const base = vertices.length / 11;
+      const faceVerticesData = faceVertices(world, face.face, color, proceduralFaceUvs(), block);
+      const base = vertices.length / 12;
       vertices.push(...faceVerticesData.flat());
       indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
     }
@@ -321,10 +321,10 @@ function shadedFaceColor(base, face, shadow) {
   return directional.map((value) => value * shadow);
 }
 
-function faceVertices(origin, face, color, uvs) {
+function faceVertices(origin, face, color, uvs, materialId) {
   const [x, y, z] = origin;
   const normal = faceNormal(face);
-  const make = (px, py, pz, uv) => [px, py, pz, color[0], color[1], color[2], normal[0], normal[1], normal[2], uv[0], uv[1]];
+  const make = (px, py, pz, uv) => [px, py, pz, color[0], color[1], color[2], normal[0], normal[1], normal[2], uv[0], uv[1], materialId];
   switch (face) {
     case "north":
       return [make(x, y + 1, z, uvs[0]), make(x + 1, y + 1, z, uvs[1]), make(x + 1, y, z, uvs[2]), make(x, y, z, uvs[3])];
@@ -382,6 +382,8 @@ function blockBaseColor(block) {
       return [0.96, 0.78, 0.36];
     case 11:
       return [0.60, 0.42, 0.24];
+    case 12:
+      return [0.55, 0.55, 0.58];
     default:
       return [1, 1, 1];
   }

@@ -250,6 +250,7 @@ impl WebApp {
         let hotbar_blocks = vec![
             BlockId::Grass,
             BlockId::Stone,
+            BlockId::GoldOre,
             BlockId::Planks,
             BlockId::Glass,
             BlockId::Lantern,
@@ -1614,6 +1615,7 @@ fn load_featured_model_mesh(renderer: &Renderer<'_>, spawn_position: WorldPos) -
                 color: [1.0, 1.0, 1.0],
                 normal: vertex.normal.normalize_or_zero().to_array(),
                 uv: vertex.uv,
+                material_id: 0.0,
             }
         })
         .collect::<Vec<_>>();
@@ -1962,6 +1964,7 @@ fn block_label(block: BlockId) -> &'static str {
         BlockId::Glass => "Glass",
         BlockId::Lantern => "Lantern",
         BlockId::Storage => "Storage",
+        BlockId::GoldOre => "Gold Ore",
         BlockId::Air => "Empty",
     }
 }
@@ -2247,12 +2250,13 @@ fn start_mesh_worker_pool(
             let indices = js_sys::Uint32Array::new(&indices_value).to_vec();
             let voxels = js_sys::Uint16Array::new(&voxels_value).to_vec();
             let vertices = vertex_floats
-                .chunks_exact(11)
+                .chunks_exact(12)
                 .map(|values| Vertex {
                     position: [values[0], values[1], values[2]],
                     color: [values[3], values[4], values[5]],
                     normal: [values[6], values[7], values[8]],
                     uv: [values[9], values[10]],
+                    material_id: values[11],
                 })
                 .collect::<Vec<_>>();
 
@@ -2549,6 +2553,7 @@ fn block_is_solid(block: BlockId) -> bool {
             | BlockId::Glass
             | BlockId::Lantern
             | BlockId::Storage
+            | BlockId::GoldOre
     )
 }
 
@@ -2565,6 +2570,7 @@ fn block_from_id(id: u16) -> BlockId {
         9 => BlockId::Glass,
         10 => BlockId::Lantern,
         11 => BlockId::Storage,
+        12 => BlockId::GoldOre,
         _ => BlockId::Air,
     }
 }
@@ -2821,6 +2827,7 @@ fn add_face_indices(
             color,
             normal,
             uv,
+            material_id: 0.0,
         });
     }
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);

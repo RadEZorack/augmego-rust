@@ -651,6 +651,7 @@ impl VoxelServer {
                 slots: vec![
                     InventoryStack { block: BlockId::Grass, count: 64 },
                     InventoryStack { block: BlockId::Stone, count: 64 },
+                    InventoryStack { block: BlockId::GoldOre, count: 32 },
                     InventoryStack { block: BlockId::Planks, count: 32 },
                 ],
             }),
@@ -730,6 +731,7 @@ impl VoxelServer {
             slots: vec![
                 InventoryStack { block: BlockId::Grass, count: 64 },
                 InventoryStack { block: BlockId::Stone, count: 64 },
+                InventoryStack { block: BlockId::GoldOre, count: 32 },
                 InventoryStack { block: BlockId::Planks, count: 32 },
             ],
         }));

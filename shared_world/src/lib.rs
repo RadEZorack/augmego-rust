@@ -23,6 +23,7 @@ pub enum BlockId {
     Glass = 9,
     Lantern = 10,
     Storage = 11,
+    GoldOre = 12,
 }
 
 impl BlockId {

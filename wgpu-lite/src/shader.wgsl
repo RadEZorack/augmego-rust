@@ -10,6 +10,7 @@ struct VertexInput {
     @location(1) color: vec3<f32>,
     @location(2) normal: vec3<f32>,
     @location(3) uv: vec2<f32>,
+    @location(4) material_id: f32,
 };
 
 struct VertexOutput {
@@ -18,6 +19,7 @@ struct VertexOutput {
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) world_position: vec3<f32>,
+    @location(4) material_id: f32,
 };
 
 @group(1) @binding(0)
@@ -34,8 +36,15 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.normal = normalize(input.normal);
     output.uv = input.uv;
     output.world_position = input.position;
+    output.material_id = input.material_id;
     return output;
 }
+
+struct MaterialPalette {
+    base: vec3<f32>,
+    accent: vec3<f32>,
+    accent_amount: f32,
+};
 
 fn hash13(value: vec3<f32>) -> f32 {
     let q = vec3<f32>(
@@ -46,26 +55,80 @@ fn hash13(value: vec3<f32>) -> f32 {
     return fract(sin(dot(q, vec3<f32>(1.0, 1.0, 1.0))) * 43758.5453);
 }
 
-fn procedural_voxel_albedo(world_position: vec3<f32>, normal: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+fn material_palette(material_id: f32) -> MaterialPalette {
+    if material_id < 0.5 {
+        return MaterialPalette(vec3<f32>(1.0), vec3<f32>(1.0), 0.0);
+    }
+
+    if material_id < 1.5 {
+        return MaterialPalette(vec3<f32>(0.43, 0.66, 0.29), vec3<f32>(0.27, 0.44, 0.16), 0.18);
+    }
+    if material_id < 2.5 {
+        return MaterialPalette(vec3<f32>(0.47, 0.33, 0.22), vec3<f32>(0.34, 0.22, 0.14), 0.12);
+    }
+    if material_id < 3.5 {
+        return MaterialPalette(vec3<f32>(0.58, 0.58, 0.6), vec3<f32>(0.39, 0.39, 0.43), 0.10);
+    }
+    if material_id < 4.5 {
+        return MaterialPalette(vec3<f32>(0.82, 0.76, 0.52), vec3<f32>(0.67, 0.58, 0.34), 0.10);
+    }
+    if material_id < 5.5 {
+        return MaterialPalette(vec3<f32>(0.38, 0.58, 0.78), vec3<f32>(0.24, 0.43, 0.63), 0.14);
+    }
+    if material_id < 6.5 {
+        return MaterialPalette(vec3<f32>(0.52, 0.38, 0.22), vec3<f32>(0.71, 0.57, 0.36), 0.16);
+    }
+    if material_id < 7.5 {
+        return MaterialPalette(vec3<f32>(0.30, 0.54, 0.24), vec3<f32>(0.18, 0.34, 0.12), 0.22);
+    }
+    if material_id < 8.5 {
+        return MaterialPalette(vec3<f32>(0.72, 0.56, 0.34), vec3<f32>(0.52, 0.38, 0.21), 0.12);
+    }
+    if material_id < 9.5 {
+        return MaterialPalette(vec3<f32>(0.78, 0.88, 0.92), vec3<f32>(0.56, 0.71, 0.78), 0.10);
+    }
+    if material_id < 10.5 {
+        return MaterialPalette(vec3<f32>(0.96, 0.78, 0.36), vec3<f32>(1.0, 0.94, 0.62), 0.30);
+    }
+    if material_id < 11.5 {
+        return MaterialPalette(vec3<f32>(0.60, 0.42, 0.24), vec3<f32>(0.42, 0.28, 0.15), 0.14);
+    }
+    if material_id < 12.5 {
+        return MaterialPalette(vec3<f32>(0.55, 0.55, 0.58), vec3<f32>(0.90, 0.72, 0.20), 0.18);
+    }
+
+    return MaterialPalette(vec3<f32>(1.0), vec3<f32>(1.0), 0.0);
+}
+
+fn procedural_voxel_albedo(
+    world_position: vec3<f32>,
+    normal: vec3<f32>,
+    uv: vec2<f32>,
+    material_id: f32,
+) -> vec3<f32> {
     let block_origin = floor(world_position - normal * 0.5);
     let local_uv = uv - vec2<f32>(2.0, 2.0);
     let pixel = floor(local_uv * 16.0);
     let coarse_noise = hash13(block_origin * 0.73 + vec3<f32>(pixel, 0.0));
     let fine_noise = hash13(block_origin * 1.91 + vec3<f32>(pixel.yx, pixel.x + pixel.y));
     let macro_noise = hash13(block_origin * 0.37 + vec3<f32>(pixel * 0.5, pixel.x - pixel.y));
+    let accent_noise = hash13(block_origin * 1.43 + vec3<f32>(pixel.y, pixel.x, pixel.x * pixel.y * 0.25));
+    let palette = material_palette(material_id);
     let grain = (coarse_noise - 0.5) * 0.34 + (fine_noise - 0.5) * 0.22;
     let patches = (macro_noise - 0.5) * 0.28;
     let face_bias = (hash13(block_origin + normal * 3.17) - 0.5) * 0.10;
     let tint = clamp(1.0 + grain + patches + face_bias, 0.56, 1.46);
-    return vec3<f32>(tint);
+    let accent_mask = select(0.0, 1.0, accent_noise > (1.0 - palette.accent_amount));
+    let palette_color = mix(palette.base, palette.accent, accent_mask);
+    return palette_color * tint;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let is_procedural_voxel = input.uv.x >= 2.0 && input.uv.y >= 2.0;
+    let is_procedural_voxel = input.material_id >= 0.5;
     var albedo: vec3<f32>;
     if is_procedural_voxel {
-        albedo = procedural_voxel_albedo(input.world_position, input.normal, input.uv);
+        albedo = procedural_voxel_albedo(input.world_position, input.normal, input.uv, input.material_id);
     } else {
         albedo = textureSample(atlas_texture, atlas_sampler, input.uv).rgb;
     }

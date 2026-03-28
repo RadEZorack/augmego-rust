@@ -127,6 +127,23 @@ enum AuthEvent {
     Resolved(std::result::Result<Option<AuthUser>, String>),
 }
 
+enum RemoteAvatarEvent {
+    Loaded {
+        url: String,
+        bytes: Vec<u8>,
+    },
+    Failed {
+        url: String,
+        message: String,
+    },
+}
+
+struct RemoteAvatarTemplate {
+    vertices: Vec<ImportedVertex>,
+    indices: Vec<u32>,
+    texture: DynamicTexture,
+}
+
 thread_local! {
     static AUTH_GUEST_QUEUE: RefCell<bool> = const { RefCell::new(false) };
 }
@@ -188,6 +205,7 @@ async fn run() -> Result<()> {
                 }
                 WindowEvent::RedrawRequested => {
                     app.process_webcam_events();
+                    app.process_remote_avatar_events(&renderer);
                     app.process_generation_updates(&renderer, &mut chunk_meshes, DEFAULT_GENERATION_BUDGET_PER_UPDATE);
                     app.tick();
                     renderer.update_camera(app.camera_matrix());
@@ -204,6 +222,7 @@ async fn run() -> Result<()> {
                     if let Some(mesh) = &remote_players_mesh {
                         visible_mesh_refs.push(mesh);
                     }
+                    let remote_avatar_meshes = app.build_remote_avatar_meshes(&renderer);
                     let remote_media_placeholder_mesh = app.build_remote_media_placeholder_mesh(&renderer);
                     if let Some(mesh) = &remote_media_placeholder_mesh {
                         visible_mesh_refs.push(mesh);
@@ -219,6 +238,7 @@ async fn run() -> Result<()> {
                         overlay_meshes.push(mesh);
                     }
                     let mut textured_mesh_refs = textured_meshes.iter().collect::<Vec<_>>();
+                    textured_mesh_refs.extend(remote_avatar_meshes.iter());
                     if let Some(featured_model) = app.featured_model.as_ref() {
                         textured_mesh_refs.push(featured_model);
                     }
@@ -271,7 +291,10 @@ struct WebApp {
     selected_hotbar: usize,
     player_id: Option<u64>,
     remote_players: HashMap<u64, [f32; 3]>,
+    remote_player_stationary_model_urls: HashMap<u64, Option<String>>,
     remote_media: HashMap<u64, RemotePeerMedia>,
+    remote_avatar_templates: HashMap<String, RemoteAvatarTemplate>,
+    pending_remote_avatar_urls: HashSet<String>,
     featured_model: Option<TexturedMesh>,
     featured_model_attempted: bool,
     spawn_position: Option<WorldPos>,
@@ -294,6 +317,8 @@ struct WebApp {
     auth_status: AuthStatus,
     auth_user: Option<AuthUser>,
     auth_rx: Receiver<AuthEvent>,
+    remote_avatar_tx: Sender<RemoteAvatarEvent>,
+    remote_avatar_rx: Receiver<RemoteAvatarEvent>,
     auth_overlay: Element,
     auth_overlay_status: Element,
     player_avatar_panel: Element,
@@ -336,6 +361,7 @@ impl WebApp {
         let (mouse_lock_prompt, mouse_lock_prompt_onclick) = create_mouse_lock_prompt(&canvas);
         let (webcam_prompt, webcam_prompt_onclick) = create_webcam_prompt();
         let auth_rx = request_auth_session();
+        let (remote_avatar_tx, remote_avatar_rx) = mpsc::channel();
         let (auth_overlay, auth_overlay_status, auth_button_onclicks) = create_auth_overlay();
         let (player_avatar_panel, player_avatar_panel_status, player_avatar_panel_onclick) =
             create_player_avatar_panel();
@@ -373,7 +399,10 @@ impl WebApp {
             selected_hotbar: 0,
             player_id: None,
             remote_players: HashMap::new(),
+            remote_player_stationary_model_urls: HashMap::new(),
             remote_media: HashMap::new(),
+            remote_avatar_templates: HashMap::new(),
+            pending_remote_avatar_urls: HashSet::new(),
             featured_model: None,
             featured_model_attempted: false,
             spawn_position: None,
@@ -396,6 +425,8 @@ impl WebApp {
             auth_status: AuthStatus::Checking,
             auth_user: None,
             auth_rx,
+            remote_avatar_tx,
+            remote_avatar_rx,
             auth_overlay,
             auth_overlay_status,
             player_avatar_panel,
@@ -577,6 +608,32 @@ impl WebApp {
         });
     }
 
+    fn process_remote_avatar_events(&mut self, renderer: &Renderer<'_>) {
+        while let Ok(event) = self.remote_avatar_rx.try_recv() {
+            match event {
+                RemoteAvatarEvent::Loaded { url, bytes } => {
+                    self.pending_remote_avatar_urls.remove(&url);
+                    match build_remote_avatar_template(renderer, &bytes) {
+                        Ok(template) => {
+                            self.remote_avatar_templates.insert(url, template);
+                        }
+                        Err(error) => {
+                            web_sys::console::warn_1(&JsValue::from_str(&format!(
+                                "failed to build remote avatar template: {error}"
+                            )));
+                        }
+                    }
+                }
+                RemoteAvatarEvent::Failed { url, message } => {
+                    self.pending_remote_avatar_urls.remove(&url);
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "failed to fetch remote avatar {url}: {message}"
+                    )));
+                }
+            }
+        }
+    }
+
     fn drain_network(&mut self) {
         while let Ok(event) = self.network_rx.try_recv() {
             self.pending_network_events.push_back(event);
@@ -611,7 +668,10 @@ impl WebApp {
                             self.login_request_sent = false;
                             self.player_id = None;
                             self.remote_players.clear();
+                            self.remote_player_stationary_model_urls.clear();
                             self.remote_media.clear();
+                            self.remote_avatar_templates.clear();
+                            self.pending_remote_avatar_urls.clear();
                             self.featured_model = None;
                             self.featured_model_attempted = false;
                             web_sys::console::error_1(&JsValue::from_str(&format!(
@@ -634,7 +694,10 @@ impl WebApp {
                             self.player_id = Some(response.player_id);
                             self.pending_network_events.clear();
                             self.remote_players.clear();
+                            self.remote_player_stationary_model_urls.clear();
                             self.remote_media.clear();
+                            self.remote_avatar_templates.clear();
+                            self.pending_remote_avatar_urls.clear();
                             self.last_sent_position = None;
                             self.last_sent_velocity = None;
                             self.camera.position = Vec3::new(
@@ -702,6 +765,13 @@ impl WebApp {
                     ServerMessage::PlayerStateSnapshot(snapshot) => {
                         if Some(snapshot.player_id) != self.player_id {
                             self.remote_players.insert(snapshot.player_id, snapshot.position);
+                            self.remote_player_stationary_model_urls.insert(
+                                snapshot.player_id,
+                                snapshot.stationary_model_url.clone(),
+                            );
+                            self.ensure_remote_avatar_requested(
+                                snapshot.stationary_model_url.as_deref(),
+                            );
                             self.ensure_peer_connection(snapshot.player_id);
                         }
                     }
@@ -722,7 +792,10 @@ impl WebApp {
                     self.player_id = None;
                     self.pending_network_events.clear();
                     self.remote_players.clear();
+                    self.remote_player_stationary_model_urls.clear();
                     self.remote_media.clear();
+                    self.remote_avatar_templates.clear();
+                    self.pending_remote_avatar_urls.clear();
                     self.featured_model = None;
                     self.featured_model_attempted = false;
                     web_sys::console::error_1(&JsValue::from_str(&format!("multiplayer disconnected: {reason}")));
@@ -841,6 +914,10 @@ impl WebApp {
 
         self.send_client_message(&ClientMessage::LoginRequest(LoginRequest {
             name: user.display_name(),
+            stationary_model_url: user
+                .avatar_selection
+                .as_ref()
+                .and_then(|selection| selection.idle_model_url.clone()),
         }));
         self.login_request_sent = true;
     }
@@ -1060,6 +1137,14 @@ impl WebApp {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         for (&player_id, position) in &self.remote_players {
+            if self
+                .remote_player_stationary_model_urls
+                .get(&player_id)
+                .and_then(|url| url.as_ref())
+                .is_some_and(|url| self.remote_avatar_templates.contains_key(url))
+            {
+                continue;
+            }
             let tint = remote_player_color(player_id);
             let anchor = player_anchor_from_eye(Vec3::new(position[0], position[1], position[2]));
             let center = (anchor.body + anchor.head) * 0.5;
@@ -1076,6 +1161,54 @@ impl WebApp {
         }
 
         Some(renderer.create_mesh(&vertices, &indices))
+    }
+
+    fn build_remote_avatar_meshes(&self, renderer: &Renderer<'_>) -> Vec<TexturedMesh> {
+        let mut meshes = Vec::new();
+        for (&player_id, position) in &self.remote_players {
+            let Some(url) = self
+                .remote_player_stationary_model_urls
+                .get(&player_id)
+                .and_then(|value| value.as_ref())
+            else {
+                continue;
+            };
+            let Some(template) = self.remote_avatar_templates.get(url) else {
+                continue;
+            };
+            let anchor = player_anchor_from_eye(Vec3::new(position[0], position[1], position[2]));
+            let vertices = template
+                .vertices
+                .iter()
+                .map(|vertex| Vertex {
+                    position: (vertex.position + anchor.body).to_array(),
+                    color: [1.0, 1.0, 1.0],
+                    normal: vertex.normal.normalize_or_zero().to_array(),
+                    uv: vertex.uv,
+                    material_id: 0.0,
+                })
+                .collect::<Vec<_>>();
+            meshes.push(renderer.create_textured_mesh(
+                &vertices,
+                &template.indices,
+                &template.texture,
+            ));
+        }
+        meshes
+    }
+
+    fn ensure_remote_avatar_requested(&mut self, maybe_url: Option<&str>) {
+        let Some(url) = maybe_url.map(str::trim).filter(|url| !url.is_empty()) else {
+            return;
+        };
+        if self.remote_avatar_templates.contains_key(url)
+            || self.pending_remote_avatar_urls.contains(url)
+        {
+            return;
+        }
+
+        self.pending_remote_avatar_urls.insert(url.to_string());
+        request_remote_avatar_model(url.to_string(), self.remote_avatar_tx.clone());
     }
 
     fn build_remote_media_placeholder_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
@@ -2603,6 +2736,34 @@ fn create_player_avatar_panel() -> (Element, Element, Closure<dyn FnMut(WebEvent
     let run_input = create_player_avatar_file_input(&document, &root, "Run", "player-avatar-run");
     let dance_input = create_player_avatar_file_input(&document, &root, "Dance", "player-avatar-dance");
 
+    let divider = document
+        .create_element("div")
+        .expect("player avatar divider");
+    let _ = divider.set_attribute(
+        "style",
+        "margin:14px 0 10px 0;height:1px;background:rgba(255,255,255,0.10);",
+    );
+    let _ = root.append_child(&divider);
+
+    let url_copy = document
+        .create_element("p")
+        .expect("player avatar url copy");
+    let _ = url_copy.set_attribute(
+        "style",
+        "margin:0 0 8px 0;color:rgba(230,237,243,0.72);font-size:12px;line-height:1.45;",
+    );
+    url_copy.set_text_content(Some(
+        "Slow connection? Paste public GLB links instead of uploading files.",
+    ));
+    let _ = root.append_child(&url_copy);
+
+    let idle_url_input =
+        create_player_avatar_url_input(&document, &root, "Idle URL", "player-avatar-idle-url");
+    let run_url_input =
+        create_player_avatar_url_input(&document, &root, "Run URL", "player-avatar-run-url");
+    let dance_url_input =
+        create_player_avatar_url_input(&document, &root, "Dance URL", "player-avatar-dance-url");
+
     let upload_button = document
         .create_element("button")
         .expect("player avatar upload button");
@@ -2612,6 +2773,16 @@ fn create_player_avatar_panel() -> (Element, Element, Closure<dyn FnMut(WebEvent
         "margin-top:14px;width:100%;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.18);background:linear-gradient(180deg,#f6c665,#e8a93c);color:#1b1206;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;",
     );
     let _ = root.append_child(&upload_button);
+
+    let save_urls_button = document
+        .create_element("button")
+        .expect("player avatar url save button");
+    save_urls_button.set_text_content(Some("Save Avatar URLs"));
+    let _ = save_urls_button.set_attribute(
+        "style",
+        "margin-top:10px;width:100%;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.08);color:#f2f6fb;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;",
+    );
+    let _ = root.append_child(&save_urls_button);
 
     let status = document
         .create_element("p")
@@ -2627,19 +2798,56 @@ fn create_player_avatar_panel() -> (Element, Element, Closure<dyn FnMut(WebEvent
     let idle_input_for_click = idle_input.clone();
     let run_input_for_click = run_input.clone();
     let dance_input_for_click = dance_input.clone();
+    let upload_button_for_click = upload_button.clone();
     let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
         let status = status_for_click.clone();
         let idle_input = idle_input_for_click.clone();
         let run_input = run_input_for_click.clone();
         let dance_input = dance_input_for_click.clone();
+        let upload_button = upload_button_for_click.clone();
         spawn_local(async move {
+            let _ = upload_button.set_attribute("disabled", "true");
             status.set_text_content(Some("Uploading avatar GLBs..."));
             if let Err(error) = upload_player_avatar_set(&idle_input, &run_input, &dance_input, &status).await {
                 status.set_text_content(Some(&error.to_string()));
             }
+            let _ = upload_button.remove_attribute("disabled");
         });
     }) as Box<dyn FnMut(WebEvent)>);
     let _ = upload_button.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+
+    let status_for_url_click = status.clone();
+    let idle_url_input_for_click = idle_url_input.clone();
+    let run_url_input_for_click = run_url_input.clone();
+    let dance_url_input_for_click = dance_url_input.clone();
+    let save_urls_button_for_click = save_urls_button.clone();
+    let save_urls_onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let status = status_for_url_click.clone();
+        let idle_url_input = idle_url_input_for_click.clone();
+        let run_url_input = run_url_input_for_click.clone();
+        let dance_url_input = dance_url_input_for_click.clone();
+        let save_urls_button = save_urls_button_for_click.clone();
+        spawn_local(async move {
+            let _ = save_urls_button.set_attribute("disabled", "true");
+            status.set_text_content(Some("Saving avatar URLs..."));
+            if let Err(error) = save_player_avatar_urls(
+                &idle_url_input,
+                &run_url_input,
+                &dance_url_input,
+                &status,
+            )
+            .await
+            {
+                status.set_text_content(Some(&error.to_string()));
+            }
+            let _ = save_urls_button.remove_attribute("disabled");
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = save_urls_button.add_event_listener_with_callback(
+        "click",
+        save_urls_onclick.as_ref().unchecked_ref(),
+    );
+    save_urls_onclick.forget();
 
     let _ = body.append_child(&root);
     (root, status, onclick)
@@ -2678,34 +2886,99 @@ fn create_player_avatar_file_input(
     input
 }
 
+fn create_player_avatar_url_input(
+    document: &Document,
+    root: &Element,
+    label: &str,
+    id: &str,
+) -> HtmlInputElement {
+    let wrapper = document
+        .create_element("label")
+        .expect("player avatar url input wrapper");
+    let _ = wrapper.set_attribute(
+        "style",
+        "display:grid;gap:6px;margin-top:10px;font-size:12px;font-weight:700;color:#f4f7fb;",
+    );
+    wrapper.set_text_content(Some(label));
+
+    let input = document
+        .create_element("input")
+        .expect("player avatar url input")
+        .dyn_into::<HtmlInputElement>()
+        .expect("player avatar url input cast");
+    input.set_id(id);
+    input.set_type("url");
+    input.set_placeholder("https://...");
+    let _ = input.set_attribute(
+        "style",
+        "display:block;width:100%;padding:10px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.06);color:#dce6ef;font:500 12px/1.3 ui-sans-serif,system-ui,sans-serif;",
+    );
+
+    let _ = wrapper.append_child(&input);
+    let _ = root.append_child(&wrapper);
+    input
+}
+
 async fn upload_player_avatar_set(
     idle_input: &HtmlInputElement,
     run_input: &HtmlInputElement,
     dance_input: &HtmlInputElement,
     status: &Element,
 ) -> Result<()> {
-    let idle_file = input_selected_file(idle_input)
-        .ok_or_else(|| anyhow::anyhow!("Choose an idle GLB before uploading."))?;
-    let run_file =
-        input_selected_file(run_input).ok_or_else(|| anyhow::anyhow!("Choose a run GLB before uploading."))?;
-    let dance_file = input_selected_file(dance_input)
-        .ok_or_else(|| anyhow::anyhow!("Choose a dance GLB before uploading."))?;
+    let idle_file = input_selected_file(idle_input);
+    let run_file = input_selected_file(run_input);
+    let dance_file = input_selected_file(dance_input);
+    if idle_file.is_none() && run_file.is_none() && dance_file.is_none() {
+        return Err(anyhow::anyhow!(
+            "Choose at least one GLB before uploading."
+        ));
+    }
 
-    status.set_text_content(Some("Uploading idle GLB..."));
-    upload_player_avatar_slot("idle", &idle_file).await?;
-    status.set_text_content(Some("Uploading run GLB..."));
-    upload_player_avatar_slot("run", &run_file).await?;
-    status.set_text_content(Some("Uploading dance GLB..."));
-    upload_player_avatar_slot("dance", &dance_file).await?;
+    let mut idle_url = None;
+    let mut run_url = None;
+    let mut dance_url = None;
 
-    idle_input.set_value("");
-    run_input.set_value("");
-    dance_input.set_value("");
-    status.set_text_content(Some("Uploaded idle, run, and dance avatar GLBs."));
+    if let Some(file) = idle_file.as_ref() {
+        status.set_text_content(Some("Uploading idle GLB..."));
+        idle_url = upload_player_avatar_slot("idle", file).await?;
+    }
+    if let Some(file) = run_file.as_ref() {
+        status.set_text_content(Some("Uploading run GLB..."));
+        run_url = upload_player_avatar_slot("run", file).await?;
+    }
+    if let Some(file) = dance_file.as_ref() {
+        status.set_text_content(Some("Uploading dance GLB..."));
+        dance_url = upload_player_avatar_slot("dance", file).await?;
+    }
+
+    if idle_url.is_some() || run_url.is_some() || dance_url.is_some() {
+        status.set_text_content(Some("Saving avatar URLs..."));
+        save_player_avatar_url_values(
+            idle_url.as_deref(),
+            run_url.as_deref(),
+            dance_url.as_deref(),
+        )
+        .await?;
+    }
+
+    if idle_file.is_some() {
+        idle_input.set_value("");
+    }
+    if run_file.is_some() {
+        run_input.set_value("");
+    }
+    if dance_file.is_some() {
+        dance_input.set_value("");
+    }
+    status.set_text_content(Some("Avatar upload complete."));
     Ok(())
 }
 
-async fn upload_player_avatar_slot(slot: &str, file: &web_sys::File) -> Result<()> {
+async fn upload_player_avatar_slot(slot: &str, file: &web_sys::File) -> Result<Option<String>> {
+    if let Ok(public_url) = upload_player_avatar_slot_direct(slot, file).await {
+        return Ok(Some(public_url));
+    }
+
     let form_data = FormData::new().map_err(|error| anyhow::anyhow!("create form data: {error:?}"))?;
     form_data
         .append_with_str("slot", slot)
@@ -2742,11 +3015,302 @@ async fn upload_player_avatar_slot(slot: &str, file: &web_sys::File) -> Result<(
         ));
     }
 
+    Ok(None)
+}
+
+async fn upload_player_avatar_slot_direct(slot: &str, file: &web_sys::File) -> Result<String> {
+    let init = RequestInit::new();
+    init.set_method("POST");
+    init.set_mode(RequestMode::Cors);
+    init.set_credentials(RequestCredentials::Include);
+
+    let payload = js_sys::Object::new();
+    js_sys::Reflect::set(&payload, &JsValue::from_str("slot"), &JsValue::from_str(slot))
+        .map_err(|error| anyhow::anyhow!("set direct upload slot: {error:?}"))?;
+    js_sys::Reflect::set(
+        &payload,
+        &JsValue::from_str("fileName"),
+        &JsValue::from_str(&file.name()),
+    )
+    .map_err(|error| anyhow::anyhow!("set direct upload file name: {error:?}"))?;
+    js_sys::Reflect::set(
+        &payload,
+        &JsValue::from_str("contentType"),
+        &JsValue::from_str("model/gltf-binary"),
+    )
+    .map_err(|error| anyhow::anyhow!("set direct upload content type: {error:?}"))?;
+    let json = js_sys::JSON::stringify(&payload)
+        .map_err(|error| anyhow::anyhow!("stringify direct upload payload: {error:?}"))?
+        .as_string()
+        .ok_or_else(|| anyhow::anyhow!("direct upload payload was not a string"))?;
+    init.set_body(&JsValue::from_str(&json));
+
+    let request = Request::new_with_str_and_init(
+        &format!("{}/auth/player-avatar/upload-url", api_base_url()?),
+        &init,
+    )
+    .map_err(|error| anyhow::anyhow!("build direct upload request: {error:?}"))?;
+    request
+        .headers()
+        .set("Content-Type", "application/json")
+        .map_err(|error| anyhow::anyhow!("set direct upload headers: {error:?}"))?;
+
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
+    let response_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| anyhow::anyhow!("request direct upload URL: {error:?}"))?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("convert direct upload URL response"))?;
+    if !response.ok() {
+        return Err(anyhow::anyhow!(
+            "direct upload URL request failed with HTTP {}",
+            response.status()
+        ));
+    }
+
+    let body = JsFuture::from(
+        response
+            .json()
+            .map_err(|error| anyhow::anyhow!("read direct upload URL response: {error:?}"))?,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("parse direct upload URL response: {error:?}"))?;
+    let upload_url = js_get_string(&body, "uploadUrl")
+        .ok_or_else(|| anyhow::anyhow!("direct upload URL missing uploadUrl"))?;
+    let public_url = js_get_string(&body, "publicUrl")
+        .ok_or_else(|| anyhow::anyhow!("direct upload URL missing publicUrl"))?;
+    let content_type =
+        js_get_string(&body, "contentType").unwrap_or_else(|| "model/gltf-binary".to_string());
+    let upload_headers = js_get(&body, "uploadHeaders");
+    let upload_acl = upload_headers
+        .as_ref()
+        .and_then(|headers| js_get_string(headers, "x-amz-acl"))
+        .unwrap_or_else(|| "public-read".to_string());
+
+    let upload_init = RequestInit::new();
+    upload_init.set_method("PUT");
+    upload_init.set_mode(RequestMode::Cors);
+    upload_init.set_body(&JsValue::from(file.clone()));
+    let upload_request = Request::new_with_str_and_init(&upload_url, &upload_init)
+        .map_err(|error| anyhow::anyhow!("build direct PUT request: {error:?}"))?;
+    upload_request
+        .headers()
+        .set("Content-Type", &content_type)
+        .map_err(|error| anyhow::anyhow!("set direct PUT content type: {error:?}"))?;
+    upload_request
+        .headers()
+        .set("x-amz-acl", &upload_acl)
+        .map_err(|error| anyhow::anyhow!("set direct PUT ACL: {error:?}"))?;
+
+    let upload_response_value = JsFuture::from(window.fetch_with_request(&upload_request))
+        .await
+        .map_err(|error| anyhow::anyhow!("upload file to CDN: {error:?}"))?;
+    let upload_response: Response = upload_response_value
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("convert direct PUT response"))?;
+    if !upload_response.ok() {
+        return Err(anyhow::anyhow!(
+            "direct file upload failed with HTTP {}",
+            upload_response.status()
+        ));
+    }
+
+    Ok(public_url)
+}
+
+async fn save_player_avatar_urls(
+    idle_input: &HtmlInputElement,
+    run_input: &HtmlInputElement,
+    dance_input: &HtmlInputElement,
+    status: &Element,
+) -> Result<()> {
+    let idle_url = idle_input.value().trim().to_string();
+    let run_url = run_input.value().trim().to_string();
+    let dance_url = dance_input.value().trim().to_string();
+
+    if idle_url.is_empty() && run_url.is_empty() && dance_url.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Paste at least one public avatar URL before saving."
+        ));
+    }
+
+    save_player_avatar_url_values(
+        (!idle_url.is_empty()).then_some(idle_url.as_str()),
+        (!run_url.is_empty()).then_some(run_url.as_str()),
+        (!dance_url.is_empty()).then_some(dance_url.as_str()),
+    )
+    .await?;
+    status.set_text_content(Some("Saved avatar URL changes."));
+    Ok(())
+}
+
+async fn save_player_avatar_url_values(
+    idle_url: Option<&str>,
+    run_url: Option<&str>,
+    dance_url: Option<&str>,
+) -> Result<()> {
+    let payload = js_sys::Object::new();
+    let mut field_count = 0usize;
+    if let Some(idle_url) = idle_url {
+        js_sys::Reflect::set(
+            &payload,
+            &JsValue::from_str("idleModelUrl"),
+            &JsValue::from_str(idle_url),
+        )
+        .map_err(|error| anyhow::anyhow!("set idle URL payload: {error:?}"))?;
+        field_count += 1;
+    }
+    if let Some(run_url) = run_url {
+        js_sys::Reflect::set(
+            &payload,
+            &JsValue::from_str("runModelUrl"),
+            &JsValue::from_str(run_url),
+        )
+        .map_err(|error| anyhow::anyhow!("set run URL payload: {error:?}"))?;
+        field_count += 1;
+    }
+    if let Some(dance_url) = dance_url {
+        js_sys::Reflect::set(
+            &payload,
+            &JsValue::from_str("danceModelUrl"),
+            &JsValue::from_str(dance_url),
+        )
+        .map_err(|error| anyhow::anyhow!("set dance URL payload: {error:?}"))?;
+        field_count += 1;
+    }
+    if field_count == 0 {
+        return Err(anyhow::anyhow!("No avatar URL values were provided."));
+    }
+
+    let json = js_sys::JSON::stringify(&payload)
+        .map_err(|error| anyhow::anyhow!("stringify avatar URL payload: {error:?}"))?
+        .as_string()
+        .ok_or_else(|| anyhow::anyhow!("avatar URL payload was not a string"))?;
+
+    let init = RequestInit::new();
+    init.set_method("PATCH");
+    init.set_mode(RequestMode::Cors);
+    init.set_credentials(RequestCredentials::Include);
+    init.set_body(&JsValue::from_str(&json));
+
+    let request = Request::new_with_str_and_init(
+        &format!("{}/auth/player-avatar", api_base_url()?),
+        &init,
+    )
+    .map_err(|error| anyhow::anyhow!("build avatar URL save request: {error:?}"))?;
+    request
+        .headers()
+        .set("Content-Type", "application/json")
+        .map_err(|error| anyhow::anyhow!("set avatar URL headers: {error:?}"))?;
+
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
+    let response_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| anyhow::anyhow!("save avatar URLs: {error:?}"))?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("convert avatar URL response"))?;
+
+    if !response.ok() {
+        return Err(anyhow::anyhow!(
+            "Saving avatar URLs failed with HTTP {}.",
+            response.status()
+        ));
+    }
+
     Ok(())
 }
 
 fn input_selected_file(input: &HtmlInputElement) -> Option<web_sys::File> {
     input.files()?.get(0)
+}
+
+fn request_remote_avatar_model(url: String, sender: Sender<RemoteAvatarEvent>) {
+    spawn_local(async move {
+        let result = fetch_remote_avatar_bytes(&url).await;
+        let event = match result {
+            Ok(bytes) => RemoteAvatarEvent::Loaded { url, bytes },
+            Err(error) => RemoteAvatarEvent::Failed {
+                url,
+                message: error.to_string(),
+            },
+        };
+        let _ = sender.send(event);
+    });
+}
+
+async fn fetch_remote_avatar_bytes(url: &str) -> Result<Vec<u8>> {
+    let init = RequestInit::new();
+    init.set_method("GET");
+    init.set_mode(RequestMode::Cors);
+
+    let request = Request::new_with_str_and_init(url, &init)
+        .map_err(|error| anyhow::anyhow!("build remote avatar request: {error:?}"))?;
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
+    let response_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| anyhow::anyhow!("fetch remote avatar bytes: {error:?}"))?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("convert remote avatar response"))?;
+
+    if !response.ok() {
+        return Err(anyhow::anyhow!(
+            "remote avatar request returned HTTP {}",
+            response.status()
+        ));
+    }
+
+    let buffer = JsFuture::from(
+        response
+            .array_buffer()
+            .map_err(|error| anyhow::anyhow!("read remote avatar bytes: {error:?}"))?,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("parse remote avatar bytes: {error:?}"))?;
+
+    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+}
+
+fn build_remote_avatar_template(
+    renderer: &Renderer<'_>,
+    bytes: &[u8],
+) -> Result<RemoteAvatarTemplate> {
+    let (mut vertices, indices, image) = load_glb_model(bytes)?;
+    let (min, max) = model_bounds(&vertices).ok_or_else(|| anyhow::anyhow!("remote avatar has no vertices"))?;
+    let scale = PLAYER_HEIGHT / (max.y - min.y).max(0.001);
+    let center_x = (min.x + max.x) * 0.5;
+    let center_z = (min.z + max.z) * 0.5;
+
+    let vertices = vertices
+        .drain(..)
+        .map(|vertex| ImportedVertex {
+            position: Vec3::new(
+                (vertex.position.x - center_x) * scale,
+                (vertex.position.y - min.y) * scale,
+                (vertex.position.z - center_z) * scale,
+            ),
+            normal: vertex.normal.normalize_or_zero(),
+            uv: vertex.uv,
+        })
+        .collect::<Vec<_>>();
+
+    let rgba = match image.as_ref() {
+        Some(image) => image_to_rgba_pixels(image)?,
+        None => vec![255, 255, 255, 255],
+    };
+    let (width, height) = image
+        .map(|image| (image.width.max(1), image.height.max(1)))
+        .unwrap_or((1, 1));
+    let texture = renderer.create_dynamic_texture(width, height);
+    renderer.update_dynamic_texture_rgba(&texture, &rgba);
+
+    Ok(RemoteAvatarTemplate {
+        vertices,
+        indices,
+        texture,
+    })
 }
 
 fn attach_local_webcam_overlay(video: &HtmlVideoElement) {

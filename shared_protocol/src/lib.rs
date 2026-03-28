@@ -21,6 +21,7 @@ pub struct ServerHello {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginRequest {
     pub name: String,
+    pub stationary_model_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +58,7 @@ pub struct PlayerStateSnapshot {
     pub tick: u64,
     pub position: [f32; 3],
     pub velocity: [f32; 3],
+    pub stationary_model_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

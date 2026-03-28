@@ -2,6 +2,7 @@ import { Elysia } from "elysia";
 import { cors } from "@elysiajs/cors";
 import { PrismaClient, WorldAssetVisibility } from "@prisma/client";
 import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import jwt from "jsonwebtoken";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -356,6 +357,7 @@ type UserAvatarSelection = {
 };
 
 type PlayerAvatarSlot = "idle" | "run" | "dance";
+const PLAYER_AVATAR_UPLOAD_URL_TTL_SECONDS = 60 * 15;
 
 function isMissingAvatarSelectionColumnsError(error: unknown) {
   return (
@@ -389,6 +391,15 @@ async function loadUserAvatarSelection(userId: string): Promise<UserAvatarSelect
     }
     throw error;
   }
+}
+
+function normalizePlayerAvatarUploadFileName(value: unknown, fallback: PlayerAvatarSlot) {
+  const normalized = sanitizeFilename(
+    typeof value === "string" ? value : `${fallback}.glb`
+  );
+  return normalized.toLowerCase().endsWith(".glb")
+    ? normalized
+    : `${normalized}.glb`;
 }
 
 function isPlayerAvatarSlot(value: unknown): value is PlayerAvatarSlot {
@@ -3349,6 +3360,75 @@ const api = new Elysia({ prefix: "/api/v1" })
       ok: true,
       uploadedSlots: [...uploadedFiles.keys()],
       avatarSelection: nextSelection
+    });
+  })
+  .post("/auth/player-avatar/upload-url", async ({ request }) => {
+    const user = await resolveSessionUser(prisma, request, SESSION_COOKIE_NAME);
+    if (!user) {
+      return jsonResponse({ error: "AUTH_REQUIRED" }, { status: 401 });
+    }
+    if (effectiveWorldStorageProvider !== "spaces" || !spacesClient) {
+      return jsonResponse(
+        { error: "DIRECT_UPLOAD_NOT_AVAILABLE" },
+        { status: 503 }
+      );
+    }
+
+    const body = (await request.json().catch(() => null)) as {
+      slot?: unknown;
+      fileName?: unknown;
+      contentType?: unknown;
+    } | null;
+    const slotValue = String(body?.slot ?? "").trim().toLowerCase();
+    if (!isPlayerAvatarSlot(slotValue)) {
+      return jsonResponse({ error: "INVALID_AVATAR_SLOT" }, { status: 400 });
+    }
+
+    const contentType =
+      typeof body?.contentType === "string" &&
+      body.contentType.toLowerCase().includes("model/gltf-binary")
+        ? "model/gltf-binary"
+        : "model/gltf-binary";
+    const fileName = normalizePlayerAvatarUploadFileName(body?.fileName, slotValue);
+    const storageKey = path
+      .join(
+        WORLD_STORAGE_NAMESPACE,
+        user.id,
+        "player-avatars",
+        slotValue,
+        `${crypto.randomUUID()}_${fileName}`
+      )
+      .replace(/\\/g, "/");
+
+    const uploadUrl = await getSignedUrl(
+      spacesClient,
+      new PutObjectCommand({
+        Bucket: DO_SPACES_BUCKET,
+        Key: storageKey,
+        ACL: "public-read",
+        ContentType: contentType
+      }),
+      { expiresIn: PLAYER_AVATAR_UPLOAD_URL_TTL_SECONDS }
+    );
+    const publicUrl = resolveWorldAssetPublicUrl(storageKey);
+    if (!publicUrl) {
+      return jsonResponse(
+        { error: "DIRECT_UPLOAD_URL_UNAVAILABLE" },
+        { status: 503 }
+      );
+    }
+
+    return jsonResponse({
+      ok: true,
+      slot: slotValue,
+      method: "PUT",
+      uploadUrl,
+      publicUrl,
+      contentType,
+      uploadHeaders: {
+        "Content-Type": contentType,
+        "x-amz-acl": "public-read"
+      }
     });
   })
   .get("/worlds/search", async ({ request }) => {

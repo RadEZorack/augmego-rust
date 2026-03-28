@@ -60,6 +60,7 @@ struct Player {
     name: String,
     position: [f32; 3],
     velocity: [f32; 3],
+    stationary_model_url: Option<String>,
     subscribed_chunks: HashSet<ChunkPos>,
 }
 
@@ -77,13 +78,19 @@ impl PlayerService {
         }
     }
 
-    async fn login(&self, name: String, spawn: WorldPos) -> Player {
+    async fn login(
+        &self,
+        name: String,
+        spawn: WorldPos,
+        stationary_model_url: Option<String>,
+    ) -> Player {
         let mut next_id = self.next_id.lock().await;
         let player = Player {
             id: *next_id,
             name,
             position: [spawn.x as f32 + 0.5, spawn.y as f32, spawn.z as f32 + 0.5],
             velocity: [0.0; 3],
+            stationary_model_url,
             subscribed_chunks: HashSet::new(),
         };
         *next_id += 1;
@@ -464,6 +471,7 @@ impl ChunkStreamingService {
                 tick: 0,
                 position: player.position,
                 velocity: player.velocity,
+                stationary_model_url: player.stationary_model_url.clone(),
             }));
         }
 
@@ -652,7 +660,10 @@ impl VoxelServer {
         };
 
         let spawn_position = self.world_service.safe_spawn_position();
-        let player = self.player_service.login(login.name, spawn_position).await;
+        let player = self
+            .player_service
+            .login(login.name, spawn_position, login.stationary_model_url)
+            .await;
         tracing::info!(player_id = player.id, name = %player.name, "player joined");
 
         write_message(
@@ -698,6 +709,7 @@ impl VoxelServer {
                 tick: 0,
                 position: player.position,
                 velocity: player.velocity,
+                stationary_model_url: player.stationary_model_url.clone(),
             }),
         )
         .await?;
@@ -738,7 +750,10 @@ impl VoxelServer {
         };
 
         let spawn_position = self.world_service.safe_spawn_position();
-        let player = self.player_service.login(login.name, spawn_position).await;
+        let player = self
+            .player_service
+            .login(login.name, spawn_position, login.stationary_model_url)
+            .await;
         tracing::info!(player_id = player.id, name = %player.name, "websocket player joined");
 
         let _ = sender.send(ServerMessage::LoginResponse(LoginResponse {
@@ -776,6 +791,7 @@ impl VoxelServer {
             tick: 0,
             position: player.position,
             velocity: player.velocity,
+            stationary_model_url: player.stationary_model_url.clone(),
         }));
 
         while let Ok(message) = read_ws_message::<ClientMessage, _>(&mut ws_read).await {
@@ -818,6 +834,7 @@ impl VoxelServer {
                                 tick: input.tick,
                                 position: player.position,
                                 velocity: player.velocity,
+                                stationary_model_url: player.stationary_model_url.clone(),
                             }),
                         )
                         .await?;
@@ -904,12 +921,14 @@ impl VoxelServer {
                             tick: input.tick,
                             position: player.position,
                             velocity: player.velocity,
+                            stationary_model_url: player.stationary_model_url.clone(),
                         }));
                         self.broadcast_player_snapshot(
                             player_id,
                             input.tick,
                             player.position,
                             player.velocity,
+                            player.stationary_model_url.clone(),
                         )
                         .await;
                     }
@@ -989,6 +1008,7 @@ impl VoxelServer {
         tick: u64,
         position: [f32; 3],
         velocity: [f32; 3],
+        stationary_model_url: Option<String>,
     ) {
         let chunk = ChunkPos::from_world(WorldPos {
             x: position[0].floor() as i64,
@@ -1004,6 +1024,7 @@ impl VoxelServer {
                     tick,
                     position,
                     velocity,
+                    stationary_model_url,
                 }),
             )
             .await;

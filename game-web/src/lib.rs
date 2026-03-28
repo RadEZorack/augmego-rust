@@ -635,9 +635,10 @@ impl WebApp {
                             self.pending_generation.clear();
                             self.inflight_generation.clear();
                             self.dirty_generation.clear();
-                            let desired_positions = self.desired_chunks.iter().copied().collect::<Vec<_>>();
+                            let desired_positions =
+                                ordered_desired_chunk_positions(self.current_chunk, WEB_RADIUS);
                             for position in desired_positions {
-                                self.schedule_chunk_rebuild(position);
+                                self.schedule_chunk_rebuild_deferred(position);
                             }
                             self.send_chunk_subscription(self.current_chunk);
                             self.link_panel = LinkPanel::near_spawn(self.camera.position);
@@ -1505,13 +1506,10 @@ impl WebApp {
             .retain(|position| self.desired_chunks.contains(position));
         self.completed_meshes
             .retain(|mesh| self.desired_chunks.contains(&mesh.position));
-        for position in self
-            .desired_chunks
-            .difference(&previous_desired)
-            .copied()
-            .collect::<Vec<_>>()
-        {
-            self.schedule_chunk_rebuild(position);
+        for position in ordered_desired_chunk_positions(self.current_chunk, WEB_RADIUS) {
+            if !previous_desired.contains(&position) {
+                self.schedule_chunk_rebuild_deferred(position);
+            }
         }
     }
 
@@ -1808,6 +1806,17 @@ impl WebApp {
 
         if !self.pending_generation.contains(&position) {
             self.pending_generation.push_front(position);
+        }
+    }
+
+    fn schedule_chunk_rebuild_deferred(&mut self, position: ChunkPos) {
+        if self.inflight_generation.contains(&position) {
+            self.dirty_generation.insert(position);
+            return;
+        }
+
+        if !self.pending_generation.contains(&position) {
+            self.pending_generation.push_back(position);
         }
     }
 
@@ -2907,6 +2916,16 @@ fn scaled_render_size(size: PhysicalSize<u32>) -> PhysicalSize<u32> {
 }
 
 fn desired_chunk_set(center: ChunkPos, radius: i32) -> HashSet<ChunkPos> {
+    ordered_chunk_positions(radius)
+        .into_iter()
+        .map(|offset| ChunkPos {
+            x: center.x + offset.x,
+            z: center.z + offset.z,
+        })
+        .collect()
+}
+
+fn ordered_desired_chunk_positions(center: ChunkPos, radius: i32) -> Vec<ChunkPos> {
     ordered_chunk_positions(radius)
         .into_iter()
         .map(|offset| ChunkPos {

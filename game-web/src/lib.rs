@@ -20,10 +20,11 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_time::Instant;
 use web_sys::{
     BinaryType, CanvasRenderingContext2d, CloseEvent, Document, Element, ErrorEvent,
-    Event as WebEvent, HtmlCanvasElement, HtmlVideoElement, MediaStream, MediaStreamConstraints,
-    MessageEvent, Request, RequestCredentials, RequestInit, RequestMode, Response,
-    RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType,
-    RtcSessionDescriptionInit, RtcTrackEvent, WebSocket, Worker,
+    Event as WebEvent, FormData, HtmlCanvasElement, HtmlInputElement, HtmlVideoElement,
+    MediaStream, MediaStreamConstraints, MessageEvent, Request, RequestCredentials,
+    RequestInit, RequestMode, Response, RtcIceCandidateInit, RtcPeerConnection,
+    RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit, RtcTrackEvent,
+    WebSocket, Worker,
 };
 use wgpu_lite::{DynamicTexture, Mesh, Renderer, TexturedMesh, Vertex};
 use winit::dpi::PhysicalSize;
@@ -85,6 +86,14 @@ struct AuthUser {
     id: String,
     name: Option<String>,
     email: Option<String>,
+    avatar_selection: Option<PlayerAvatarSelection>,
+}
+
+#[derive(Clone, Debug)]
+struct PlayerAvatarSelection {
+    idle_model_url: Option<String>,
+    run_model_url: Option<String>,
+    dance_model_url: Option<String>,
 }
 
 impl AuthUser {
@@ -94,6 +103,7 @@ impl AuthUser {
             id: guest_id.clone(),
             name: Some(format!("Guest {}", &guest_id[6..guest_id.len().min(12)])),
             email: None,
+            avatar_selection: None,
         }
     }
 
@@ -286,9 +296,12 @@ struct WebApp {
     auth_rx: Receiver<AuthEvent>,
     auth_overlay: Element,
     auth_overlay_status: Element,
+    player_avatar_panel: Element,
+    player_avatar_panel_status: Element,
     server_ready_for_login: bool,
     login_request_sent: bool,
     _auth_button_onclicks: Vec<Closure<dyn FnMut(WebEvent)>>,
+    _player_avatar_panel_onclick: Closure<dyn FnMut(WebEvent)>,
     mesh_result_rx: Receiver<MeshBuildResult>,
     workers: Vec<Worker>,
     next_worker_index: usize,
@@ -324,6 +337,8 @@ impl WebApp {
         let (webcam_prompt, webcam_prompt_onclick) = create_webcam_prompt();
         let auth_rx = request_auth_session();
         let (auth_overlay, auth_overlay_status, auth_button_onclicks) = create_auth_overlay();
+        let (player_avatar_panel, player_avatar_panel_status, player_avatar_panel_onclick) =
+            create_player_avatar_panel();
         update_hotbar_ui(&hotbar_slots, &hotbar_blocks, 0);
         let current_chunk = chunk_from_world_position(camera.position);
         let desired_chunks = HashSet::new();
@@ -383,9 +398,12 @@ impl WebApp {
             auth_rx,
             auth_overlay,
             auth_overlay_status,
+            player_avatar_panel,
+            player_avatar_panel_status,
             server_ready_for_login: false,
             login_request_sent: false,
             _auth_button_onclicks: auth_button_onclicks,
+            _player_avatar_panel_onclick: player_avatar_panel_onclick,
             mesh_result_rx,
             workers,
             next_worker_index: 0,
@@ -745,6 +763,7 @@ impl WebApp {
         }
 
         self.sync_auth_overlay();
+        self.sync_player_avatar_panel();
         self.maybe_send_login_request();
     }
 
@@ -766,6 +785,47 @@ impl WebApp {
             AuthStatus::Failed(message) => {
                 let _ = self.auth_overlay.set_attribute("style", auth_overlay_style());
                 self.auth_overlay_status.set_text_content(Some(message));
+            }
+        }
+    }
+
+    fn sync_player_avatar_panel(&self) {
+        match &self.auth_status {
+            AuthStatus::SignedIn => {
+                if self.auth_user.as_ref().is_some_and(auth_user_is_guest) {
+                    let _ = self
+                        .player_avatar_panel
+                        .set_attribute("style", player_avatar_panel_style());
+                    self.player_avatar_panel_status.set_text_content(Some(
+                        "Sign in with SSO to save avatar animation uploads.",
+                    ));
+                } else {
+                    let _ = self
+                        .player_avatar_panel
+                        .set_attribute("style", player_avatar_panel_style());
+                    if let Some(user) = self.auth_user.as_ref() {
+                        let selection = user.avatar_selection.as_ref();
+                        let uploaded_count = [
+                            selection.and_then(|value| value.idle_model_url.as_ref()),
+                            selection.and_then(|value| value.run_model_url.as_ref()),
+                            selection.and_then(|value| value.dance_model_url.as_ref()),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .count();
+                        let message = if uploaded_count == 0 {
+                            "Choose three GLBs for idle, run, and dance."
+                        } else {
+                            "Avatar animations ready. Upload again to replace any slot."
+                        };
+                        self.player_avatar_panel_status.set_text_content(Some(message));
+                    }
+                }
+            }
+            _ => {
+                let _ = self
+                    .player_avatar_panel
+                    .set_attribute("style", "display:none;");
             }
         }
     }
@@ -2328,6 +2388,14 @@ fn auth_overlay_style() -> &'static str {
     "position:fixed;inset:0;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at top,rgba(62,118,158,0.24),transparent 45%),rgba(5,8,12,0.72);backdrop-filter:blur(10px);z-index:60;"
 }
 
+fn player_avatar_panel_style() -> &'static str {
+    "position:fixed;left:16px;top:16px;width:min(360px,calc(100vw - 32px));padding:16px;border-radius:18px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:45;"
+}
+
+fn auth_user_is_guest(user: &AuthUser) -> bool {
+    user.id.starts_with("guest-")
+}
+
 fn fallback_element() -> Element {
     web_sys::window()
         .and_then(|window| window.document())
@@ -2470,6 +2538,16 @@ fn parse_auth_user(body: &JsValue) -> Option<AuthUser> {
         id: js_get_string(&user, "id")?,
         name: js_get_string(&user, "name"),
         email: js_get_string(&user, "email"),
+        avatar_selection: parse_avatar_selection(&user),
+    })
+}
+
+fn parse_avatar_selection(user: &JsValue) -> Option<PlayerAvatarSelection> {
+    let avatar_selection = js_get(user, "avatarSelection")?;
+    Some(PlayerAvatarSelection {
+        idle_model_url: js_get_string(&avatar_selection, "stationaryModelUrl"),
+        run_model_url: js_get_string(&avatar_selection, "moveModelUrl"),
+        dance_model_url: js_get_string(&avatar_selection, "specialModelUrl"),
     })
 }
 
@@ -2484,6 +2562,191 @@ fn js_get(value: &JsValue, key: &str) -> Option<JsValue> {
 
 fn js_get_string(value: &JsValue, key: &str) -> Option<String> {
     js_get(value, key)?.as_string()
+}
+
+fn create_player_avatar_panel() -> (Element, Element, Closure<dyn FnMut(WebEvent)>) {
+    let Some(document) = document() else {
+        let closure = Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        return (fallback_element(), fallback_element(), closure);
+    };
+    let Some(body) = document.body() else {
+        let closure = Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        return (fallback_element(), fallback_element(), closure);
+    };
+
+    let root = document.create_element("div").expect("player avatar panel");
+    let _ = root.set_attribute("style", "display:none;");
+
+    let title = document
+        .create_element("h2")
+        .expect("player avatar panel title");
+    let _ = title.set_attribute(
+        "style",
+        "margin:0 0 6px 0;font:700 18px/1.2 ui-sans-serif,system-ui,sans-serif;",
+    );
+    title.set_text_content(Some("Player Avatar Animations"));
+    let _ = root.append_child(&title);
+
+    let copy = document
+        .create_element("p")
+        .expect("player avatar panel copy");
+    let _ = copy.set_attribute(
+        "style",
+        "margin:0 0 14px 0;color:rgba(230,237,243,0.72);font-size:13px;line-height:1.45;",
+    );
+    copy.set_text_content(Some(
+        "Upload one GLB each for idle, run, and dance. Press Esc if the mouse is locked so you can use the form.",
+    ));
+    let _ = root.append_child(&copy);
+
+    let idle_input = create_player_avatar_file_input(&document, &root, "Idle", "player-avatar-idle");
+    let run_input = create_player_avatar_file_input(&document, &root, "Run", "player-avatar-run");
+    let dance_input = create_player_avatar_file_input(&document, &root, "Dance", "player-avatar-dance");
+
+    let upload_button = document
+        .create_element("button")
+        .expect("player avatar upload button");
+    upload_button.set_text_content(Some("Upload Avatar Set"));
+    let _ = upload_button.set_attribute(
+        "style",
+        "margin-top:14px;width:100%;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.18);background:linear-gradient(180deg,#f6c665,#e8a93c);color:#1b1206;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;",
+    );
+    let _ = root.append_child(&upload_button);
+
+    let status = document
+        .create_element("p")
+        .expect("player avatar panel status");
+    let _ = status.set_attribute(
+        "style",
+        "margin:12px 0 0 0;color:rgba(230,237,243,0.72);font-size:12px;line-height:1.45;",
+    );
+    status.set_text_content(Some("Choose three GLBs for idle, run, and dance."));
+    let _ = root.append_child(&status);
+
+    let status_for_click = status.clone();
+    let idle_input_for_click = idle_input.clone();
+    let run_input_for_click = run_input.clone();
+    let dance_input_for_click = dance_input.clone();
+    let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let status = status_for_click.clone();
+        let idle_input = idle_input_for_click.clone();
+        let run_input = run_input_for_click.clone();
+        let dance_input = dance_input_for_click.clone();
+        spawn_local(async move {
+            status.set_text_content(Some("Uploading avatar GLBs..."));
+            if let Err(error) = upload_player_avatar_set(&idle_input, &run_input, &dance_input, &status).await {
+                status.set_text_content(Some(&error.to_string()));
+            }
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = upload_button.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+
+    let _ = body.append_child(&root);
+    (root, status, onclick)
+}
+
+fn create_player_avatar_file_input(
+    document: &Document,
+    root: &Element,
+    label: &str,
+    id: &str,
+) -> HtmlInputElement {
+    let wrapper = document
+        .create_element("label")
+        .expect("player avatar input wrapper");
+    let _ = wrapper.set_attribute(
+        "style",
+        "display:grid;gap:6px;margin-top:10px;font-size:12px;font-weight:700;color:#f4f7fb;",
+    );
+    wrapper.set_text_content(Some(label));
+
+    let input = document
+        .create_element("input")
+        .expect("player avatar file input")
+        .dyn_into::<HtmlInputElement>()
+        .expect("player avatar input cast");
+    input.set_id(id);
+    input.set_type("file");
+    input.set_accept(".glb,model/gltf-binary");
+    let _ = input.set_attribute(
+        "style",
+        "display:block;width:100%;padding:10px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.06);color:#dce6ef;font:500 12px/1.3 ui-sans-serif,system-ui,sans-serif;",
+    );
+
+    let _ = wrapper.append_child(&input);
+    let _ = root.append_child(&wrapper);
+    input
+}
+
+async fn upload_player_avatar_set(
+    idle_input: &HtmlInputElement,
+    run_input: &HtmlInputElement,
+    dance_input: &HtmlInputElement,
+    status: &Element,
+) -> Result<()> {
+    let idle_file = input_selected_file(idle_input)
+        .ok_or_else(|| anyhow::anyhow!("Choose an idle GLB before uploading."))?;
+    let run_file =
+        input_selected_file(run_input).ok_or_else(|| anyhow::anyhow!("Choose a run GLB before uploading."))?;
+    let dance_file = input_selected_file(dance_input)
+        .ok_or_else(|| anyhow::anyhow!("Choose a dance GLB before uploading."))?;
+
+    status.set_text_content(Some("Uploading idle GLB..."));
+    upload_player_avatar_slot("idle", &idle_file).await?;
+    status.set_text_content(Some("Uploading run GLB..."));
+    upload_player_avatar_slot("run", &run_file).await?;
+    status.set_text_content(Some("Uploading dance GLB..."));
+    upload_player_avatar_slot("dance", &dance_file).await?;
+
+    idle_input.set_value("");
+    run_input.set_value("");
+    dance_input.set_value("");
+    status.set_text_content(Some("Uploaded idle, run, and dance avatar GLBs."));
+    Ok(())
+}
+
+async fn upload_player_avatar_slot(slot: &str, file: &web_sys::File) -> Result<()> {
+    let form_data = FormData::new().map_err(|error| anyhow::anyhow!("create form data: {error:?}"))?;
+    form_data
+        .append_with_str("slot", slot)
+        .map_err(|error| anyhow::anyhow!("append upload slot: {error:?}"))?;
+    form_data
+        .append_with_blob_and_filename("file", file, &file.name())
+        .map_err(|error| anyhow::anyhow!("append avatar file: {error:?}"))?;
+
+    let init = RequestInit::new();
+    init.set_method("POST");
+    init.set_mode(RequestMode::Cors);
+    init.set_credentials(RequestCredentials::Include);
+    init.set_body(&JsValue::from(form_data));
+
+    let request = Request::new_with_str_and_init(
+        &format!("{}/auth/player-avatar/upload", api_base_url()?),
+        &init,
+    )
+    .map_err(|error| anyhow::anyhow!("build player avatar upload request: {error:?}"))?;
+
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
+    let response_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| anyhow::anyhow!("upload player avatars: {error:?}"))?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("convert player avatar upload response"))?;
+
+    if !response.ok() {
+        return Err(anyhow::anyhow!(
+            "{} avatar upload failed with HTTP {}.",
+            slot,
+            response.status()
+        ));
+    }
+
+    Ok(())
+}
+
+fn input_selected_file(input: &HtmlInputElement) -> Option<web_sys::File> {
+    input.files()?.get(0)
 }
 
 fn attach_local_webcam_overlay(video: &HtmlVideoElement) {

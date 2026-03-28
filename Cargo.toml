@@ -32,7 +32,7 @@ wgpu = { version = "0.20", features = ["webgl"] }
 
 [workspace.dependencies.web-sys]
 version = "0.3"
-features = ["BinaryType", "CanvasRenderingContext2d", "CloseEvent", "Document", "Element", "ErrorEvent", "Event", "EventTarget", "Headers", "HtmlCanvasElement", "HtmlMediaElement", "HtmlVideoElement", "ImageData", "Location", "MediaDevices", "MediaStream", "MediaStreamConstraints", "MediaStreamTrack", "MessageEvent", "Navigator", "Request", "RequestCredentials", "RequestInit", "RequestMode", "Response", "RtcIceCandidate", "RtcIceCandidateInit", "RtcPeerConnection", "RtcPeerConnectionIceEvent", "RtcSdpType", "RtcSessionDescriptionInit", "RtcTrackEvent", "WebSocket", "Window", "Worker"]
+features = ["BinaryType", "CanvasRenderingContext2d", "CloseEvent", "Document", "Element", "ErrorEvent", "Event", "EventTarget", "File", "FileList", "FormData", "Headers", "HtmlCanvasElement", "HtmlInputElement", "HtmlMediaElement", "HtmlVideoElement", "ImageData", "Location", "MediaDevices", "MediaStream", "MediaStreamConstraints", "MediaStreamTrack", "MessageEvent", "Navigator", "Request", "RequestCredentials", "RequestInit", "RequestMode", "Response", "RtcIceCandidate", "RtcIceCandidateInit", "RtcPeerConnection", "RtcPeerConnectionIceEvent", "RtcSdpType", "RtcSessionDescriptionInit", "RtcTrackEvent", "WebSocket", "Window", "Worker"]
 
 [workspace.dependencies.wasm-bindgen]
 version = "0.2"

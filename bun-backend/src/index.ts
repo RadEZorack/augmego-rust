@@ -355,6 +355,8 @@ type UserAvatarSelection = {
   specialModelUrl: string | null;
 };
 
+type PlayerAvatarSlot = "idle" | "run" | "dance";
+
 function isMissingAvatarSelectionColumnsError(error: unknown) {
   return (
     error instanceof Error &&
@@ -387,6 +389,28 @@ async function loadUserAvatarSelection(userId: string): Promise<UserAvatarSelect
     }
     throw error;
   }
+}
+
+function isPlayerAvatarSlot(value: unknown): value is PlayerAvatarSlot {
+  return value === "idle" || value === "run" || value === "dance";
+}
+
+function mapPlayerAvatarSlotToSelectionKey(slot: PlayerAvatarSlot) {
+  if (slot === "idle") return "stationaryModelUrl" as const;
+  if (slot === "run") return "moveModelUrl" as const;
+  return "specialModelUrl" as const;
+}
+
+function resolvePlayerAvatarStorageKey(userId: string, slot: PlayerAvatarSlot) {
+  return path
+    .join(
+      WORLD_STORAGE_NAMESPACE,
+      userId,
+      "player-avatars",
+      slot,
+      `${slot}.glb`
+    )
+    .replace(/\\/g, "/");
 }
 
 function sanitizeFilename(value: string) {
@@ -433,6 +457,14 @@ function resolveWorldAssetFileUrl(versionId: string, storageKey: string) {
   return (
     resolveWorldAssetPublicUrl(storageKey) ??
     `/api/v1/world/assets/version/${versionId}/file`
+  );
+}
+
+function resolvePlayerAvatarFileUrl(userId: string, slot: PlayerAvatarSlot) {
+  const storageKey = resolvePlayerAvatarStorageKey(userId, slot);
+  return (
+    resolveWorldAssetPublicUrl(storageKey) ??
+    `/api/v1/users/${userId}/player-avatar/${slot}/file`
   );
 }
 
@@ -918,6 +950,38 @@ async function saveWorldAssetFile(
   const storageKey = path
     .join(WORLD_STORAGE_NAMESPACE, worldOwnerId, assetId, versionId, sanitized)
     .replace(/\\/g, "/");
+
+  if (effectiveWorldStorageProvider === "spaces") {
+    if (!spacesClient) {
+      throw new Error("DigitalOcean Spaces client not configured");
+    }
+
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    await spacesClient.send(
+      new PutObjectCommand({
+        Bucket: DO_SPACES_BUCKET,
+        Key: storageKey,
+        Body: bytes,
+        ACL: "public-read",
+        ContentType: file.type || "model/gltf-binary"
+      })
+    );
+
+    return { storageKey };
+  }
+
+  const absolutePath = path.join(WORLD_STORAGE_ROOT, storageKey);
+  await mkdir(path.dirname(absolutePath), { recursive: true });
+  await Bun.write(absolutePath, file);
+  return { storageKey };
+}
+
+async function savePlayerAvatarFile(
+  file: File,
+  userId: string,
+  slot: PlayerAvatarSlot
+) {
+  const storageKey = resolvePlayerAvatarStorageKey(userId, slot);
 
   if (effectiveWorldStorageProvider === "spaces") {
     if (!spacesClient) {
@@ -3163,6 +3227,9 @@ const api = new Elysia({ prefix: "/api/v1" })
       stationaryModelUrl?: unknown;
       moveModelUrl?: unknown;
       specialModelUrl?: unknown;
+      idleModelUrl?: unknown;
+      runModelUrl?: unknown;
+      danceModelUrl?: unknown;
     } | null;
     if (!body) {
       return jsonResponse({ error: "INVALID_AVATAR_SELECTION" }, { status: 400 });
@@ -3177,16 +3244,28 @@ const api = new Elysia({ prefix: "/api/v1" })
     const currentSelection = await loadUserAvatarSelection(user.id);
     const nextSelection: UserAvatarSelection = {
       stationaryModelUrl:
-        body.stationaryModelUrl !== undefined
-          ? normalizeModelUrl(body.stationaryModelUrl)
+        body.stationaryModelUrl !== undefined || body.idleModelUrl !== undefined
+          ? normalizeModelUrl(
+              body.stationaryModelUrl !== undefined
+                ? body.stationaryModelUrl
+                : body.idleModelUrl
+            )
           : currentSelection.stationaryModelUrl,
       moveModelUrl:
-        body.moveModelUrl !== undefined
-          ? normalizeModelUrl(body.moveModelUrl)
+        body.moveModelUrl !== undefined || body.runModelUrl !== undefined
+          ? normalizeModelUrl(
+              body.moveModelUrl !== undefined
+                ? body.moveModelUrl
+                : body.runModelUrl
+            )
           : currentSelection.moveModelUrl,
       specialModelUrl:
-        body.specialModelUrl !== undefined
-          ? normalizeModelUrl(body.specialModelUrl)
+        body.specialModelUrl !== undefined || body.danceModelUrl !== undefined
+          ? normalizeModelUrl(
+              body.specialModelUrl !== undefined
+                ? body.specialModelUrl
+                : body.danceModelUrl
+            )
           : currentSelection.specialModelUrl
     };
 
@@ -3204,6 +3283,71 @@ const api = new Elysia({ prefix: "/api/v1" })
 
     return jsonResponse({
       ok: true,
+      avatarSelection: nextSelection
+    });
+  })
+  .post("/auth/player-avatar/upload", async ({ request }) => {
+    const user = await resolveSessionUser(prisma, request, SESSION_COOKIE_NAME);
+    if (!user) {
+      return jsonResponse({ error: "AUTH_REQUIRED" }, { status: 401 });
+    }
+
+    const formData = await request.formData();
+    const slotValue = String(formData.get("slot") ?? "").trim().toLowerCase();
+    const singleFileValue = formData.get("file");
+    const uploadedFiles = new Map<PlayerAvatarSlot, File>();
+
+    if (isPlayerAvatarSlot(slotValue)) {
+      if (!(singleFileValue instanceof File)) {
+        return jsonResponse({ error: "FILE_REQUIRED" }, { status: 400 });
+      }
+      uploadedFiles.set(slotValue, singleFileValue);
+    } else {
+      const idleFile = formData.get("idleFile");
+      const runFile = formData.get("runFile");
+      const danceFile = formData.get("danceFile");
+      if (idleFile instanceof File) uploadedFiles.set("idle", idleFile);
+      if (runFile instanceof File) uploadedFiles.set("run", runFile);
+      if (danceFile instanceof File) uploadedFiles.set("dance", danceFile);
+    }
+
+    if (uploadedFiles.size === 0) {
+      return jsonResponse(
+        { error: "PLAYER_AVATAR_FILES_REQUIRED" },
+        { status: 400 }
+      );
+    }
+
+    for (const file of uploadedFiles.values()) {
+      if (!isValidGlbUpload(file)) {
+        return jsonResponse({ error: "INVALID_GLB_FILE" }, { status: 400 });
+      }
+    }
+
+    const currentSelection = await loadUserAvatarSelection(user.id);
+    const nextSelection: UserAvatarSelection = { ...currentSelection };
+
+    for (const [slot, file] of uploadedFiles.entries()) {
+      await savePlayerAvatarFile(file, user.id, slot);
+      nextSelection[mapPlayerAvatarSlotToSelectionKey(slot)] =
+        resolvePlayerAvatarFileUrl(user.id, slot);
+    }
+
+    try {
+      await prisma.$executeRaw`UPDATE "User" SET "playerAvatarStationaryModelUrl" = ${nextSelection.stationaryModelUrl}, "playerAvatarMoveModelUrl" = ${nextSelection.moveModelUrl}, "playerAvatarSpecialModelUrl" = ${nextSelection.specialModelUrl} WHERE "id" = CAST(${user.id} AS uuid)`;
+    } catch (error) {
+      if (isMissingAvatarSelectionColumnsError(error)) {
+        return jsonResponse(
+          { error: "AVATAR_SELECTION_NOT_READY" },
+          { status: 503 }
+        );
+      }
+      throw error;
+    }
+
+    return jsonResponse({
+      ok: true,
+      uploadedSlots: [...uploadedFiles.keys()],
       avatarSelection: nextSelection
     });
   })
@@ -5468,6 +5612,38 @@ const api = new Elysia({ prefix: "/api/v1" })
     return new Response(file, {
       headers: {
         "Content-Type": version.contentType || "model/gltf-binary",
+        "Cache-Control": "private, max-age=120"
+      }
+    });
+  })
+  .get("/users/:userId/player-avatar/:slot/file", async ({ request, params }) => {
+    const user = await resolveSessionUser(prisma, request, SESSION_COOKIE_NAME);
+    if (!user) {
+      return new Response("Auth required", { status: 401 });
+    }
+
+    const userId = String((params as Record<string, unknown>).userId ?? "");
+    const slot = String((params as Record<string, unknown>).slot ?? "").trim().toLowerCase();
+    if (!userId || !isPlayerAvatarSlot(slot)) {
+      return new Response("Not found", { status: 404 });
+    }
+
+    const storageKey = resolvePlayerAvatarStorageKey(userId, slot);
+    const publicUrl = resolveWorldAssetPublicUrl(storageKey);
+    if (publicUrl) {
+      return Response.redirect(publicUrl, 302);
+    }
+
+    const filePath = path.join(WORLD_STORAGE_ROOT, storageKey);
+    const file = Bun.file(filePath);
+    const exists = await file.exists();
+    if (!exists) {
+      return new Response("Not found", { status: 404 });
+    }
+
+    return new Response(file, {
+      headers: {
+        "Content-Type": "model/gltf-binary",
         "Cache-Control": "private, max-age=120"
       }
     });

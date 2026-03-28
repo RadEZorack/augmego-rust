@@ -41,4 +41,4 @@ echo
 echo "Expected local commands:"
 echo "  cd $ROOT_DIR/bun-backend && bun run dev"
 echo "  cd $ROOT_DIR && BACKEND_BIND_ADDR=0.0.0.0:4000 BACKEND_WS_BIND_ADDR=0.0.0.0:4001 cargo run -p backend"
-echo "  cd $ROOT_DIR/game-web && trunk serve --address 0.0.0.0 --port 3002"
+echo "  cd $ROOT_DIR/game-web && trunk serve --address 0.0.0.0 --port 3002 --no-autoreload"

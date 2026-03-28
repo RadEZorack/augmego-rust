@@ -54,7 +54,7 @@ Start the web client:
 
 ```bash
 cd game-web
-trunk serve --address 0.0.0.0 --port 3002 --open
+trunk serve --address 0.0.0.0 --port 3002 --open --no-autoreload
 ```
 
 Then open `https://dev.augmego.ca`.
@@ -65,6 +65,8 @@ Local dev now works like this:
 - `/` proxies to local `trunk serve` on `http://127.0.0.1:3002`
 - `/api/*` proxies to local Bun on `http://127.0.0.1:3000`
 - `/ws` proxies to local voxel WebSocket on `ws://127.0.0.1:4001`
+
+`--no-autoreload` is recommended here because Trunk's live-reload websocket can behave badly when the dev server is being fronted by a separate HTTPS nginx proxy.
 
 Before this works, you need:
 

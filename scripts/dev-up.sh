@@ -23,7 +23,7 @@ Run these in separate terminals:
 
 3. Web client
    cd game-web
-   trunk serve --address 0.0.0.0 --port 3002 --open
+   trunk serve --address 0.0.0.0 --port 3002 --open --no-autoreload
 
 Then open:
   https://dev.augmego.ca

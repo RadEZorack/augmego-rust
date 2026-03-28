@@ -439,6 +439,7 @@ struct WebApp {
     auth_overlay: Element,
     auth_overlay_status: Element,
     player_avatar_panel: Element,
+    player_avatar_modal: Element,
     player_avatar_panel_status: Element,
     server_ready_for_login: bool,
     login_request_sent: bool,
@@ -480,7 +481,7 @@ impl WebApp {
         let auth_rx = request_auth_session();
         let (remote_avatar_tx, remote_avatar_rx) = mpsc::channel();
         let (auth_overlay, auth_overlay_status, auth_button_onclicks) = create_auth_overlay();
-        let (player_avatar_panel, player_avatar_panel_status, player_avatar_panel_onclick) =
+        let (player_avatar_panel, player_avatar_modal, player_avatar_panel_status, player_avatar_panel_onclick) =
             create_player_avatar_panel();
         update_hotbar_ui(&hotbar_slots, &hotbar_blocks, 0);
         let current_chunk = chunk_from_world_position(camera.position);
@@ -551,6 +552,7 @@ impl WebApp {
             auth_overlay,
             auth_overlay_status,
             player_avatar_panel,
+            player_avatar_modal,
             player_avatar_panel_status,
             server_ready_for_login: false,
             login_request_sent: false,
@@ -1013,17 +1015,14 @@ impl WebApp {
     fn sync_player_avatar_panel(&self) {
         match &self.auth_status {
             AuthStatus::SignedIn => {
+                let _ = self
+                    .player_avatar_panel
+                    .set_attribute("style", player_avatar_launcher_style());
                 if self.auth_user.as_ref().is_some_and(auth_user_is_guest) {
-                    let _ = self
-                        .player_avatar_panel
-                        .set_attribute("style", player_avatar_panel_style());
                     self.player_avatar_panel_status.set_text_content(Some(
                         "Sign in with SSO to save avatar animation uploads.",
                     ));
                 } else {
-                    let _ = self
-                        .player_avatar_panel
-                        .set_attribute("style", player_avatar_panel_style());
                     if let Some(user) = self.auth_user.as_ref() {
                         let selection = user.avatar_selection.as_ref();
                         let uploaded_count = [
@@ -1046,6 +1045,9 @@ impl WebApp {
             _ => {
                 let _ = self
                     .player_avatar_panel
+                    .set_attribute("style", "display:none;");
+                let _ = self
+                    .player_avatar_modal
                     .set_attribute("style", "display:none;");
             }
         }
@@ -2761,8 +2763,16 @@ fn auth_overlay_style() -> &'static str {
     "position:fixed;inset:0;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at top,rgba(62,118,158,0.24),transparent 45%),rgba(5,8,12,0.72);backdrop-filter:blur(10px);z-index:60;"
 }
 
-fn player_avatar_panel_style() -> &'static str {
-    "position:fixed;left:16px;top:16px;width:min(360px,calc(100vw - 32px));padding:16px;border-radius:18px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:45;"
+fn player_avatar_launcher_style() -> &'static str {
+    "position:fixed;left:16px;top:16px;padding:12px 16px;border-radius:16px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:45;cursor:pointer;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;"
+}
+
+fn player_avatar_modal_style() -> &'static str {
+    "position:fixed;inset:0;display:none;align-items:center;justify-content:center;padding:20px;background:rgba(5,8,12,0.72);backdrop-filter:blur(10px);z-index:65;"
+}
+
+fn player_avatar_modal_card_style() -> &'static str {
+    "position:relative;width:min(420px,calc(100vw - 24px));max-height:min(82vh,760px);overflow:auto;padding:18px;border-radius:20px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.96),rgba(7,11,18,0.96));color:#e6edf3;box-shadow:0 24px 60px rgba(0,0,0,0.38);"
 }
 
 fn auth_user_is_guest(user: &AuthUser) -> bool {
@@ -2937,28 +2947,47 @@ fn js_get_string(value: &JsValue, key: &str) -> Option<String> {
     js_get(value, key)?.as_string()
 }
 
-fn create_player_avatar_panel() -> (Element, Element, Closure<dyn FnMut(WebEvent)>) {
+fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut(WebEvent)>) {
     let Some(document) = document() else {
         let closure = Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
-        return (fallback_element(), fallback_element(), closure);
+        return (fallback_element(), fallback_element(), fallback_element(), closure);
     };
     let Some(body) = document.body() else {
         let closure = Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
-        return (fallback_element(), fallback_element(), closure);
+        return (fallback_element(), fallback_element(), fallback_element(), closure);
     };
 
-    let root = document.create_element("div").expect("player avatar panel");
+    let root = document.create_element("button").expect("player avatar launcher");
+    root.set_text_content(Some("Player Avatar Animations"));
     let _ = root.set_attribute("style", "display:none;");
+    let _ = root.set_attribute("type", "button");
+
+    let modal = document.create_element("div").expect("player avatar modal");
+    let _ = modal.set_attribute("style", player_avatar_modal_style());
+
+    let card = document.create_element("div").expect("player avatar modal card");
+    let _ = card.set_attribute("style", player_avatar_modal_card_style());
+
+    let close_button = document
+        .create_element("button")
+        .expect("player avatar modal close button");
+    close_button.set_text_content(Some("Close"));
+    let _ = close_button.set_attribute(
+        "style",
+        "position:absolute;top:14px;right:14px;padding:8px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.08);color:#f2f6fb;font:600 12px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;",
+    );
+    let _ = close_button.set_attribute("type", "button");
+    let _ = card.append_child(&close_button);
 
     let title = document
         .create_element("h2")
         .expect("player avatar panel title");
     let _ = title.set_attribute(
         "style",
-        "margin:0 0 6px 0;font:700 18px/1.2 ui-sans-serif,system-ui,sans-serif;",
+        "margin:0 48px 6px 0;font:700 18px/1.2 ui-sans-serif,system-ui,sans-serif;",
     );
     title.set_text_content(Some("Player Avatar Animations"));
-    let _ = root.append_child(&title);
+    let _ = card.append_child(&title);
 
     let copy = document
         .create_element("p")
@@ -2970,11 +2999,11 @@ fn create_player_avatar_panel() -> (Element, Element, Closure<dyn FnMut(WebEvent
     copy.set_text_content(Some(
         "Upload one GLB each for idle, run, and dance. Press Esc if the mouse is locked so you can use the form.",
     ));
-    let _ = root.append_child(&copy);
+    let _ = card.append_child(&copy);
 
-    let idle_input = create_player_avatar_file_input(&document, &root, "Idle", "player-avatar-idle");
-    let run_input = create_player_avatar_file_input(&document, &root, "Run", "player-avatar-run");
-    let dance_input = create_player_avatar_file_input(&document, &root, "Dance", "player-avatar-dance");
+    let idle_input = create_player_avatar_file_input(&document, &card, "Idle", "player-avatar-idle");
+    let run_input = create_player_avatar_file_input(&document, &card, "Run", "player-avatar-run");
+    let dance_input = create_player_avatar_file_input(&document, &card, "Dance", "player-avatar-dance");
 
     let divider = document
         .create_element("div")
@@ -2983,7 +3012,7 @@ fn create_player_avatar_panel() -> (Element, Element, Closure<dyn FnMut(WebEvent
         "style",
         "margin:14px 0 10px 0;height:1px;background:rgba(255,255,255,0.10);",
     );
-    let _ = root.append_child(&divider);
+    let _ = card.append_child(&divider);
 
     let url_copy = document
         .create_element("p")
@@ -2995,14 +3024,14 @@ fn create_player_avatar_panel() -> (Element, Element, Closure<dyn FnMut(WebEvent
     url_copy.set_text_content(Some(
         "Slow connection? Paste public GLB links instead of uploading files.",
     ));
-    let _ = root.append_child(&url_copy);
+    let _ = card.append_child(&url_copy);
 
     let idle_url_input =
-        create_player_avatar_url_input(&document, &root, "Idle URL", "player-avatar-idle-url");
+        create_player_avatar_url_input(&document, &card, "Idle URL", "player-avatar-idle-url");
     let run_url_input =
-        create_player_avatar_url_input(&document, &root, "Run URL", "player-avatar-run-url");
+        create_player_avatar_url_input(&document, &card, "Run URL", "player-avatar-run-url");
     let dance_url_input =
-        create_player_avatar_url_input(&document, &root, "Dance URL", "player-avatar-dance-url");
+        create_player_avatar_url_input(&document, &card, "Dance URL", "player-avatar-dance-url");
 
     let upload_button = document
         .create_element("button")
@@ -3012,7 +3041,8 @@ fn create_player_avatar_panel() -> (Element, Element, Closure<dyn FnMut(WebEvent
         "style",
         "margin-top:14px;width:100%;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.18);background:linear-gradient(180deg,#f6c665,#e8a93c);color:#1b1206;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;",
     );
-    let _ = root.append_child(&upload_button);
+    let _ = upload_button.set_attribute("type", "button");
+    let _ = card.append_child(&upload_button);
 
     let save_urls_button = document
         .create_element("button")
@@ -3022,7 +3052,8 @@ fn create_player_avatar_panel() -> (Element, Element, Closure<dyn FnMut(WebEvent
         "style",
         "margin-top:10px;width:100%;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.08);color:#f2f6fb;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;",
     );
-    let _ = root.append_child(&save_urls_button);
+    let _ = save_urls_button.set_attribute("type", "button");
+    let _ = card.append_child(&save_urls_button);
 
     let status = document
         .create_element("p")
@@ -3032,7 +3063,9 @@ fn create_player_avatar_panel() -> (Element, Element, Closure<dyn FnMut(WebEvent
         "margin:12px 0 0 0;color:rgba(230,237,243,0.72);font-size:12px;line-height:1.45;",
     );
     status.set_text_content(Some("Choose three GLBs for idle, run, and dance."));
-    let _ = root.append_child(&status);
+    let _ = card.append_child(&status);
+
+    let _ = modal.append_child(&card);
 
     let status_for_click = status.clone();
     let idle_input_for_click = idle_input.clone();
@@ -3089,8 +3122,27 @@ fn create_player_avatar_panel() -> (Element, Element, Closure<dyn FnMut(WebEvent
     );
     save_urls_onclick.forget();
 
+    let modal_for_open = modal.clone();
+    let open_modal = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let _ = modal_for_open.set_attribute(
+            "style",
+            "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(5,8,12,0.72);backdrop-filter:blur(10px);z-index:65;",
+        );
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = root.add_event_listener_with_callback("click", open_modal.as_ref().unchecked_ref());
+    open_modal.forget();
+
+    let modal_for_close = modal.clone();
+    let close_modal = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let _ = modal_for_close.set_attribute("style", player_avatar_modal_style());
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = close_button
+        .add_event_listener_with_callback("click", close_modal.as_ref().unchecked_ref());
+    close_modal.forget();
+
     let _ = body.append_child(&root);
-    (root, status, onclick)
+    let _ = body.append_child(&modal);
+    (root, modal, status, onclick)
 }
 
 fn create_player_avatar_file_input(

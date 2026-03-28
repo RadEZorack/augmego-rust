@@ -13,6 +13,16 @@ struct VertexInput {
     @location(4) material_id: f32,
 };
 
+const MAX_SKIN_JOINTS: u32 = 128u;
+
+struct SkinnedVertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) joints: vec4<f32>,
+    @location(4) weights: vec4<f32>,
+};
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec3<f32>,
@@ -28,6 +38,14 @@ var atlas_texture: texture_2d<f32>;
 @group(1) @binding(1)
 var atlas_sampler: sampler;
 
+struct SkinUniforms {
+    model: mat4x4<f32>,
+    joints: array<mat4x4<f32>, MAX_SKIN_JOINTS>,
+};
+
+@group(2) @binding(0)
+var<uniform> skinning: SkinUniforms;
+
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
@@ -37,6 +55,57 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.uv = input.uv;
     output.world_position = input.position;
     output.material_id = input.material_id;
+    return output;
+}
+
+@vertex
+fn vs_skinned_main(input: SkinnedVertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    var skinned_position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var skinned_normal = vec3<f32>(0.0, 0.0, 0.0);
+    var total_weight = 0.0;
+
+    if input.weights.x > 0.0 {
+        let joint = skinning.joints[u32(input.joints.x)];
+        skinned_position += (joint * vec4<f32>(input.position, 1.0)) * input.weights.x;
+        skinned_normal += (joint * vec4<f32>(input.normal, 0.0)).xyz * input.weights.x;
+        total_weight += input.weights.x;
+    }
+    if input.weights.y > 0.0 {
+        let joint = skinning.joints[u32(input.joints.y)];
+        skinned_position += (joint * vec4<f32>(input.position, 1.0)) * input.weights.y;
+        skinned_normal += (joint * vec4<f32>(input.normal, 0.0)).xyz * input.weights.y;
+        total_weight += input.weights.y;
+    }
+    if input.weights.z > 0.0 {
+        let joint = skinning.joints[u32(input.joints.z)];
+        skinned_position += (joint * vec4<f32>(input.position, 1.0)) * input.weights.z;
+        skinned_normal += (joint * vec4<f32>(input.normal, 0.0)).xyz * input.weights.z;
+        total_weight += input.weights.z;
+    }
+    if input.weights.w > 0.0 {
+        let joint = skinning.joints[u32(input.joints.w)];
+        skinned_position += (joint * vec4<f32>(input.position, 1.0)) * input.weights.w;
+        skinned_normal += (joint * vec4<f32>(input.normal, 0.0)).xyz * input.weights.w;
+        total_weight += input.weights.w;
+    }
+
+    var model_position = vec4<f32>(input.position, 1.0);
+    var model_normal = input.normal;
+    if total_weight > 0.0 {
+        model_position = skinned_position / total_weight;
+        model_normal = normalize(skinned_normal / total_weight);
+    }
+
+    let world_position = skinning.model * model_position;
+    let world_normal = normalize((skinning.model * vec4<f32>(model_normal, 0.0)).xyz);
+
+    output.clip_position = camera.view_proj * world_position;
+    output.color = vec3<f32>(1.0, 1.0, 1.0);
+    output.normal = world_normal;
+    output.uv = input.uv;
+    output.world_position = world_position.xyz;
+    output.material_id = 0.0;
     return output;
 }
 

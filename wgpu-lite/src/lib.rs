@@ -7,6 +7,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 const TILE_SIZE: u32 = 16;
 const ATLAS_TILES: u32 = 12;
+pub const MAX_SKIN_JOINTS: usize = 128;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -54,6 +55,52 @@ impl Vertex {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct AnimatedVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+    pub joints: [f32; 4],
+    pub weights: [f32; 4],
+}
+
+impl AnimatedVertex {
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<AnimatedVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 3]>() as u64,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 6]>() as u64,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 8]>() as u64,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 12]>() as u64,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        }
+    }
+}
+
 pub struct Mesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -71,6 +118,19 @@ pub struct DynamicTexture {
 pub struct TexturedMesh {
     mesh: Mesh,
     bind_group: wgpu::BindGroup,
+}
+
+pub struct AnimatedMesh {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+    texture_bind_group: wgpu::BindGroup,
+}
+
+pub struct AnimatedMeshDraw<'a> {
+    mesh: &'a AnimatedMesh,
+    skin_bind_group: wgpu::BindGroup,
+    _skin_buffer: wgpu::Buffer,
 }
 
 struct DepthTarget {
@@ -104,6 +164,13 @@ impl DepthTarget {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SkinUniform {
+    model: [[f32; 4]; 4],
+    joints: [[[f32; 4]; 4]; MAX_SKIN_JOINTS],
 }
 
 struct MaterialTarget {
@@ -242,10 +309,12 @@ pub struct Renderer<'a> {
     size: PhysicalSize<u32>,
     max_surface_extent: u32,
     pipeline: wgpu::RenderPipeline,
+    animated_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     material: MaterialTarget,
+    skin_layout: wgpu::BindGroupLayout,
     depth: DepthTarget,
 }
 
@@ -345,11 +414,32 @@ impl<'a> Renderer<'a> {
 
         let material = MaterialTarget::new(&device, &queue);
 
+        let skin_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("skin-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline-layout"),
             bind_group_layouts: &[&camera_layout, &material.layout],
             push_constant_ranges: &[],
         });
+
+        let animated_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("animated-pipeline-layout"),
+                bind_group_layouts: &[&camera_layout, &material.layout, &skin_layout],
+                push_constant_ranges: &[],
+            });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("voxel-pipeline"),
@@ -423,6 +513,45 @@ impl<'a> Renderer<'a> {
             multiview: None,
         });
 
+        let animated_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("animated-pipeline"),
+            layout: Some(&animated_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_skinned_main",
+                buffers: &[AnimatedVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview: None,
+        });
+
         let depth = DepthTarget::new(&device, size);
 
         Ok(Self {
@@ -433,10 +562,12 @@ impl<'a> Renderer<'a> {
             size,
             max_surface_extent,
             pipeline,
+            animated_pipeline,
             overlay_pipeline,
             camera_buffer,
             camera_bind_group,
             material,
+            skin_layout,
             depth,
         })
     }
@@ -571,6 +702,66 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    pub fn create_animated_mesh(
+        &self,
+        vertices: &[AnimatedVertex],
+        indices: &[u32],
+        texture: &DynamicTexture,
+    ) -> AnimatedMesh {
+        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("animated-mesh-vertex-buffer"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("animated-mesh-index-buffer"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        AnimatedMesh {
+            vertex_buffer,
+            index_buffer,
+            index_count: indices.len() as u32,
+            texture_bind_group: texture.bind_group(&self.device, &self.material.layout),
+        }
+    }
+
+    pub fn create_animated_draw<'b>(
+        &self,
+        mesh: &'b AnimatedMesh,
+        model: Mat4,
+        joints: &[Mat4],
+    ) -> AnimatedMeshDraw<'b> {
+        let mut uniform = SkinUniform {
+            model: model.to_cols_array_2d(),
+            joints: [Mat4::IDENTITY.to_cols_array_2d(); MAX_SKIN_JOINTS],
+        };
+        for (index, joint) in joints.iter().take(MAX_SKIN_JOINTS).enumerate() {
+            uniform.joints[index] = joint.to_cols_array_2d();
+        }
+
+        let skin_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("skin-buffer"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let skin_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("skin-bind-group"),
+            layout: &self.skin_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: skin_buffer.as_entire_binding(),
+            }],
+        });
+
+        AnimatedMeshDraw {
+            mesh,
+            skin_bind_group,
+            _skin_buffer: skin_buffer,
+        }
+    }
+
     pub fn update_camera(&self, view_projection: Mat4) {
         let uniform = CameraUniform {
             view_proj: view_projection.to_cols_array_2d(),
@@ -610,7 +801,13 @@ impl<'a> Renderer<'a> {
         );
     }
 
-    pub fn render(&mut self, meshes: &[&Mesh], textured_meshes: &[&TexturedMesh], overlays: &[&Mesh]) -> Result<()> {
+    pub fn render(
+        &mut self,
+        meshes: &[&Mesh],
+        textured_meshes: &[&TexturedMesh],
+        animated_meshes: &[AnimatedMeshDraw<'_>],
+        overlays: &[&Mesh],
+    ) -> Result<()> {
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -667,6 +864,20 @@ impl<'a> Renderer<'a> {
                 pass.set_vertex_buffer(0, textured.mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(textured.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..textured.mesh.index_count, 0, 0..1);
+            }
+            if !animated_meshes.is_empty() {
+                pass.set_pipeline(&self.animated_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                for animated in animated_meshes {
+                    pass.set_bind_group(1, &animated.mesh.texture_bind_group, &[]);
+                    pass.set_bind_group(2, &animated.skin_bind_group, &[]);
+                    pass.set_vertex_buffer(0, animated.mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(
+                        animated.mesh.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..animated.mesh.index_count, 0, 0..1);
+                }
             }
         }
 

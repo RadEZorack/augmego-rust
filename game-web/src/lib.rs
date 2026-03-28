@@ -1,7 +1,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use anyhow::Result;
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
     BreakBlockRequest, ClientHello, ClientMessage, ClientWebRtcSignal, InventorySnapshot, LoginRequest,
@@ -26,7 +26,7 @@ use web_sys::{
     RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit, RtcTrackEvent,
     WebSocket, Worker,
 };
-use wgpu_lite::{DynamicTexture, Mesh, Renderer, TexturedMesh, Vertex};
+use wgpu_lite::{AnimatedMesh, AnimatedMeshDraw, AnimatedVertex, DynamicTexture, MAX_SKIN_JOINTS, Mesh, Renderer, TexturedMesh, Vertex};
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -139,10 +139,55 @@ enum RemoteAvatarEvent {
     },
 }
 
-struct RemoteAvatarTemplate {
-    vertices: Vec<ImportedVertex>,
-    indices: Vec<u32>,
-    texture: DynamicTexture,
+struct RemoteAvatarAsset {
+    mesh: AnimatedMesh,
+    node_children: Vec<Vec<usize>>,
+    root_nodes: Vec<usize>,
+    rest_locals: Vec<NodeTransform>,
+    joint_nodes: Vec<usize>,
+    inverse_bind_matrices: Vec<Mat4>,
+    animation: AvatarAnimationClip,
+    model_normalization: Mat4,
+}
+
+#[derive(Clone, Copy)]
+struct NodeTransform {
+    translation: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+}
+
+impl NodeTransform {
+    fn matrix(self) -> Mat4 {
+        Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
+    }
+}
+
+#[derive(Clone)]
+struct AvatarAnimationClip {
+    duration_seconds: f32,
+    channels: Vec<AvatarAnimationChannel>,
+}
+
+#[derive(Clone)]
+struct AvatarAnimationChannel {
+    node_index: usize,
+    property: AnimationProperty,
+    keyframe_times: Vec<f32>,
+    outputs: AnimationOutputs,
+}
+
+#[derive(Clone, Copy)]
+enum AnimationProperty {
+    Translation,
+    Rotation,
+    Scale,
+}
+
+#[derive(Clone)]
+enum AnimationOutputs {
+    Vec3(Vec<Vec3>),
+    Quat(Vec<Quat>),
 }
 
 thread_local! {
@@ -223,7 +268,6 @@ async fn run() -> Result<()> {
                     if let Some(mesh) = &remote_players_mesh {
                         visible_mesh_refs.push(mesh);
                     }
-                    let remote_avatar_meshes = app.build_remote_avatar_meshes(&renderer);
                     let remote_media_placeholder_mesh = app.build_remote_media_placeholder_mesh(&renderer);
                     if let Some(mesh) = &remote_media_placeholder_mesh {
                         visible_mesh_refs.push(mesh);
@@ -238,14 +282,19 @@ async fn run() -> Result<()> {
                     if let Some(mesh) = app.build_target_highlight_mesh(&renderer) {
                         overlay_meshes.push(mesh);
                     }
+                    let remote_avatar_meshes = app.build_remote_avatar_meshes(&renderer);
                     let mut textured_mesh_refs = textured_meshes.iter().collect::<Vec<_>>();
-                    textured_mesh_refs.extend(remote_avatar_meshes.iter());
                     if let Some(featured_model) = app.featured_model.as_ref() {
                         textured_mesh_refs.push(featured_model);
                     }
                     let overlay_refs = overlay_meshes.iter().collect::<Vec<_>>();
 
-                    if let Err(error) = renderer.render(&visible_mesh_refs, &textured_mesh_refs, &overlay_refs) {
+                    if let Err(error) = renderer.render(
+                        &visible_mesh_refs,
+                        &textured_mesh_refs,
+                        &remote_avatar_meshes,
+                        &overlay_refs,
+                    ) {
                         panic!("{error:?}");
                     }
                 }
@@ -294,8 +343,9 @@ struct WebApp {
     remote_players: HashMap<u64, [f32; 3]>,
     remote_player_yaws: HashMap<u64, f32>,
     remote_player_stationary_model_urls: HashMap<u64, Option<String>>,
+    remote_player_animation_times: HashMap<u64, f32>,
     remote_media: HashMap<u64, RemotePeerMedia>,
-    remote_avatar_templates: HashMap<String, RemoteAvatarTemplate>,
+    remote_avatar_assets: HashMap<String, RemoteAvatarAsset>,
     pending_remote_avatar_urls: HashSet<String>,
     featured_model: Option<TexturedMesh>,
     featured_model_attempted: bool,
@@ -404,8 +454,9 @@ impl WebApp {
             remote_players: HashMap::new(),
             remote_player_yaws: HashMap::new(),
             remote_player_stationary_model_urls: HashMap::new(),
+            remote_player_animation_times: HashMap::new(),
             remote_media: HashMap::new(),
-            remote_avatar_templates: HashMap::new(),
+            remote_avatar_assets: HashMap::new(),
             pending_remote_avatar_urls: HashSet::new(),
             featured_model: None,
             featured_model_attempted: false,
@@ -618,13 +669,13 @@ impl WebApp {
             match event {
                 RemoteAvatarEvent::Loaded { url, bytes } => {
                     self.pending_remote_avatar_urls.remove(&url);
-                    match build_remote_avatar_template(renderer, &bytes) {
-                        Ok(template) => {
-                            self.remote_avatar_templates.insert(url, template);
+                    match build_remote_avatar_asset(renderer, &bytes) {
+                        Ok(asset) => {
+                            self.remote_avatar_assets.insert(url, asset);
                         }
                         Err(error) => {
                             web_sys::console::warn_1(&JsValue::from_str(&format!(
-                                "failed to build remote avatar template: {error}"
+                                "failed to build remote avatar asset: {error}"
                             )));
                         }
                     }
@@ -675,8 +726,9 @@ impl WebApp {
                             self.remote_players.clear();
                             self.remote_player_yaws.clear();
                             self.remote_player_stationary_model_urls.clear();
+                            self.remote_player_animation_times.clear();
                             self.remote_media.clear();
-                            self.remote_avatar_templates.clear();
+                            self.remote_avatar_assets.clear();
                             self.pending_remote_avatar_urls.clear();
                             self.featured_model = None;
                             self.featured_model_attempted = false;
@@ -702,8 +754,9 @@ impl WebApp {
                             self.remote_players.clear();
                             self.remote_player_yaws.clear();
                             self.remote_player_stationary_model_urls.clear();
+                            self.remote_player_animation_times.clear();
                             self.remote_media.clear();
-                            self.remote_avatar_templates.clear();
+                            self.remote_avatar_assets.clear();
                             self.pending_remote_avatar_urls.clear();
                             self.last_sent_position = None;
                             self.last_sent_velocity = None;
@@ -778,6 +831,9 @@ impl WebApp {
                                 snapshot.player_id,
                                 snapshot.stationary_model_url.clone(),
                             );
+                            self.remote_player_animation_times
+                                .entry(snapshot.player_id)
+                                .or_insert(0.0);
                             self.ensure_remote_avatar_requested(
                                 snapshot.stationary_model_url.as_deref(),
                             );
@@ -803,8 +859,9 @@ impl WebApp {
                     self.remote_players.clear();
                     self.remote_player_yaws.clear();
                     self.remote_player_stationary_model_urls.clear();
+                    self.remote_player_animation_times.clear();
                     self.remote_media.clear();
-                    self.remote_avatar_templates.clear();
+                    self.remote_avatar_assets.clear();
                     self.pending_remote_avatar_urls.clear();
                     self.featured_model = None;
                     self.featured_model_attempted = false;
@@ -964,6 +1021,18 @@ impl WebApp {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
+        let dt_secs = dt.as_secs_f32();
+        for (player_id, playback_time) in &mut self.remote_player_animation_times {
+            let maybe_duration = self
+                .remote_player_stationary_model_urls
+                .get(player_id)
+                .and_then(|value| value.as_ref())
+                .and_then(|url| self.remote_avatar_assets.get(url))
+                .map(|asset| asset.animation.duration_seconds);
+            if let Some(duration) = maybe_duration.filter(|duration| *duration > 0.0) {
+                *playback_time = (*playback_time + dt_secs) % duration;
+            }
+        }
 
         let mut movement = Vec3::ZERO;
         if self.pressed.contains(&KeyCode::KeyW) {
@@ -1004,7 +1073,6 @@ impl WebApp {
         if !self.logged_in {
             return;
         }
-        let dt_secs = dt.as_secs_f32();
         let actual_velocity = if dt_secs > 0.0 {
             (self.camera.position - previous_position) / dt_secs
         } else {
@@ -1158,7 +1226,7 @@ impl WebApp {
                 .remote_player_stationary_model_urls
                 .get(&player_id)
                 .and_then(|url| url.as_ref())
-                .is_some_and(|url| self.remote_avatar_templates.contains_key(url))
+                .is_some_and(|url| self.remote_avatar_assets.contains_key(url))
             {
                 continue;
             }
@@ -1180,7 +1248,7 @@ impl WebApp {
         Some(renderer.create_mesh(&vertices, &indices))
     }
 
-    fn build_remote_avatar_meshes(&self, renderer: &Renderer<'_>) -> Vec<TexturedMesh> {
+    fn build_remote_avatar_meshes(&self, renderer: &Renderer<'_>) -> Vec<AnimatedMeshDraw<'_>> {
         let mut meshes = Vec::new();
         for (&player_id, position) in &self.remote_players {
             let Some(url) = self
@@ -1190,34 +1258,18 @@ impl WebApp {
             else {
                 continue;
             };
-            let Some(template) = self.remote_avatar_templates.get(url) else {
+            let Some(asset) = self.remote_avatar_assets.get(url) else {
                 continue;
             };
             let anchor = player_anchor_from_eye(Vec3::new(position[0], position[1], position[2]));
             let yaw = *self.remote_player_yaws.get(&player_id).unwrap_or(&0.0);
-            let transform =
-                Mat4::from_translation(anchor.body) * Mat4::from_rotation_y(-yaw);
-            let vertices = template
-                .vertices
-                .iter()
-                .map(|vertex| Vertex {
-                    position: transform
-                        .transform_point3(vertex.position)
-                        .to_array(),
-                    color: [1.0, 1.0, 1.0],
-                    normal: transform
-                        .transform_vector3(vertex.normal)
-                        .normalize_or_zero()
-                        .to_array(),
-                    uv: vertex.uv,
-                    material_id: 0.0,
-                })
-                .collect::<Vec<_>>();
-            meshes.push(renderer.create_textured_mesh(
-                &vertices,
-                &template.indices,
-                &template.texture,
-            ));
+            let playback_time = *self.remote_player_animation_times.get(&player_id).unwrap_or(&0.0);
+            let model =
+                Mat4::from_translation(anchor.body)
+                    * Mat4::from_rotation_y(-yaw)
+                    * asset.model_normalization;
+            let joints = evaluate_avatar_skin_matrices(asset, playback_time);
+            meshes.push(renderer.create_animated_draw(&asset.mesh, model, &joints));
         }
         meshes
     }
@@ -1226,7 +1278,7 @@ impl WebApp {
         let Some(url) = maybe_url.map(str::trim).filter(|url| !url.is_empty()) else {
             return;
         };
-        if self.remote_avatar_templates.contains_key(url)
+        if self.remote_avatar_assets.contains_key(url)
             || self.pending_remote_avatar_urls.contains(url)
         {
             return;
@@ -2087,6 +2139,15 @@ struct ImportedVertex {
     position: Vec3,
     normal: Vec3,
     uv: [f32; 2],
+}
+
+#[derive(Clone)]
+struct AnimatedImportedVertex {
+    position: Vec3,
+    normal: Vec3,
+    uv: [f32; 2],
+    joints: [u16; 4],
+    weights: [f32; 4],
 }
 
 fn load_featured_model_mesh(renderer: &Renderer<'_>, spawn_position: WorldPos) -> Result<TexturedMesh> {
@@ -3307,59 +3368,501 @@ async fn fetch_remote_avatar_bytes(url: &str) -> Result<Vec<u8>> {
     Ok(js_sys::Uint8Array::new(&buffer).to_vec())
 }
 
-fn build_remote_avatar_template(
-    renderer: &Renderer<'_>,
-    bytes: &[u8],
-) -> Result<RemoteAvatarTemplate> {
-    let (mut vertices, indices, image) = load_glb_model(bytes)?;
-    let (min, max) = model_bounds(&vertices).ok_or_else(|| anyhow::anyhow!("remote avatar has no vertices"))?;
-    let scale = (PLAYER_HEIGHT * REMOTE_AVATAR_SCALE_FACTOR) / (max.y - min.y).max(0.001);
-    let center_x = (min.x + max.x) * 0.5;
-    let center_z = (min.z + max.z) * 0.5;
+fn build_remote_avatar_asset(renderer: &Renderer<'_>, bytes: &[u8]) -> Result<RemoteAvatarAsset> {
+    let (document, buffers, images) = gltf::import_slice(bytes)?;
+    let scene = document
+        .default_scene()
+        .or_else(|| document.scenes().next())
+        .ok_or_else(|| anyhow::anyhow!("remote avatar glb has no scene"))?;
+    let animation = document
+        .animations()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("remote avatar glb has no animation clips"))?;
+    let animation = parse_avatar_animation_clip(&animation, &buffers)?;
 
-    let import_rotation = Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-    let mut vertices = vertices
-        .drain(..)
-        .map(|vertex| ImportedVertex {
-            position: Vec3::new(
-                (vertex.position.x - center_x) * scale,
-                (vertex.position.y - min.y) * scale,
-                (vertex.position.z - center_z) * scale,
-            ),
-            normal: vertex.normal.normalize_or_zero(),
-            uv: vertex.uv,
-        })
-        .collect::<Vec<_>>();
-    for vertex in &mut vertices {
-        vertex.position = import_rotation.transform_point3(vertex.position);
-        vertex.normal = import_rotation
-            .transform_vector3(vertex.normal)
-            .normalize_or_zero();
-    }
-    if let Some((rotated_min, rotated_max)) = model_bounds(&vertices) {
-        let recenter_x = (rotated_min.x + rotated_max.x) * 0.5;
-        let recenter_z = (rotated_min.z + rotated_max.z) * 0.5;
-        for vertex in &mut vertices {
-            vertex.position.x -= recenter_x;
-            vertex.position.y -= rotated_min.y;
-            vertex.position.z -= recenter_z;
+    let node_count = document.nodes().len();
+    let mut node_children = vec![Vec::new(); node_count];
+    let mut rest_locals = vec![
+        NodeTransform {
+            translation: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+        };
+        node_count
+    ];
+    for node in document.nodes() {
+        let (translation, rotation, scale) = node.transform().decomposed();
+        rest_locals[node.index()] = NodeTransform {
+            translation: Vec3::from_array(translation),
+            rotation: Quat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]),
+            scale: Vec3::from_array(scale),
+        };
+        for child in node.children() {
+            node_children[node.index()].push(child.index());
         }
     }
+    let root_nodes = scene.nodes().map(|node| node.index()).collect::<Vec<_>>();
 
-    let rgba = match image.as_ref() {
+    let mut selected_skin = None;
+    let mut skinned_vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut image_index = None;
+
+    for node in scene.nodes() {
+        append_skinned_gltf_node_meshes(
+            &node,
+            &buffers,
+            &mut skinned_vertices,
+            &mut indices,
+            &mut image_index,
+            &mut selected_skin,
+        );
+    }
+
+    let skin = selected_skin.ok_or_else(|| anyhow::anyhow!("remote avatar glb has no skin"))?;
+    if skinned_vertices.is_empty() || indices.is_empty() {
+        anyhow::bail!("remote avatar glb has no skinned triangle vertices");
+    }
+    if skin.joint_nodes.len() > MAX_SKIN_JOINTS {
+        anyhow::bail!("remote avatar joint count exceeds renderer limit");
+    }
+    let bind_globals = compute_global_node_matrices(&root_nodes, &node_children, &rest_locals);
+    let bind_pose_bounds = skinned_model_bounds(
+        &skinned_vertices,
+        &skin.joint_nodes,
+        &skin.inverse_bind_matrices,
+        &bind_globals,
+    )
+    .ok_or_else(|| anyhow::anyhow!("remote avatar skinned bind pose has no bounds"))?;
+    let model_normalization = build_remote_avatar_normalization(bind_pose_bounds);
+
+    let vertices = skinned_vertices
+        .into_iter()
+        .map(|vertex| AnimatedVertex {
+            position: vertex.position.to_array(),
+            normal: vertex.normal.to_array(),
+            uv: vertex.uv,
+            joints: [
+                vertex.joints[0] as f32,
+                vertex.joints[1] as f32,
+                vertex.joints[2] as f32,
+                vertex.joints[3] as f32,
+            ],
+            weights: vertex.weights,
+        })
+        .collect::<Vec<_>>();
+
+    let rgba = match image_index.and_then(|index| images.get(index)) {
         Some(image) => image_to_rgba_pixels(image)?,
         None => vec![255, 255, 255, 255],
     };
-    let (width, height) = image
+    let (width, height) = image_index
+        .and_then(|index| images.get(index))
         .map(|image| (image.width.max(1), image.height.max(1)))
         .unwrap_or((1, 1));
     let texture = renderer.create_dynamic_texture(width, height);
     renderer.update_dynamic_texture_rgba(&texture, &rgba);
+    let mesh = renderer.create_animated_mesh(&vertices, &indices, &texture);
 
-    Ok(RemoteAvatarTemplate {
-        vertices,
-        indices,
-        texture,
+    Ok(RemoteAvatarAsset {
+        mesh,
+        node_children,
+        root_nodes,
+        rest_locals,
+        joint_nodes: skin.joint_nodes,
+        inverse_bind_matrices: skin.inverse_bind_matrices,
+        animation,
+        model_normalization,
+    })
+}
+
+struct ParsedSkin {
+    joint_nodes: Vec<usize>,
+    inverse_bind_matrices: Vec<Mat4>,
+}
+
+fn append_skinned_gltf_node_meshes(
+    node: &gltf::Node<'_>,
+    buffers: &[gltf::buffer::Data],
+    vertices: &mut Vec<AnimatedImportedVertex>,
+    indices: &mut Vec<u32>,
+    image_index: &mut Option<usize>,
+    selected_skin: &mut Option<ParsedSkin>,
+) {
+    if let Some(mesh) = node.mesh() {
+        let Some(node_skin) = node.skin() else {
+            for child in node.children() {
+                append_skinned_gltf_node_meshes(
+                    &child,
+                    buffers,
+                    vertices,
+                    indices,
+                    image_index,
+                    selected_skin,
+                );
+            }
+            return;
+        };
+
+        let parsed_skin = selected_skin.get_or_insert_with(|| {
+            let joint_nodes = node_skin.joints().map(|joint| joint.index()).collect::<Vec<_>>();
+            let inverse_bind_matrices = node_skin
+                .reader(|buffer| Some(&buffers[buffer.index()].0))
+                .read_inverse_bind_matrices()
+                .map(|matrices| {
+                    matrices
+                        .map(|matrix| Mat4::from_cols_array_2d(&matrix))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| vec![Mat4::IDENTITY; joint_nodes.len()]);
+            ParsedSkin {
+                joint_nodes,
+                inverse_bind_matrices,
+            }
+        });
+
+        if parsed_skin.joint_nodes
+            != node_skin.joints().map(|joint| joint.index()).collect::<Vec<_>>()
+        {
+            for child in node.children() {
+                append_skinned_gltf_node_meshes(
+                    &child,
+                    buffers,
+                    vertices,
+                    indices,
+                    image_index,
+                    selected_skin,
+                );
+            }
+            return;
+        }
+
+        for primitive in mesh.primitives() {
+            if primitive.mode() != gltf::mesh::Mode::Triangles {
+                continue;
+            }
+            if image_index.is_none() {
+                *image_index = primitive
+                    .material()
+                    .pbr_metallic_roughness()
+                    .base_color_texture()
+                    .map(|texture| texture.texture().source().index());
+            }
+
+            let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()].0));
+            let Some(positions) = reader.read_positions() else {
+                continue;
+            };
+            let Some(joints) = reader.read_joints(0) else {
+                continue;
+            };
+            let Some(weights) = reader.read_weights(0) else {
+                continue;
+            };
+
+            let primitive_positions = positions.collect::<Vec<_>>();
+            let primitive_joints = joints.into_u16().collect::<Vec<_>>();
+            let primitive_weights = weights.into_f32().collect::<Vec<_>>();
+            let normals = reader.read_normals().map(|values| values.collect::<Vec<_>>());
+            let texcoords = reader
+                .read_tex_coords(0)
+                .map(|coords| coords.into_f32().collect::<Vec<_>>());
+            let base_vertex = vertices.len() as u32;
+
+            for index in 0..primitive_positions.len() {
+                let mut weight_values = primitive_weights.get(index).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+                let weight_sum = weight_values.iter().sum::<f32>();
+                if weight_sum > 0.0001 {
+                    for weight in &mut weight_values {
+                        *weight /= weight_sum;
+                    }
+                } else {
+                    weight_values = [1.0, 0.0, 0.0, 0.0];
+                }
+
+                vertices.push(AnimatedImportedVertex {
+                    position: Vec3::from_array(primitive_positions[index]),
+                    normal: normals
+                        .as_ref()
+                        .and_then(|values| values.get(index))
+                        .map(|value| Vec3::from_array(*value).normalize_or_zero())
+                        .unwrap_or(Vec3::Y),
+                    uv: texcoords
+                        .as_ref()
+                        .and_then(|values| values.get(index))
+                        .copied()
+                        .unwrap_or([0.5, 0.5]),
+                    joints: primitive_joints.get(index).copied().unwrap_or([0, 0, 0, 0]),
+                    weights: weight_values,
+                });
+            }
+
+            if let Some(read_indices) = reader.read_indices() {
+                indices.extend(read_indices.into_u32().map(|index| base_vertex + index));
+            } else {
+                indices.extend((0..primitive_positions.len() as u32).map(|index| base_vertex + index));
+            }
+        }
+    }
+
+    for child in node.children() {
+        append_skinned_gltf_node_meshes(
+            &child,
+            buffers,
+            vertices,
+            indices,
+            image_index,
+            selected_skin,
+        );
+    }
+}
+
+fn compute_global_node_matrices(
+    root_nodes: &[usize],
+    node_children: &[Vec<usize>],
+    locals: &[NodeTransform],
+) -> Vec<Mat4> {
+    let mut globals = vec![Mat4::IDENTITY; locals.len()];
+    for &root in root_nodes {
+        populate_global_node_matrices(root, Mat4::IDENTITY, node_children, locals, &mut globals);
+    }
+    globals
+}
+
+fn populate_global_node_matrices(
+    node_index: usize,
+    parent: Mat4,
+    node_children: &[Vec<usize>],
+    locals: &[NodeTransform],
+    globals: &mut [Mat4],
+) {
+    let current = parent * locals[node_index].matrix();
+    globals[node_index] = current;
+    for &child in &node_children[node_index] {
+        populate_global_node_matrices(child, current, node_children, locals, globals);
+    }
+}
+
+fn skinned_model_bounds(
+    vertices: &[AnimatedImportedVertex],
+    joint_nodes: &[usize],
+    inverse_bind_matrices: &[Mat4],
+    globals: &[Mat4],
+) -> Option<(Vec3, Vec3)> {
+    let mut bounds: Option<(Vec3, Vec3)> = None;
+    for vertex in vertices {
+        let position = skin_vertex_position(vertex, joint_nodes, inverse_bind_matrices, globals);
+        bounds = Some(match bounds {
+            Some((min, max)) => (min.min(position), max.max(position)),
+            None => (position, position),
+        });
+    }
+    bounds
+}
+
+fn skin_vertex_position(
+    vertex: &AnimatedImportedVertex,
+    joint_nodes: &[usize],
+    inverse_bind_matrices: &[Mat4],
+    globals: &[Mat4],
+) -> Vec3 {
+    let mut result = Vec3::ZERO;
+    let mut total_weight = 0.0;
+    for influence in 0..4 {
+        let weight = vertex.weights[influence];
+        if weight <= 0.0 {
+            continue;
+        }
+        let joint_index = vertex.joints[influence] as usize;
+        let Some(&joint_node) = joint_nodes.get(joint_index) else {
+            continue;
+        };
+        let inverse_bind = inverse_bind_matrices
+            .get(joint_index)
+            .copied()
+            .unwrap_or(Mat4::IDENTITY);
+        let joint_matrix = globals[joint_node] * inverse_bind;
+        result += joint_matrix.transform_point3(vertex.position) * weight;
+        total_weight += weight;
+    }
+    if total_weight > 0.0 {
+        result / total_weight
+    } else {
+        vertex.position
+    }
+}
+
+fn build_remote_avatar_normalization((min, max): (Vec3, Vec3)) -> Mat4 {
+    let import_rotation = Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+    let rotated_corners = [
+        Vec3::new(min.x, min.y, min.z),
+        Vec3::new(min.x, min.y, max.z),
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(min.x, max.y, max.z),
+        Vec3::new(max.x, min.y, min.z),
+        Vec3::new(max.x, min.y, max.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(max.x, max.y, max.z),
+    ]
+    .into_iter()
+    .map(|corner| import_rotation.transform_point3(corner))
+    .collect::<Vec<_>>();
+    let mut rotated_min = rotated_corners[0];
+    let mut rotated_max = rotated_corners[0];
+    for corner in &rotated_corners[1..] {
+        rotated_min = rotated_min.min(*corner);
+        rotated_max = rotated_max.max(*corner);
+    }
+
+    let scale =
+        (PLAYER_HEIGHT * REMOTE_AVATAR_SCALE_FACTOR) / (rotated_max.y - rotated_min.y).max(0.001);
+    let center_x = (rotated_min.x + rotated_max.x) * 0.5;
+    let center_z = (rotated_min.z + rotated_max.z) * 0.5;
+    Mat4::from_translation(Vec3::new(
+        -center_x * scale,
+        -rotated_min.y * scale,
+        -center_z * scale,
+    )) * Mat4::from_scale(Vec3::splat(scale))
+        * import_rotation
+}
+
+fn evaluate_avatar_skin_matrices(asset: &RemoteAvatarAsset, playback_time: f32) -> Vec<Mat4> {
+    let mut locals = asset.rest_locals.clone();
+    apply_animation_to_locals(&mut locals, &asset.animation, playback_time);
+    let globals = compute_global_node_matrices(&asset.root_nodes, &asset.node_children, &locals);
+
+    asset
+        .joint_nodes
+        .iter()
+        .enumerate()
+        .map(|(index, joint_node)| {
+            globals[*joint_node]
+                * asset
+                    .inverse_bind_matrices
+                    .get(index)
+                    .copied()
+                    .unwrap_or(Mat4::IDENTITY)
+        })
+        .collect()
+}
+
+fn apply_animation_to_locals(
+    locals: &mut [NodeTransform],
+    animation: &AvatarAnimationClip,
+    playback_time: f32,
+) {
+    for channel in &animation.channels {
+        if channel.keyframe_times.is_empty() {
+            continue;
+        }
+        let node_local = &mut locals[channel.node_index];
+        match (&channel.property, &channel.outputs) {
+            (AnimationProperty::Translation, AnimationOutputs::Vec3(values)) => {
+                node_local.translation = sample_vec3_channel(&channel.keyframe_times, values, playback_time);
+            }
+            (AnimationProperty::Scale, AnimationOutputs::Vec3(values)) => {
+                node_local.scale = sample_vec3_channel(&channel.keyframe_times, values, playback_time);
+            }
+            (AnimationProperty::Rotation, AnimationOutputs::Quat(values)) => {
+                node_local.rotation = sample_quat_channel(&channel.keyframe_times, values, playback_time);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn sample_vec3_channel(times: &[f32], values: &[Vec3], playback_time: f32) -> Vec3 {
+    if times.len() == 1 || values.len() == 1 {
+        return values[0];
+    }
+    let (left, right, alpha) = animation_keyframe_span(times, playback_time);
+    values[left].lerp(values[right], alpha)
+}
+
+fn sample_quat_channel(times: &[f32], values: &[Quat], playback_time: f32) -> Quat {
+    if times.len() == 1 || values.len() == 1 {
+        return values[0];
+    }
+    let (left, right, alpha) = animation_keyframe_span(times, playback_time);
+    values[left].slerp(values[right], alpha).normalize()
+}
+
+fn animation_keyframe_span(times: &[f32], playback_time: f32) -> (usize, usize, f32) {
+    if playback_time <= times[0] {
+        return (0, 0, 0.0);
+    }
+    for index in 0..times.len().saturating_sub(1) {
+        let start = times[index];
+        let end = times[index + 1];
+        if playback_time <= end {
+            let alpha = if end > start {
+                (playback_time - start) / (end - start)
+            } else {
+                0.0
+            };
+            return (index, index + 1, alpha.clamp(0.0, 1.0));
+        }
+    }
+    let last = times.len().saturating_sub(1);
+    (last, last, 0.0)
+}
+
+fn parse_avatar_animation_clip(
+    animation: &gltf::Animation<'_>,
+    buffers: &[gltf::buffer::Data],
+) -> Result<AvatarAnimationClip> {
+    let mut channels = Vec::new();
+    let mut duration_seconds = 0.0_f32;
+
+    for channel in animation.channels() {
+        let reader = channel.reader(|buffer| Some(&buffers[buffer.index()].0));
+        let Some(inputs) = reader.read_inputs() else {
+            continue;
+        };
+        let keyframe_times = inputs.collect::<Vec<_>>();
+        if let Some(last) = keyframe_times.last().copied() {
+            duration_seconds = duration_seconds.max(last);
+        }
+        let property = match channel.target().property() {
+            gltf::animation::Property::Translation => AnimationProperty::Translation,
+            gltf::animation::Property::Rotation => AnimationProperty::Rotation,
+            gltf::animation::Property::Scale => AnimationProperty::Scale,
+            gltf::animation::Property::MorphTargetWeights => continue,
+        };
+
+        let outputs = match reader.read_outputs() {
+            Some(gltf::animation::util::ReadOutputs::Translations(values)) => {
+                AnimationOutputs::Vec3(values.map(Vec3::from_array).collect())
+            }
+            Some(gltf::animation::util::ReadOutputs::Scales(values)) => {
+                AnimationOutputs::Vec3(values.map(Vec3::from_array).collect())
+            }
+            Some(gltf::animation::util::ReadOutputs::Rotations(values)) => {
+                AnimationOutputs::Quat(
+                    values
+                        .into_f32()
+                        .map(|value| Quat::from_xyzw(value[0], value[1], value[2], value[3]))
+                        .collect(),
+                )
+            }
+            _ => continue,
+        };
+
+        channels.push(AvatarAnimationChannel {
+            node_index: channel.target().node().index(),
+            property,
+            keyframe_times,
+            outputs,
+        });
+    }
+
+    if channels.is_empty() {
+        anyhow::bail!("remote avatar first animation clip has no supported channels");
+    }
+
+    Ok(AvatarAnimationClip {
+        duration_seconds: duration_seconds.max(0.0001),
+        channels,
     })
 }
 

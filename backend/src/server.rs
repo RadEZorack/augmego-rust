@@ -60,6 +60,7 @@ struct Player {
     name: String,
     position: [f32; 3],
     velocity: [f32; 3],
+    yaw: f32,
     stationary_model_url: Option<String>,
     subscribed_chunks: HashSet<ChunkPos>,
 }
@@ -90,6 +91,7 @@ impl PlayerService {
             name,
             position: [spawn.x as f32 + 0.5, spawn.y as f32, spawn.z as f32 + 0.5],
             velocity: [0.0; 3],
+            yaw: 0.0,
             stationary_model_url,
             subscribed_chunks: HashSet::new(),
         };
@@ -98,11 +100,18 @@ impl PlayerService {
         player
     }
 
-    async fn update_motion(&self, player_id: u64, position: [f32; 3], velocity: [f32; 3]) -> Option<Player> {
+    async fn update_motion(
+        &self,
+        player_id: u64,
+        position: [f32; 3],
+        velocity: [f32; 3],
+        yaw: f32,
+    ) -> Option<Player> {
         let mut players = self.players.lock().await;
         let player = players.get_mut(&player_id)?;
         player.position = position;
         player.velocity = velocity;
+        player.yaw = yaw;
         Some(player.clone())
     }
 
@@ -471,6 +480,7 @@ impl ChunkStreamingService {
                 tick: 0,
                 position: player.position,
                 velocity: player.velocity,
+                yaw: player.yaw,
                 stationary_model_url: player.stationary_model_url.clone(),
             }));
         }
@@ -709,6 +719,7 @@ impl VoxelServer {
                 tick: 0,
                 position: player.position,
                 velocity: player.velocity,
+                yaw: player.yaw,
                 stationary_model_url: player.stationary_model_url.clone(),
             }),
         )
@@ -791,6 +802,7 @@ impl VoxelServer {
             tick: 0,
             position: player.position,
             velocity: player.velocity,
+            yaw: player.yaw,
             stationary_model_url: player.stationary_model_url.clone(),
         }));
 
@@ -824,7 +836,12 @@ impl VoxelServer {
 
                     if let Some(player) = self
                         .player_service
-                        .update_motion(player_id, position, velocity)
+                        .update_motion(
+                            player_id,
+                            position,
+                            velocity,
+                            input.yaw.unwrap_or(current_player.yaw),
+                        )
                         .await
                     {
                         write_message(
@@ -834,6 +851,7 @@ impl VoxelServer {
                                 tick: input.tick,
                                 position: player.position,
                                 velocity: player.velocity,
+                                yaw: player.yaw,
                                 stationary_model_url: player.stationary_model_url.clone(),
                             }),
                         )
@@ -913,7 +931,12 @@ impl VoxelServer {
 
                     if let Some(player) = self
                         .player_service
-                        .update_motion(player_id, position, velocity)
+                        .update_motion(
+                            player_id,
+                            position,
+                            velocity,
+                            input.yaw.unwrap_or(current_player.yaw),
+                        )
                         .await
                     {
                         let _ = sender.send(ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
@@ -921,6 +944,7 @@ impl VoxelServer {
                             tick: input.tick,
                             position: player.position,
                             velocity: player.velocity,
+                            yaw: player.yaw,
                             stationary_model_url: player.stationary_model_url.clone(),
                         }));
                         self.broadcast_player_snapshot(
@@ -928,6 +952,7 @@ impl VoxelServer {
                             input.tick,
                             player.position,
                             player.velocity,
+                            player.yaw,
                             player.stationary_model_url.clone(),
                         )
                         .await;
@@ -1008,6 +1033,7 @@ impl VoxelServer {
         tick: u64,
         position: [f32; 3],
         velocity: [f32; 3],
+        yaw: f32,
         stationary_model_url: Option<String>,
     ) {
         let chunk = ChunkPos::from_world(WorldPos {
@@ -1024,6 +1050,7 @@ impl VoxelServer {
                     tick,
                     position,
                     velocity,
+                    yaw,
                     stationary_model_url,
                 }),
             )

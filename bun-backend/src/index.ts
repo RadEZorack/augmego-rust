@@ -147,6 +147,8 @@ const WORLD_TIMELINE_EXPORT_MAX_ATTEMPTS = toPositiveInteger(
   process.env.WORLD_TIMELINE_EXPORT_MAX_ATTEMPTS,
   3
 );
+const PLAYER_AVATAR_CACHE_CONTROL =
+  process.env.PLAYER_AVATAR_CACHE_CONTROL ?? "public, max-age=31536000, immutable";
 const DEFAULT_WORLD_PORTAL_LAT = 43.090003;
 const DEFAULT_WORLD_PORTAL_LNG = -79.068051;
 
@@ -3406,7 +3408,8 @@ const api = new Elysia({ prefix: "/api/v1" })
         Bucket: DO_SPACES_BUCKET,
         Key: storageKey,
         ACL: "public-read",
-        ContentType: contentType
+        ContentType: contentType,
+        CacheControl: PLAYER_AVATAR_CACHE_CONTROL
       }),
       { expiresIn: PLAYER_AVATAR_UPLOAD_URL_TTL_SECONDS }
     );
@@ -3427,7 +3430,8 @@ const api = new Elysia({ prefix: "/api/v1" })
       contentType,
       uploadHeaders: {
         "Content-Type": contentType,
-        "x-amz-acl": "public-read"
+        "x-amz-acl": "public-read",
+        "Cache-Control": PLAYER_AVATAR_CACHE_CONTROL
       }
     });
   })

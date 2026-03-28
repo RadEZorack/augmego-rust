@@ -49,6 +49,7 @@ pub struct PlayerInputTick {
     pub movement: [f32; 3],
     pub position: Option<[f32; 3]>,
     pub velocity: Option<[f32; 3]>,
+    pub yaw: Option<f32>,
     pub jump: bool,
 }
 
@@ -58,6 +59,7 @@ pub struct PlayerStateSnapshot {
     pub tick: u64,
     pub position: [f32; 3],
     pub velocity: [f32; 3],
+    pub yaw: f32,
     pub stationary_model_url: Option<String>,
 }
 

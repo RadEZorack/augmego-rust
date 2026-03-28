@@ -78,6 +78,7 @@ const REMOTE_PLAYER_HALF_HEIGHT: f32 = 0.9;
 const WEBCAM_PANEL_HALF_WIDTH: f32 = 0.55;
 const WEBCAM_PANEL_HALF_HEIGHT: f32 = 0.40;
 const FEATURED_MODEL_DESIRED_HEIGHT: f32 = 1.5;
+const REMOTE_AVATAR_SCALE_FACTOR: f32 = 1.0 / 3.0;
 const AUTH_STATUS_CHECKING: &str = "Checking your sign-in session...";
 const AUTH_STATUS_SIGNED_OUT: &str = "Sign in with SSO, or continue as a guest.";
 
@@ -291,6 +292,7 @@ struct WebApp {
     selected_hotbar: usize,
     player_id: Option<u64>,
     remote_players: HashMap<u64, [f32; 3]>,
+    remote_player_yaws: HashMap<u64, f32>,
     remote_player_stationary_model_urls: HashMap<u64, Option<String>>,
     remote_media: HashMap<u64, RemotePeerMedia>,
     remote_avatar_templates: HashMap<String, RemoteAvatarTemplate>,
@@ -305,6 +307,7 @@ struct WebApp {
     webcam: Option<WebcamCapture>,
     last_sent_position: Option<[f32; 3]>,
     last_sent_velocity: Option<[f32; 3]>,
+    last_sent_yaw: Option<f32>,
     tick_counter: u64,
     transport_open: bool,
     logged_in: bool,
@@ -399,6 +402,7 @@ impl WebApp {
             selected_hotbar: 0,
             player_id: None,
             remote_players: HashMap::new(),
+            remote_player_yaws: HashMap::new(),
             remote_player_stationary_model_urls: HashMap::new(),
             remote_media: HashMap::new(),
             remote_avatar_templates: HashMap::new(),
@@ -413,6 +417,7 @@ impl WebApp {
             webcam: None,
             last_sent_position: None,
             last_sent_velocity: None,
+            last_sent_yaw: None,
             tick_counter: 0,
             transport_open: false,
             logged_in: false,
@@ -668,6 +673,7 @@ impl WebApp {
                             self.login_request_sent = false;
                             self.player_id = None;
                             self.remote_players.clear();
+                            self.remote_player_yaws.clear();
                             self.remote_player_stationary_model_urls.clear();
                             self.remote_media.clear();
                             self.remote_avatar_templates.clear();
@@ -694,12 +700,14 @@ impl WebApp {
                             self.player_id = Some(response.player_id);
                             self.pending_network_events.clear();
                             self.remote_players.clear();
+                            self.remote_player_yaws.clear();
                             self.remote_player_stationary_model_urls.clear();
                             self.remote_media.clear();
                             self.remote_avatar_templates.clear();
                             self.pending_remote_avatar_urls.clear();
                             self.last_sent_position = None;
                             self.last_sent_velocity = None;
+                            self.last_sent_yaw = None;
                             self.camera.position = Vec3::new(
                                 response.spawn_position.x as f32 + 0.5,
                                 response.spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
@@ -765,6 +773,7 @@ impl WebApp {
                     ServerMessage::PlayerStateSnapshot(snapshot) => {
                         if Some(snapshot.player_id) != self.player_id {
                             self.remote_players.insert(snapshot.player_id, snapshot.position);
+                            self.remote_player_yaws.insert(snapshot.player_id, snapshot.yaw);
                             self.remote_player_stationary_model_urls.insert(
                                 snapshot.player_id,
                                 snapshot.stationary_model_url.clone(),
@@ -792,12 +801,14 @@ impl WebApp {
                     self.player_id = None;
                     self.pending_network_events.clear();
                     self.remote_players.clear();
+                    self.remote_player_yaws.clear();
                     self.remote_player_stationary_model_urls.clear();
                     self.remote_media.clear();
                     self.remote_avatar_templates.clear();
                     self.pending_remote_avatar_urls.clear();
                     self.featured_model = None;
                     self.featured_model_attempted = false;
+                    self.last_sent_yaw = None;
                     web_sys::console::error_1(&JsValue::from_str(&format!("multiplayer disconnected: {reason}")));
                 }
             }
@@ -1021,18 +1032,24 @@ impl WebApp {
                 dx * dx + dy * dy + dz * dz > 0.0025
             })
             .unwrap_or(true);
+        let yaw_changed = self
+            .last_sent_yaw
+            .map(|last| (self.camera.yaw - last).abs() > 0.0025)
+            .unwrap_or(true);
 
-        if should_broadcast_motion && (position_changed || velocity_changed) {
+        if (should_broadcast_motion && (position_changed || velocity_changed)) || yaw_changed {
             self.tick_counter = self.tick_counter.wrapping_add(1);
             self.send_client_message(&ClientMessage::PlayerInputTick(PlayerInputTick {
                 tick: self.tick_counter,
                 movement: [world_movement.x, 0.0, world_movement.z],
                 position: Some(position),
                 velocity: Some(velocity),
+                yaw: Some(self.camera.yaw),
                 jump,
             }));
             self.last_sent_position = Some(position);
             self.last_sent_velocity = Some(velocity);
+            self.last_sent_yaw = Some(self.camera.yaw);
         }
     }
 
@@ -1177,13 +1194,21 @@ impl WebApp {
                 continue;
             };
             let anchor = player_anchor_from_eye(Vec3::new(position[0], position[1], position[2]));
+            let yaw = *self.remote_player_yaws.get(&player_id).unwrap_or(&0.0);
+            let transform =
+                Mat4::from_translation(anchor.body) * Mat4::from_rotation_y(-yaw);
             let vertices = template
                 .vertices
                 .iter()
                 .map(|vertex| Vertex {
-                    position: (vertex.position + anchor.body).to_array(),
+                    position: transform
+                        .transform_point3(vertex.position)
+                        .to_array(),
                     color: [1.0, 1.0, 1.0],
-                    normal: vertex.normal.normalize_or_zero().to_array(),
+                    normal: transform
+                        .transform_vector3(vertex.normal)
+                        .normalize_or_zero()
+                        .to_array(),
                     uv: vertex.uv,
                     material_id: 0.0,
                 })
@@ -3087,6 +3112,9 @@ async fn upload_player_avatar_slot_direct(slot: &str, file: &web_sys::File) -> R
         .as_ref()
         .and_then(|headers| js_get_string(headers, "x-amz-acl"))
         .unwrap_or_else(|| "public-read".to_string());
+    let upload_cache_control = upload_headers
+        .as_ref()
+        .and_then(|headers| js_get_string(headers, "Cache-Control"));
 
     let upload_init = RequestInit::new();
     upload_init.set_method("PUT");
@@ -3102,6 +3130,12 @@ async fn upload_player_avatar_slot_direct(slot: &str, file: &web_sys::File) -> R
         .headers()
         .set("x-amz-acl", &upload_acl)
         .map_err(|error| anyhow::anyhow!("set direct PUT ACL: {error:?}"))?;
+    if let Some(upload_cache_control) = upload_cache_control.as_deref() {
+        upload_request
+            .headers()
+            .set("Cache-Control", upload_cache_control)
+            .map_err(|error| anyhow::anyhow!("set direct PUT cache control: {error:?}"))?;
+    }
 
     let upload_response_value = JsFuture::from(window.fetch_with_request(&upload_request))
         .await
@@ -3279,11 +3313,12 @@ fn build_remote_avatar_template(
 ) -> Result<RemoteAvatarTemplate> {
     let (mut vertices, indices, image) = load_glb_model(bytes)?;
     let (min, max) = model_bounds(&vertices).ok_or_else(|| anyhow::anyhow!("remote avatar has no vertices"))?;
-    let scale = PLAYER_HEIGHT / (max.y - min.y).max(0.001);
+    let scale = (PLAYER_HEIGHT * REMOTE_AVATAR_SCALE_FACTOR) / (max.y - min.y).max(0.001);
     let center_x = (min.x + max.x) * 0.5;
     let center_z = (min.z + max.z) * 0.5;
 
-    let vertices = vertices
+    let import_rotation = Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+    let mut vertices = vertices
         .drain(..)
         .map(|vertex| ImportedVertex {
             position: Vec3::new(
@@ -3295,6 +3330,21 @@ fn build_remote_avatar_template(
             uv: vertex.uv,
         })
         .collect::<Vec<_>>();
+    for vertex in &mut vertices {
+        vertex.position = import_rotation.transform_point3(vertex.position);
+        vertex.normal = import_rotation
+            .transform_vector3(vertex.normal)
+            .normalize_or_zero();
+    }
+    if let Some((rotated_min, rotated_max)) = model_bounds(&vertices) {
+        let recenter_x = (rotated_min.x + rotated_max.x) * 0.5;
+        let recenter_z = (rotated_min.z + rotated_max.z) * 0.5;
+        for vertex in &mut vertices {
+            vertex.position.x -= recenter_x;
+            vertex.position.y -= rotated_min.y;
+            vertex.position.z -= recenter_z;
+        }
+    }
 
     let rgba = match image.as_ref() {
         Some(image) => image_to_rgba_pixels(image)?,

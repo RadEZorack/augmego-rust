@@ -61,7 +61,9 @@ struct Player {
     position: [f32; 3],
     velocity: [f32; 3],
     yaw: f32,
-    stationary_model_url: Option<String>,
+    idle_model_url: Option<String>,
+    run_model_url: Option<String>,
+    dance_model_url: Option<String>,
     subscribed_chunks: HashSet<ChunkPos>,
 }
 
@@ -83,7 +85,9 @@ impl PlayerService {
         &self,
         name: String,
         spawn: WorldPos,
-        stationary_model_url: Option<String>,
+        idle_model_url: Option<String>,
+        run_model_url: Option<String>,
+        dance_model_url: Option<String>,
     ) -> Player {
         let mut next_id = self.next_id.lock().await;
         let player = Player {
@@ -92,7 +96,9 @@ impl PlayerService {
             position: [spawn.x as f32 + 0.5, spawn.y as f32, spawn.z as f32 + 0.5],
             velocity: [0.0; 3],
             yaw: 0.0,
-            stationary_model_url,
+            idle_model_url,
+            run_model_url,
+            dance_model_url,
             subscribed_chunks: HashSet::new(),
         };
         *next_id += 1;
@@ -481,7 +487,9 @@ impl ChunkStreamingService {
                 position: player.position,
                 velocity: player.velocity,
                 yaw: player.yaw,
-                stationary_model_url: player.stationary_model_url.clone(),
+                idle_model_url: player.idle_model_url.clone(),
+                run_model_url: player.run_model_url.clone(),
+                dance_model_url: player.dance_model_url.clone(),
             }));
         }
 
@@ -672,7 +680,13 @@ impl VoxelServer {
         let spawn_position = self.world_service.safe_spawn_position();
         let player = self
             .player_service
-            .login(login.name, spawn_position, login.stationary_model_url)
+            .login(
+                login.name,
+                spawn_position,
+                login.idle_model_url,
+                login.run_model_url,
+                login.dance_model_url,
+            )
             .await;
         tracing::info!(player_id = player.id, name = %player.name, "player joined");
 
@@ -720,7 +734,9 @@ impl VoxelServer {
                 position: player.position,
                 velocity: player.velocity,
                 yaw: player.yaw,
-                stationary_model_url: player.stationary_model_url.clone(),
+                idle_model_url: player.idle_model_url.clone(),
+                run_model_url: player.run_model_url.clone(),
+                dance_model_url: player.dance_model_url.clone(),
             }),
         )
         .await?;
@@ -763,7 +779,13 @@ impl VoxelServer {
         let spawn_position = self.world_service.safe_spawn_position();
         let player = self
             .player_service
-            .login(login.name, spawn_position, login.stationary_model_url)
+            .login(
+                login.name,
+                spawn_position,
+                login.idle_model_url,
+                login.run_model_url,
+                login.dance_model_url,
+            )
             .await;
         tracing::info!(player_id = player.id, name = %player.name, "websocket player joined");
 
@@ -803,7 +825,9 @@ impl VoxelServer {
             position: player.position,
             velocity: player.velocity,
             yaw: player.yaw,
-            stationary_model_url: player.stationary_model_url.clone(),
+            idle_model_url: player.idle_model_url.clone(),
+            run_model_url: player.run_model_url.clone(),
+            dance_model_url: player.dance_model_url.clone(),
         }));
 
         while let Ok(message) = read_ws_message::<ClientMessage, _>(&mut ws_read).await {
@@ -852,7 +876,9 @@ impl VoxelServer {
                                 position: player.position,
                                 velocity: player.velocity,
                                 yaw: player.yaw,
-                                stationary_model_url: player.stationary_model_url.clone(),
+                                idle_model_url: player.idle_model_url.clone(),
+                                run_model_url: player.run_model_url.clone(),
+                                dance_model_url: player.dance_model_url.clone(),
                             }),
                         )
                         .await?;
@@ -945,7 +971,9 @@ impl VoxelServer {
                             position: player.position,
                             velocity: player.velocity,
                             yaw: player.yaw,
-                            stationary_model_url: player.stationary_model_url.clone(),
+                            idle_model_url: player.idle_model_url.clone(),
+                            run_model_url: player.run_model_url.clone(),
+                            dance_model_url: player.dance_model_url.clone(),
                         }));
                         self.broadcast_player_snapshot(
                             player_id,
@@ -953,7 +981,9 @@ impl VoxelServer {
                             player.position,
                             player.velocity,
                             player.yaw,
-                            player.stationary_model_url.clone(),
+                            player.idle_model_url.clone(),
+                            player.run_model_url.clone(),
+                            player.dance_model_url.clone(),
                         )
                         .await;
                     }
@@ -1034,7 +1064,9 @@ impl VoxelServer {
         position: [f32; 3],
         velocity: [f32; 3],
         yaw: f32,
-        stationary_model_url: Option<String>,
+        idle_model_url: Option<String>,
+        run_model_url: Option<String>,
+        dance_model_url: Option<String>,
     ) {
         let chunk = ChunkPos::from_world(WorldPos {
             x: position[0].floor() as i64,
@@ -1051,7 +1083,9 @@ impl VoxelServer {
                     position,
                     velocity,
                     yaw,
-                    stationary_model_url,
+                    idle_model_url,
+                    run_model_url,
+                    dance_model_url,
                 }),
             )
             .await;

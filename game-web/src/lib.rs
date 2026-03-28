@@ -78,7 +78,9 @@ const REMOTE_PLAYER_HALF_HEIGHT: f32 = 0.9;
 const WEBCAM_PANEL_HALF_WIDTH: f32 = 0.55;
 const WEBCAM_PANEL_HALF_HEIGHT: f32 = 0.40;
 const FEATURED_MODEL_DESIRED_HEIGHT: f32 = 1.5;
-const REMOTE_AVATAR_SCALE_FACTOR: f32 = 1.0 / 3.0;
+const REMOTE_AVATAR_RUN_SPEED_THRESHOLD: f32 = 0.15;
+const REMOTE_AVATAR_IDLE_DELAY_SECS: f32 = 0.35;
+const REMOTE_AVATAR_DANCE_DELAY_SECS: f32 = 5.0;
 const AUTH_STATUS_CHECKING: &str = "Checking your sign-in session...";
 const AUTH_STATUS_SIGNED_OUT: &str = "Sign in with SSO, or continue as a guest.";
 
@@ -90,11 +92,46 @@ struct AuthUser {
     avatar_selection: Option<PlayerAvatarSelection>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PlayerAvatarSelection {
     idle_model_url: Option<String>,
     run_model_url: Option<String>,
     dance_model_url: Option<String>,
+}
+
+impl PlayerAvatarSelection {
+    fn idle_url(&self) -> Option<&str> {
+        self.idle_model_url.as_deref().map(str::trim).filter(|url| !url.is_empty())
+    }
+
+    fn run_url(&self) -> Option<&str> {
+        self.run_model_url.as_deref().map(str::trim).filter(|url| !url.is_empty())
+    }
+
+    fn dance_url(&self) -> Option<&str> {
+        self.dance_model_url.as_deref().map(str::trim).filter(|url| !url.is_empty())
+    }
+
+    fn first_available_url(&self) -> Option<&str> {
+        self.idle_url().or_else(|| self.run_url()).or_else(|| self.dance_url())
+    }
+
+    fn url_for_animation(&self, animation: RemoteAvatarAnimation) -> Option<&str> {
+        match animation {
+            RemoteAvatarAnimation::Idle => self
+                .idle_url()
+                .or_else(|| self.run_url())
+                .or_else(|| self.dance_url()),
+            RemoteAvatarAnimation::Run => self
+                .run_url()
+                .or_else(|| self.idle_url())
+                .or_else(|| self.dance_url()),
+            RemoteAvatarAnimation::Dance => self
+                .dance_url()
+                .or_else(|| self.idle_url())
+                .or_else(|| self.run_url()),
+        }
+    }
 }
 
 impl AuthUser {
@@ -188,6 +225,32 @@ enum AnimationProperty {
 enum AnimationOutputs {
     Vec3(Vec<Vec3>),
     Quat(Vec<Quat>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteAvatarAnimation {
+    Idle,
+    Run,
+    Dance,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteAvatarPlaybackState {
+    animation: RemoteAvatarAnimation,
+    playback_time: f32,
+    time_since_motion: f32,
+    active_url: Option<String>,
+}
+
+impl Default for RemoteAvatarPlaybackState {
+    fn default() -> Self {
+        Self {
+            animation: RemoteAvatarAnimation::Idle,
+            playback_time: 0.0,
+            time_since_motion: 0.0,
+            active_url: None,
+        }
+    }
 }
 
 thread_local! {
@@ -341,9 +404,10 @@ struct WebApp {
     selected_hotbar: usize,
     player_id: Option<u64>,
     remote_players: HashMap<u64, [f32; 3]>,
+    remote_player_velocities: HashMap<u64, [f32; 3]>,
     remote_player_yaws: HashMap<u64, f32>,
-    remote_player_stationary_model_urls: HashMap<u64, Option<String>>,
-    remote_player_animation_times: HashMap<u64, f32>,
+    remote_player_avatar_selections: HashMap<u64, PlayerAvatarSelection>,
+    remote_player_avatar_states: HashMap<u64, RemoteAvatarPlaybackState>,
     remote_media: HashMap<u64, RemotePeerMedia>,
     remote_avatar_assets: HashMap<String, RemoteAvatarAsset>,
     pending_remote_avatar_urls: HashSet<String>,
@@ -452,9 +516,10 @@ impl WebApp {
             selected_hotbar: 0,
             player_id: None,
             remote_players: HashMap::new(),
+            remote_player_velocities: HashMap::new(),
             remote_player_yaws: HashMap::new(),
-            remote_player_stationary_model_urls: HashMap::new(),
-            remote_player_animation_times: HashMap::new(),
+            remote_player_avatar_selections: HashMap::new(),
+            remote_player_avatar_states: HashMap::new(),
             remote_media: HashMap::new(),
             remote_avatar_assets: HashMap::new(),
             pending_remote_avatar_urls: HashSet::new(),
@@ -724,9 +789,10 @@ impl WebApp {
                             self.login_request_sent = false;
                             self.player_id = None;
                             self.remote_players.clear();
+                            self.remote_player_velocities.clear();
                             self.remote_player_yaws.clear();
-                            self.remote_player_stationary_model_urls.clear();
-                            self.remote_player_animation_times.clear();
+                            self.remote_player_avatar_selections.clear();
+                            self.remote_player_avatar_states.clear();
                             self.remote_media.clear();
                             self.remote_avatar_assets.clear();
                             self.pending_remote_avatar_urls.clear();
@@ -752,9 +818,10 @@ impl WebApp {
                             self.player_id = Some(response.player_id);
                             self.pending_network_events.clear();
                             self.remote_players.clear();
+                            self.remote_player_velocities.clear();
                             self.remote_player_yaws.clear();
-                            self.remote_player_stationary_model_urls.clear();
-                            self.remote_player_animation_times.clear();
+                            self.remote_player_avatar_selections.clear();
+                            self.remote_player_avatar_states.clear();
                             self.remote_media.clear();
                             self.remote_avatar_assets.clear();
                             self.pending_remote_avatar_urls.clear();
@@ -826,17 +893,29 @@ impl WebApp {
                     ServerMessage::PlayerStateSnapshot(snapshot) => {
                         if Some(snapshot.player_id) != self.player_id {
                             self.remote_players.insert(snapshot.player_id, snapshot.position);
+                            self.remote_player_velocities
+                                .insert(snapshot.player_id, snapshot.velocity);
                             self.remote_player_yaws.insert(snapshot.player_id, snapshot.yaw);
-                            self.remote_player_stationary_model_urls.insert(
-                                snapshot.player_id,
-                                snapshot.stationary_model_url.clone(),
-                            );
-                            self.remote_player_animation_times
+                            let selection = PlayerAvatarSelection {
+                                idle_model_url: snapshot.idle_model_url.clone(),
+                                run_model_url: snapshot.run_model_url.clone(),
+                                dance_model_url: snapshot.dance_model_url.clone(),
+                            };
+                            let selection_changed = self
+                                .remote_player_avatar_selections
+                                .get(&snapshot.player_id)
+                                .map(|existing| existing != &selection)
+                                .unwrap_or(true);
+                            self.remote_player_avatar_selections
+                                .insert(snapshot.player_id, selection.clone());
+                            let state = self
+                                .remote_player_avatar_states
                                 .entry(snapshot.player_id)
-                                .or_insert(0.0);
-                            self.ensure_remote_avatar_requested(
-                                snapshot.stationary_model_url.as_deref(),
-                            );
+                                .or_default();
+                            if selection_changed {
+                                state.active_url = None;
+                            }
+                            self.ensure_remote_avatar_selection_requested(&selection);
                             self.ensure_peer_connection(snapshot.player_id);
                         }
                     }
@@ -857,9 +936,10 @@ impl WebApp {
                     self.player_id = None;
                     self.pending_network_events.clear();
                     self.remote_players.clear();
+                    self.remote_player_velocities.clear();
                     self.remote_player_yaws.clear();
-                    self.remote_player_stationary_model_urls.clear();
-                    self.remote_player_animation_times.clear();
+                    self.remote_player_avatar_selections.clear();
+                    self.remote_player_avatar_states.clear();
                     self.remote_media.clear();
                     self.remote_avatar_assets.clear();
                     self.pending_remote_avatar_urls.clear();
@@ -982,10 +1062,18 @@ impl WebApp {
 
         self.send_client_message(&ClientMessage::LoginRequest(LoginRequest {
             name: user.display_name(),
-            stationary_model_url: user
+            idle_model_url: user
                 .avatar_selection
                 .as_ref()
                 .and_then(|selection| selection.idle_model_url.clone()),
+            run_model_url: user
+                .avatar_selection
+                .as_ref()
+                .and_then(|selection| selection.run_model_url.clone()),
+            dance_model_url: user
+                .avatar_selection
+                .as_ref()
+                .and_then(|selection| selection.dance_model_url.clone()),
         }));
         self.login_request_sent = true;
     }
@@ -1022,17 +1110,7 @@ impl WebApp {
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
         let dt_secs = dt.as_secs_f32();
-        for (player_id, playback_time) in &mut self.remote_player_animation_times {
-            let maybe_duration = self
-                .remote_player_stationary_model_urls
-                .get(player_id)
-                .and_then(|value| value.as_ref())
-                .and_then(|url| self.remote_avatar_assets.get(url))
-                .map(|asset| asset.animation.duration_seconds);
-            if let Some(duration) = maybe_duration.filter(|duration| *duration > 0.0) {
-                *playback_time = (*playback_time + dt_secs) % duration;
-            }
-        }
+        self.update_remote_avatar_playback(dt_secs);
 
         let mut movement = Vec3::ZERO;
         if self.pressed.contains(&KeyCode::KeyW) {
@@ -1223,9 +1301,7 @@ impl WebApp {
         let mut indices = Vec::new();
         for (&player_id, position) in &self.remote_players {
             if self
-                .remote_player_stationary_model_urls
-                .get(&player_id)
-                .and_then(|url| url.as_ref())
+                .current_remote_avatar_url(player_id)
                 .is_some_and(|url| self.remote_avatar_assets.contains_key(url))
             {
                 continue;
@@ -1251,11 +1327,7 @@ impl WebApp {
     fn build_remote_avatar_meshes(&self, renderer: &Renderer<'_>) -> Vec<AnimatedMeshDraw<'_>> {
         let mut meshes = Vec::new();
         for (&player_id, position) in &self.remote_players {
-            let Some(url) = self
-                .remote_player_stationary_model_urls
-                .get(&player_id)
-                .and_then(|value| value.as_ref())
-            else {
+            let Some(url) = self.current_remote_avatar_url(player_id) else {
                 continue;
             };
             let Some(asset) = self.remote_avatar_assets.get(url) else {
@@ -1263,15 +1335,91 @@ impl WebApp {
             };
             let anchor = player_anchor_from_eye(Vec3::new(position[0], position[1], position[2]));
             let yaw = *self.remote_player_yaws.get(&player_id).unwrap_or(&0.0);
-            let playback_time = *self.remote_player_animation_times.get(&player_id).unwrap_or(&0.0);
+            let playback_time = self
+                .remote_player_avatar_states
+                .get(&player_id)
+                .map(|state| state.playback_time)
+                .unwrap_or(0.0);
             let model =
                 Mat4::from_translation(anchor.body)
-                    * Mat4::from_rotation_y(-yaw)
+                    * Mat4::from_rotation_y(yaw)
                     * asset.model_normalization;
             let joints = evaluate_avatar_skin_matrices(asset, playback_time);
             meshes.push(renderer.create_animated_draw(&asset.mesh, model, &joints));
         }
         meshes
+    }
+
+    fn current_remote_avatar_url(&self, player_id: u64) -> Option<&str> {
+        let selection = self.remote_player_avatar_selections.get(&player_id)?;
+        let animation = self
+            .remote_player_avatar_states
+            .get(&player_id)
+            .map(|state| state.animation)
+            .unwrap_or(RemoteAvatarAnimation::Idle);
+        selection
+            .url_for_animation(animation)
+            .or_else(|| selection.first_available_url())
+    }
+
+    fn update_remote_avatar_playback(&mut self, dt_secs: f32) {
+        let remote_player_ids = self.remote_players.keys().copied().collect::<Vec<_>>();
+        for player_id in remote_player_ids {
+            let selection = self
+                .remote_player_avatar_selections
+                .get(&player_id)
+                .cloned()
+                .unwrap_or_default();
+            let speed = self
+                .remote_player_velocities
+                .get(&player_id)
+                .map(|velocity| velocity[0].hypot(velocity[2]))
+                .unwrap_or(0.0);
+            let moving = speed > REMOTE_AVATAR_RUN_SPEED_THRESHOLD;
+
+            let state = self
+                .remote_player_avatar_states
+                .entry(player_id)
+                .or_default();
+            if moving {
+                state.time_since_motion = 0.0;
+            } else {
+                state.time_since_motion += dt_secs;
+            }
+
+            let desired_animation = if moving {
+                RemoteAvatarAnimation::Run
+            } else if state.time_since_motion >= REMOTE_AVATAR_DANCE_DELAY_SECS {
+                RemoteAvatarAnimation::Dance
+            } else if state.time_since_motion >= REMOTE_AVATAR_IDLE_DELAY_SECS
+                || state.animation != RemoteAvatarAnimation::Run
+            {
+                RemoteAvatarAnimation::Idle
+            } else {
+                RemoteAvatarAnimation::Run
+            };
+
+            let active_url = selection
+                .url_for_animation(desired_animation)
+                .or_else(|| selection.first_available_url())
+                .map(str::to_owned);
+            if state.animation != desired_animation || state.active_url != active_url {
+                state.animation = desired_animation;
+                state.active_url = active_url.clone();
+                state.playback_time = 0.0;
+            }
+
+            let maybe_duration = active_url
+                .as_deref()
+                .and_then(|url| self.remote_avatar_assets.get(url))
+                .map(|asset| asset.animation.duration_seconds);
+            if let Some(duration) = maybe_duration.filter(|duration| *duration > 0.0) {
+                state.playback_time = (state.playback_time + dt_secs) % duration;
+            }
+        }
+
+        self.remote_player_avatar_states
+            .retain(|player_id, _| self.remote_players.contains_key(player_id));
     }
 
     fn ensure_remote_avatar_requested(&mut self, maybe_url: Option<&str>) {
@@ -1286,6 +1434,12 @@ impl WebApp {
 
         self.pending_remote_avatar_urls.insert(url.to_string());
         request_remote_avatar_model(url.to_string(), self.remote_avatar_tx.clone());
+    }
+
+    fn ensure_remote_avatar_selection_requested(&mut self, selection: &PlayerAvatarSelection) {
+        self.ensure_remote_avatar_requested(selection.idle_url());
+        self.ensure_remote_avatar_requested(selection.run_url());
+        self.ensure_remote_avatar_requested(selection.dance_url());
     }
 
     fn build_remote_media_placeholder_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
@@ -3693,8 +3847,7 @@ fn skin_vertex_position(
 }
 
 fn build_remote_avatar_normalization((min, max): (Vec3, Vec3)) -> Mat4 {
-    let import_rotation = Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-    let rotated_corners = [
+    let normalized_corners = [
         Vec3::new(min.x, min.y, min.z),
         Vec3::new(min.x, min.y, max.z),
         Vec3::new(min.x, max.y, min.z),
@@ -3704,26 +3857,22 @@ fn build_remote_avatar_normalization((min, max): (Vec3, Vec3)) -> Mat4 {
         Vec3::new(max.x, max.y, min.z),
         Vec3::new(max.x, max.y, max.z),
     ]
-    .into_iter()
-    .map(|corner| import_rotation.transform_point3(corner))
-    .collect::<Vec<_>>();
-    let mut rotated_min = rotated_corners[0];
-    let mut rotated_max = rotated_corners[0];
-    for corner in &rotated_corners[1..] {
-        rotated_min = rotated_min.min(*corner);
-        rotated_max = rotated_max.max(*corner);
+    .to_vec();
+    let mut normalized_min = normalized_corners[0];
+    let mut normalized_max = normalized_corners[0];
+    for corner in &normalized_corners[1..] {
+        normalized_min = normalized_min.min(*corner);
+        normalized_max = normalized_max.max(*corner);
     }
 
-    let scale =
-        (PLAYER_HEIGHT * REMOTE_AVATAR_SCALE_FACTOR) / (rotated_max.y - rotated_min.y).max(0.001);
-    let center_x = (rotated_min.x + rotated_max.x) * 0.5;
-    let center_z = (rotated_min.z + rotated_max.z) * 0.5;
+    let scale = PLAYER_HEIGHT / (normalized_max.y - normalized_min.y).max(0.001);
+    let center_x = (normalized_min.x + normalized_max.x) * 0.5;
+    let center_z = (normalized_min.z + normalized_max.z) * 0.5;
     Mat4::from_translation(Vec3::new(
         -center_x * scale,
-        -rotated_min.y * scale,
+        -normalized_min.y * scale,
         -center_z * scale,
     )) * Mat4::from_scale(Vec3::splat(scale))
-        * import_rotation
 }
 
 fn evaluate_avatar_skin_matrices(asset: &RemoteAvatarAsset, playback_time: f32) -> Vec<Mat4> {

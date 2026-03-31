@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { isSupportedProvider, redirectToProviderSignin } from "@/src/lib/auth-compat";
+import { isSupportedProvider, startProviderSignin } from "@/src/lib/auth-compat";
 
 type RouteContext = {
   params: Promise<{
@@ -13,5 +13,5 @@ export async function GET(request: NextRequest, context: RouteContext) {
     return NextResponse.json({ error: "UNKNOWN_PROVIDER" }, { status: 404 });
   }
 
-  return redirectToProviderSignin(request, provider);
+  return startProviderSignin(request, provider);
 }

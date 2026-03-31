@@ -31,6 +31,8 @@ const repoRoot = path.resolve(process.cwd(), "../..");
 export const webBaseUrl = normalizeBaseUrl(
   process.env.WEB_BASE_URL ?? process.env.NEXTAUTH_URL ?? "http://localhost:3000",
 );
+process.env.AUTH_URL ??= webBaseUrl;
+process.env.NEXTAUTH_URL ??= webBaseUrl;
 export const webOrigin = (() => {
   try {
     return new URL(webBaseUrl).origin;

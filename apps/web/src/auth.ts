@@ -70,7 +70,6 @@ if (appleClientId && resolvedAppleClientSecret) {
 export const { auth, handlers, signIn, signOut } = NextAuth({
   trustHost: true,
   secret: authSecret,
-  redirectProxyUrl: `${webBaseUrl}/api/v1/auth`,
   session: {
     strategy: "jwt",
     maxAge: sessionTtlSeconds,

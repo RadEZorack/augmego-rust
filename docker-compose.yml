@@ -34,27 +34,15 @@ services:
       COOKIE_SECURE: "false"
       WORLD_STORAGE_PROVIDER: local
       WORLD_STORAGE_ROOT: ../../storage/world-assets
+      GAME_WORLD_ROOT: ../../storage/world-ts
+      GAME_WORLD_SEED: "2792211969"
+      GAME_VIEW_RADIUS: "4"
+      GAME_WS_HEARTBEAT_MS: "15000"
     ports:
       - "3001:3000"
     volumes:
       - next-storage:/app/storage
 
-  voxel-backend:
-    build:
-      context: .
-      dockerfile: backend/Dockerfile
-    restart: unless-stopped
-    environment:
-      BACKEND_BIND_ADDR: 0.0.0.0:4000
-      BACKEND_WS_BIND_ADDR: 0.0.0.0:4001
-      BACKEND_SAVE_PATH: /data/world
-    ports:
-      - "4000:4000"
-      - "4001:4001"
-    volumes:
-      - world-data:/data/world
-
 volumes:
   postgres-data:
   next-storage:
-  world-data:

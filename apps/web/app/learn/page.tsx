@@ -16,7 +16,7 @@ export default function LearnPage() {
           <h3>Player Guides</h3>
           <p>
             Explain controls, world rules, and progression without mixing those
-            concerns into the Rust/WASM client bundle.
+            concerns into a separate native client or toolchain.
           </p>
         </article>
         <article className="card">

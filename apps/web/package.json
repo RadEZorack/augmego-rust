@@ -3,31 +3,40 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev --hostname 0.0.0.0 --port 3000",
-    "build": "next build",
-    "start": "next start --hostname 0.0.0.0 --port 3000",
+    "dev": "NODE_ENV=development node --import tsx server.ts",
+    "build": "next build && node -e \"const fs=require('node:fs'); const path=require('node:path'); const file=path.join('.next','BUILD_ID'); if(!fs.existsSync(file)){fs.writeFileSync(file, Date.now().toString(36));}\"",
+    "start": "NODE_ENV=production node --import tsx server.ts",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
     "prisma:generate": "prisma generate --schema ../../prisma/schema.prisma",
     "prisma:migrate:deploy": "prisma migrate deploy --schema ../../prisma/schema.prisma",
-    "game:watch": "env -u NO_COLOR trunk watch --config ../../game-web/Trunk.toml",
-    "game:build": "env -u NO_COLOR trunk build --config ../../game-web/Trunk.toml --release",
     "postinstall": "npm run prisma:generate"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.888.0",
     "@aws-sdk/s3-request-presigner": "^3.888.0",
     "@prisma/client": "^5.20.0",
+    "@react-three/fiber": "^9.1.2",
     "@types/jsonwebtoken": "^9.0.10",
     "jsonwebtoken": "^9.0.2",
+    "msgpackr": "^1.11.2",
     "next": "^15.0.0",
     "next-auth": "beta",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "three": "^0.179.1",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.54.2",
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.2",
     "@types/react-dom": "^19.0.2",
+    "@types/three": "^0.179.0",
+    "@types/ws": "^8.5.13",
     "prisma": "^5.20.0",
+    "tsx": "^4.19.4",
+    "vitest": "^2.1.8",
     "typescript": "^5.7.2"
   }
 }

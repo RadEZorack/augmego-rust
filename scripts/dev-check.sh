@@ -20,7 +20,7 @@ echo
 echo "Checking local service endpoints..."
 check_url "next api health" "http://127.0.0.1:3000/api/v1/health"
 check_url "next web app" "http://127.0.0.1:3000/"
-check_url "play bundle" "http://127.0.0.1:3000/play/index.html"
+check_url "play route" "http://127.0.0.1:3000/play"
 
 echo
 echo "Checking local HTTPS dev host..."
@@ -41,5 +41,3 @@ fi
 echo
 echo "Expected local commands:"
 echo "  cd $ROOT_DIR/apps/web && npm install && npm run dev"
-echo "  cd $ROOT_DIR && BACKEND_BIND_ADDR=0.0.0.0:4000 BACKEND_WS_BIND_ADDR=0.0.0.0:4001 cargo run -p backend"
-echo "  cd $ROOT_DIR/apps/web && npm run game:watch"

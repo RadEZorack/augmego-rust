@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Augmego",
-  description: "Next.js shell for the Augmego Rust voxel world.",
+  description: "Next.js shell for the Augmego TypeScript voxel world.",
 };
 
 export default function RootLayout({

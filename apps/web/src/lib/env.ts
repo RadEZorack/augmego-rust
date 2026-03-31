@@ -90,6 +90,26 @@ export const worldStorageRoot = process.env.WORLD_STORAGE_ROOT
 export const playerAvatarCacheControl =
   process.env.PLAYER_AVATAR_CACHE_CONTROL ?? "public, max-age=31536000, immutable";
 
+export const gameWorldRoot = process.env.GAME_WORLD_ROOT
+  ? path.resolve(process.cwd(), process.env.GAME_WORLD_ROOT)
+  : path.resolve(repoRoot, "storage", "world-ts");
+export const gameWorldSeed = (() => {
+  const raw = process.env.GAME_WORLD_SEED;
+  if (!raw) {
+    return 0xa66de601;
+  }
+
+  if (/^0x/i.test(raw)) {
+    const parsed = Number.parseInt(raw, 16);
+    return Number.isFinite(parsed) ? parsed : 0xa66de601;
+  }
+
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? Math.trunc(parsed) : 0xa66de601;
+})();
+export const gameViewRadius = toPositiveInteger(process.env.GAME_VIEW_RADIUS, 4);
+export const gameWsHeartbeatMs = toPositiveInteger(process.env.GAME_WS_HEARTBEAT_MS, 15_000);
+
 export function resolveAppleClientSecret() {
   if (appleClientSecret) {
     return appleClientSecret;

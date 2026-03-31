@@ -17,13 +17,6 @@ Run these in separate terminals:
    npm install
    npm run dev
 
-2. Rust voxel backend
-   BACKEND_BIND_ADDR=0.0.0.0:4000 BACKEND_WS_BIND_ADDR=0.0.0.0:4001 cargo run -p backend
-
-3. Rust/WASM game bundle watch
-   cd apps/web
-   npm run game:watch
-
 Then open:
   https://dev.augmego.ca
 

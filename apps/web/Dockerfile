@@ -1,26 +1,3 @@
-FROM rust:1.88-bookworm AS wasm-builder
-
-WORKDIR /app
-
-RUN rustup target add wasm32-unknown-unknown
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git/db \
-    cargo install --locked trunk
-
-COPY Cargo.toml Cargo.lock ./
-COPY assets ./assets
-COPY game-web ./game-web
-COPY shared_math ./shared_math
-COPY shared_protocol ./shared_protocol
-COPY shared_world ./shared_world
-COPY wgpu-lite ./wgpu-lite
-COPY apps/web ./apps/web
-
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git/db \
-    --mount=type=cache,target=/app/target \
-    trunk build --config game-web/Trunk.toml --release
-
 FROM node:22-bookworm AS web-builder
 
 WORKDIR /app/apps/web
@@ -32,7 +9,6 @@ COPY prisma /app/prisma
 RUN npm ci
 
 COPY apps/web ./
-COPY --from=wasm-builder /app/apps/web/public/play ./public/play
 
 RUN npm run build
 
@@ -53,6 +29,10 @@ COPY --from=web-builder /app/apps/web/public ./public
 COPY --from=web-builder /app/apps/web/package.json ./package.json
 COPY --from=web-builder /app/apps/web/node_modules ./node_modules
 COPY --from=web-builder /app/apps/web/next.config.ts ./next.config.ts
+COPY --from=web-builder /app/apps/web/server.ts ./server.ts
+COPY --from=web-builder /app/apps/web/src ./src
+COPY --from=web-builder /app/apps/web/tsconfig.json ./tsconfig.json
+COPY --from=web-builder /app/apps/web/next-env.d.ts ./next-env.d.ts
 
 EXPOSE 3000
 

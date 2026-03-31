@@ -8,11 +8,11 @@ export default async function HomePage() {
     <main className="shell">
       <section className="hero">
         <p className="eyebrow">Augmego Web</p>
-        <h1>One web shell. One Rust world.</h1>
+        <h1>One web shell. One TypeScript world.</h1>
         <p>
-          Next.js now owns the browser-facing app surface for sign-in, content,
-          and learning material. The Rust voxel server still handles the
-          authoritative shared world and realtime transport.
+          Next.js now owns the browser-facing app surface, the voxel simulation,
+          and the realtime websocket server. The A/B experiment now runs the
+          world loop directly in TypeScript and React.
         </p>
         <div className="actions">
           <Link className="button primary" href="/play">
@@ -33,8 +33,8 @@ export default async function HomePage() {
         <article className="card">
           <h2>Game Route</h2>
           <p>
-            The Rust/WASM client is built by Trunk into <code>/play</code> and
-            served through the same Next.js origin as the rest of the product.
+            The voxel client now renders natively inside React on{" "}
+            <code>/play</code> instead of redirecting to a generated WASM bundle.
           </p>
           <span className="meta">/play</span>
         </article>
@@ -50,9 +50,8 @@ export default async function HomePage() {
         <article className="card">
           <h2>Unified Origin</h2>
           <p>
-            Browser pages, API routes, and the game shell now share the same
-            host. Only the authoritative voxel socket stays separate at{" "}
-            <code>/ws</code>.
+            Browser pages, API routes, and the authoritative websocket transport
+            now run from the same Next.js server.
           </p>
           <span className="meta">/ws</span>
         </article>

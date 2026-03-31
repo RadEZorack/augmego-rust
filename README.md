@@ -1,128 +1,138 @@
-# Augmego Rust Voxel Sandbox
+# Augmego Web + Rust Voxel Stack
 
-An MMO-oriented Minecraft-style voxel sandbox prototype in Rust.
+Augmego now runs as a two-runtime system:
+
+- `apps/web`: Next.js app for browser-facing pages, auth, API routes, and the `/play` shell
+- `backend`: authoritative Rust voxel server for world simulation and realtime websocket transport
+
+The Rust `game-web` client is still the game client, but it is no longer treated as a separate deployed frontend service. Trunk builds it into `apps/web/public/play`, and Next serves it on the same origin.
 
 ## Workspace Layout
 
-- `backend`: authoritative world server with chunk generation, persistence, and TCP protocol handling
-- `game`: desktop client with chunk cache, meshing, networking, camera controls, and lightweight rendering
+- `apps/web`: Next.js App Router app, Auth.js integration, Prisma-backed web APIs
+- `backend`: Rust authoritative voxel backend and websocket server
+- `game-web`: Rust/WASM client bundle built by Trunk into `apps/web/public/play`
+- `prisma`: shared Prisma schema and migrations for the web/auth data model
 - `shared_math`: voxel/world coordinate math and helpers
-- `shared_world`: chunk storage, palette compression, world serialization, and terrain generation
-- `shared_content`: block definitions and starter crafting recipes
+- `shared_world`: chunk storage, palette compression, world serialization, terrain generation
 - `shared_protocol`: binary client/server protocol
-- `wgpu-lite`: small local rendering wrapper over `wgpu`
+- `shared_content`: block definitions and starter crafting recipes
+- `wgpu-lite`: local rendering wrapper over `wgpu`
+- `bun-backend`: legacy Bun service kept as reference while migration finishes
 
 ## Local Dev
 
-Use native commands for day-to-day development and keep Docker for infrastructure only.
-
-Quick start:
+Start local infrastructure:
 
 ```bash
 ./scripts/dev-up.sh
 ```
 
-Start Postgres:
+That brings up:
+
+- Postgres on `localhost:5432`
+- the local HTTPS reverse proxy for `https://dev.augmego.ca`
+
+Then run these in separate terminals:
 
 ```bash
-docker compose -f docker-compose.dev.yml up -d postgres
+cd apps/web
+npm install
+npm run dev
 ```
-
-Start the local HTTPS reverse proxy for `https://dev.augmego.ca`:
-
-```bash
-docker compose -f docker-compose.dev.yml up -d dev-proxy
-```
-
-Start the Bun API from [`bun-backend`](/Users/travismiller/Documents/augmego-rust/bun-backend):
-
-```bash
-bun install
-bun run db:generate
-bun run dev
-```
-
-The Bun API now respects `HOST` or `BUN_HOST`. For the local HTTPS proxy flow, use `HOST="0.0.0.0"` in your Bun env.
-
-Start the Rust voxel backend:
 
 ```bash
 BACKEND_BIND_ADDR=0.0.0.0:4000 BACKEND_WS_BIND_ADDR=0.0.0.0:4001 cargo run -p backend
 ```
 
-Start the web client:
-
 ```bash
-cd game-web
-trunk serve --address 0.0.0.0 --port 3002 --open --no-autoreload
+cd apps/web
+npm run game:watch
 ```
 
-Then open `https://dev.augmego.ca`.
+Then open:
 
-Local dev now works like this:
+```text
+https://dev.augmego.ca
+```
+
+The local flow now works like this:
 
 - nginx in Docker terminates HTTPS for `dev.augmego.ca`
-- `/` proxies to local `trunk serve` on `http://127.0.0.1:3002`
-- `/api/*` proxies to local Bun on `http://127.0.0.1:3000`
-- `/ws` proxies to local voxel WebSocket on `ws://127.0.0.1:4001`
+- `/` proxies to local Next.js on `http://127.0.0.1:3000`
+- `/api/*` proxies to local Next.js on `http://127.0.0.1:3000`
+- `/ws` proxies to the Rust voxel websocket on `ws://127.0.0.1:4001`
 
-`--no-autoreload` is recommended here because Trunk's live-reload websocket can behave badly when the dev server is being fronted by a separate HTTPS nginx proxy.
+The Rust/WASM bundle is served by Next from `apps/web/public/play`. `npm run game:watch` keeps that bundle fresh while `next dev` serves it on `/play`.
 
-Before this works, you need:
+Before local HTTPS works, you still need:
 
 1. A hosts entry:
    `127.0.0.1 dev.augmego.ca`
-2. Local TLS certs at [`dev-proxy/README.md`](/Users/travismiller/Documents/augmego-rust/dev-proxy/README.md)
-3. Bun auth env values matching:
-   `WEB_BASE_URL="https://dev.augmego.ca"`
-   `WEB_ORIGINS="https://dev.augmego.ca"`
+2. Local TLS certs as described in `dev-proxy/README.md`
+3. Web env values in `apps/web/.env.example`
 
-Use [`bun-backend/.env.example`](/Users/travismiller/Documents/augmego-rust/bun-backend/.env.example) as the starting point for the SSO callback URLs and cookie settings.
-
-You can sanity-check the local setup with:
+You can sanity-check the setup with:
 
 ```bash
 ./scripts/dev-check.sh
 ```
 
+## Prisma
+
+Prisma ownership now lives at the repo root:
+
+- schema: `prisma/schema.prisma`
+- migrations: `prisma/migrations/*`
+
+The Next app generates its client from that shared schema:
+
+```bash
+cd apps/web
+npm run prisma:generate
+```
+
+The legacy Bun service can still be pointed at the same schema with its updated scripts, but it is no longer part of the default runtime path.
+
+## Game Route
+
+The canonical browser entrypoint for the Rust/WASM client is now:
+
+```text
+/play
+```
+
+Next redirects `/play` to the generated Trunk bundle at `/play/index.html`, and Trunk emits all related assets under `/play/*`.
+
 ## Docker Compose
 
-Bring up the browser client, Bun API, Rust voxel server, and Postgres together:
+The production-oriented compose stack is now:
+
+- `postgres`
+- `next-web`
+- `voxel-backend`
+
+Bring it up with:
 
 ```bash
 docker compose up --build
 ```
 
-Then open `http://localhost:3001`.
+Then open:
+
+```text
+http://localhost:3001
+```
 
 Published ports:
 
-- `3001`: web client
-- `3000`: Bun auth/API server
+- `3001`: Next.js app
 - `4000`: Rust TCP backend
-- `4001`: Rust WebSocket backend
+- `4001`: Rust websocket backend
 - `5432`: Postgres
 
-The compose stack uses local Docker volumes for Postgres data, Bun storage, and voxel world persistence. OAuth providers are optional; if you want Google/Apple/LinkedIn login to work, add the corresponding credentials to the `bun-backend` service environment in [`docker-compose.yml`](/Users/travismiller/Documents/augmego-rust/docker-compose.yml).
-This is the production-oriented stack. It builds the release web bundle with `trunk build --release` and serves it through nginx on `http://localhost:3001`.
+## Compatibility Notes
 
-## Current Slice
-
-- authoritative seeded terrain generation on the backend
-- region-organized chunk persistence to `world/`
-- binary handshake/login/chunk streaming protocol
-- client chunk ingestion and per-chunk mesh generation
-- first-person fly camera with streamed voxel terrain rendering
-
-## Next High-Value Steps
-
-- delta replication for block edits and shared multiplayer visibility
-- async mesh jobs and transparent/opaque mesh separation
-- inventories, crafting interactions, storage blocks, and hotbar UI
-- richer biomes, landmarks, weather, and traversal tools
-
-
-docker compose -f docker-compose.dev.yml up -d postgres dev-proxy
-cd bun-backend && bun install && bun run db:generate && bun run dev
-BACKEND_BIND_ADDR=0.0.0.0:4000 BACKEND_WS_BIND_ADDR=0.0.0.0:4001 cargo run -p backend
-cd game-web && trunk serve --address 0.0.0.0 --port 3002 --open
+- The Rust client still talks to `/api/v1/auth/*`, so the multiplayer login flow does not need a client-side API rewrite.
+- `/ws` remains the authoritative realtime websocket endpoint owned by the Rust backend.
+- `bun-backend` is intentionally left in the repo as a legacy reference, but it is deprecated for normal dev and deploy flows.

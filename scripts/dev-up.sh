@@ -12,18 +12,17 @@ Infrastructure is up.
 
 Run these in separate terminals:
 
-1. Bun API
-   cd bun-backend
-   bun install
-   bun run db:generate
-   bun run dev
+1. Next.js app
+   cd apps/web
+   npm install
+   npm run dev
 
 2. Rust voxel backend
    BACKEND_BIND_ADDR=0.0.0.0:4000 BACKEND_WS_BIND_ADDR=0.0.0.0:4001 cargo run -p backend
 
-3. Web client
-   cd game-web
-   trunk serve --address 0.0.0.0 --port 3002 --open --no-autoreload
+3. Rust/WASM game bundle watch
+   cd apps/web
+   npm run game:watch
 
 Then open:
   https://dev.augmego.ca

@@ -6,9 +6,9 @@
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "start": "bun src/index.ts",
-    "prisma": "prisma",
-    "db:generate": "prisma generate",
-    "db:migrate": "prisma migrate deploy"
+    "prisma": "prisma --schema ../prisma/schema.prisma",
+    "db:generate": "prisma generate --schema ../prisma/schema.prisma",
+    "db:migrate": "prisma migrate deploy --schema ../prisma/schema.prisma"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.888.0",

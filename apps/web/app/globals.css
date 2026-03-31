@@ -1,0 +1,137 @@
+:root {
+  color-scheme: light;
+  --sand: #f4efe6;
+  --stone: #1b1b1d;
+  --fog: #5d6f81;
+  --sky: #d6eef8;
+  --pine: #204f41;
+  --gold: #e1a93f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background:
+    radial-gradient(circle at top, rgba(214, 238, 248, 0.95), rgba(214, 238, 248, 0) 38%),
+    linear-gradient(180deg, #f4efe6 0%, #efe6d7 100%);
+  color: var(--stone);
+  font-family: Georgia, "Times New Roman", serif;
+}
+
+body {
+  min-height: 100vh;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.shell {
+  width: min(1100px, calc(100vw - 32px));
+  margin: 0 auto;
+}
+
+.hero {
+  padding: 72px 0 36px;
+}
+
+.eyebrow {
+  margin: 0 0 12px;
+  font: 700 12px/1.2 "Courier New", monospace;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--pine);
+}
+
+.hero h1 {
+  margin: 0;
+  max-width: 11ch;
+  font-size: clamp(3rem, 8vw, 5.8rem);
+  line-height: 0.95;
+}
+
+.hero p {
+  max-width: 60ch;
+  margin: 20px 0 0;
+  color: var(--fog);
+  font-size: 1.05rem;
+  line-height: 1.7;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 28px;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 52px;
+  padding: 0 18px;
+  border-radius: 999px;
+  border: 1px solid rgba(27, 27, 29, 0.12);
+  background: rgba(255, 255, 255, 0.62);
+  backdrop-filter: blur(14px);
+  font: 600 0.95rem/1.2 "Helvetica Neue", Arial, sans-serif;
+}
+
+.button.primary {
+  background: linear-gradient(180deg, #24584a 0%, #193c33 100%);
+  color: white;
+  border-color: transparent;
+}
+
+.cards {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  padding-bottom: 64px;
+}
+
+.card {
+  padding: 22px;
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.68);
+  border: 1px solid rgba(27, 27, 29, 0.08);
+  box-shadow: 0 24px 60px rgba(39, 45, 61, 0.08);
+  backdrop-filter: blur(14px);
+}
+
+.card h2,
+.card h3 {
+  margin: 0 0 10px;
+  font-size: 1.15rem;
+}
+
+.card p {
+  margin: 0;
+  color: var(--fog);
+  font: 400 0.98rem/1.65 "Helvetica Neue", Arial, sans-serif;
+}
+
+.meta {
+  display: inline-flex;
+  align-items: center;
+  margin-top: 16px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(225, 169, 63, 0.14);
+  color: #7d5412;
+  font: 700 12px/1 "Courier New", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.section-title {
+  margin: 0 0 18px;
+  font-size: 1.8rem;
+}

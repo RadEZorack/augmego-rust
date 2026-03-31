@@ -2688,7 +2688,7 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
         "margin:0 0 18px 0;color:rgba(230,237,243,0.78);font-size:15px;line-height:1.5;",
     );
     body_copy.set_text_content(Some(
-        "Use the existing Bun auth service to sign in before the web client joins multiplayer.",
+        "Sign in with the web account flow before the game client joins multiplayer.",
     ));
     let _ = card.append_child(&body_copy);
 

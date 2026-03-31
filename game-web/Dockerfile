@@ -21,6 +21,7 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY assets ./assets
+COPY apps/web ./apps/web
 COPY game-web ./game-web
 COPY shared_math ./shared_math
 COPY shared_protocol ./shared_protocol
@@ -41,7 +42,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM nginx:1.27-alpine
 
 COPY game-web/nginx.conf /etc/nginx/conf.d/default.conf
-COPY --from=builder /app/game-web/dist /usr/share/nginx/html
+COPY --from=builder /app/apps/web/public/play /usr/share/nginx/html
 
 EXPOSE 80
 

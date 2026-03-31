@@ -16,26 +16,28 @@ services:
       timeout: 5s
       retries: 20
 
-  bun-backend:
+  next-web:
     build:
-      context: ./bun-backend
+      context: .
+      dockerfile: apps/web/Dockerfile
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      PORT: "3000"
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/augmego?schema=public
       WEB_BASE_URL: http://localhost:3001
-      WEB_ORIGINS: http://localhost:3001
+      NEXTAUTH_URL: http://localhost:3001
+      AUTH_SECRET: replace-me-for-production
+      PORT: "3000"
       COOKIE_SAMESITE: Lax
       COOKIE_SECURE: "false"
       WORLD_STORAGE_PROVIDER: local
-      WORLD_STORAGE_ROOT: /app/storage/world-assets
+      WORLD_STORAGE_ROOT: ../../storage/world-assets
     ports:
-      - "3000:3000"
+      - "3001:3000"
     volumes:
-      - bun-storage:/app/storage
+      - next-storage:/app/storage
 
   voxel-backend:
     build:
@@ -52,18 +54,7 @@ services:
     volumes:
       - world-data:/data/world
 
-  game-web:
-    build:
-      context: .
-      dockerfile: game-web/Dockerfile
-    restart: unless-stopped
-    depends_on:
-      - bun-backend
-      - voxel-backend
-    ports:
-      - "3001:80"
-
 volumes:
   postgres-data:
-  bun-storage:
+  next-storage:
   world-data:

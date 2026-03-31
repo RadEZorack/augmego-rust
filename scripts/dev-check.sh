@@ -18,8 +18,9 @@ docker compose -f "$ROOT_DIR/docker-compose.dev.yml" ps
 
 echo
 echo "Checking local service endpoints..."
-check_url "bun api health" "http://127.0.0.1:3000/api/v1/health"
-check_url "web trunk dev server" "http://127.0.0.1:3002/"
+check_url "next api health" "http://127.0.0.1:3000/api/v1/health"
+check_url "next web app" "http://127.0.0.1:3000/"
+check_url "play bundle" "http://127.0.0.1:3000/play/index.html"
 
 echo
 echo "Checking local HTTPS dev host..."
@@ -39,6 +40,6 @@ fi
 
 echo
 echo "Expected local commands:"
-echo "  cd $ROOT_DIR/bun-backend && bun run dev"
+echo "  cd $ROOT_DIR/apps/web && npm install && npm run dev"
 echo "  cd $ROOT_DIR && BACKEND_BIND_ADDR=0.0.0.0:4000 BACKEND_WS_BIND_ADDR=0.0.0.0:4001 cargo run -p backend"
-echo "  cd $ROOT_DIR/game-web && trunk serve --address 0.0.0.0 --port 3002 --no-autoreload"
+echo "  cd $ROOT_DIR/apps/web && npm run game:watch"

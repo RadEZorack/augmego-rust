@@ -1,6 +1,7 @@
 [build]
 target = "index.html"
-dist = "dist"
+dist = "../apps/web/public/play"
+public_url = "/play/"
 
 [[proxy]]
 rewrite = "/api/"

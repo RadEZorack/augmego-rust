@@ -3,6 +3,8 @@ target
 world
 **/node_modules
 **/dist
+apps/web/.next
+apps/web/public/play
 **/.DS_Store
 **/.env
 **/.env.*

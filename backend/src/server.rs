@@ -197,6 +197,15 @@ impl PlayerService {
             .cloned()
             .collect()
     }
+
+    async fn is_subscribed_to_chunk(&self, player_id: u64, chunk: ChunkPos) -> bool {
+        self.players
+            .lock()
+            .await
+            .get(&player_id)
+            .map(|player| player.subscribed_chunks.contains(&chunk))
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Clone)]
@@ -548,14 +557,45 @@ impl ChunkStreamingService {
             }));
         }
 
-        for (index, position) in additions.into_iter().enumerate() {
-            if let Some(chunk) = self.world.chunk_override(position).await? {
-                let _ = sender.send(ServerMessage::ChunkData(chunk));
-            }
+        if !additions.is_empty() {
+            let world = self.world.clone();
+            let player_service = player_service.clone();
+            let sender = sender.clone();
 
-            if index > 0 && index % 8 == 0 {
-                yield_now().await;
-            }
+            tokio::spawn(async move {
+                for (index, position) in additions.into_iter().enumerate() {
+                    if !player_service
+                        .is_subscribed_to_chunk(player_id, position)
+                        .await
+                    {
+                        continue;
+                    }
+
+                    match world.chunk_override(position).await {
+                        Ok(Some(chunk)) => {
+                            if player_service
+                                .is_subscribed_to_chunk(player_id, position)
+                                .await
+                            {
+                                let _ = sender.send(ServerMessage::ChunkData(chunk));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                ?position,
+                                player_id,
+                                "failed to stream websocket chunk override"
+                            );
+                        }
+                    }
+
+                    if index > 0 && index % 8 == 0 {
+                        yield_now().await;
+                    }
+                }
+            });
         }
 
         Ok(())
@@ -944,13 +984,7 @@ impl VoxelServer {
 
                     if let Some(player) = self
                         .player_service
-                        .update_motion(
-                            player_id,
-                            position,
-                            velocity,
-                            yaw,
-                            pet_states,
-                        )
+                        .update_motion(player_id, position, velocity, yaw, pet_states)
                         .await
                     {
                         write_message(
@@ -1045,13 +1079,7 @@ impl VoxelServer {
 
                     if let Some(player) = self
                         .player_service
-                        .update_motion(
-                            player_id,
-                            position,
-                            velocity,
-                            yaw,
-                            pet_states,
-                        )
+                        .update_motion(player_id, position, velocity, yaw, pet_states)
                         .await
                     {
                         let snapshot = player.snapshot(tick);

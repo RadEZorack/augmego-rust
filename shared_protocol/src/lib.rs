@@ -64,6 +64,15 @@ pub struct PetStateSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerRealtimeState {
+    pub tick: u64,
+    pub position: [f32; 3],
+    pub velocity: [f32; 3],
+    pub yaw: f32,
+    pub pet_states: Vec<PetStateSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerStateSnapshot {
     pub player_id: u64,
     pub tick: u64,

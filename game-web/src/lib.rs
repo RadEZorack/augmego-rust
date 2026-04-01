@@ -5,8 +5,9 @@ use glam::{Mat4, Quat, Vec3};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
     BreakBlockRequest, ClientHello, ClientMessage, ClientWebRtcSignal, InventorySnapshot,
-    LoginRequest, PROTOCOL_VERSION, PetStateSnapshot, PlaceBlockRequest, PlayerInputTick,
-    ServerMessage, ServerWebRtcSignal, SubscribeChunks, WebRtcSignalPayload, decode, encode,
+    LoginRequest, PROTOCOL_VERSION, PeerRealtimeState, PetStateSnapshot, PlaceBlockRequest,
+    PlayerInputTick, ServerMessage, ServerWebRtcSignal, SubscribeChunks, WebRtcSignalPayload,
+    decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::cell::RefCell;
@@ -21,8 +22,9 @@ use web_sys::{
     BinaryType, CanvasRenderingContext2d, CloseEvent, Document, Element, ErrorEvent,
     Event as WebEvent, FormData, HtmlCanvasElement, HtmlInputElement, HtmlVideoElement,
     MediaStream, MediaStreamConstraints, MessageEvent, Request, RequestCredentials, RequestInit,
-    RequestMode, Response, RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent,
-    RtcSdpType, RtcSessionDescriptionInit, RtcTrackEvent, WebSocket, Worker,
+    RequestMode, Response, RtcDataChannel, RtcDataChannelEvent, RtcIceCandidateInit,
+    RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
+    RtcTrackEvent, WebSocket, Worker,
 };
 use web_time::Instant;
 use wgpu_lite::{
@@ -102,6 +104,8 @@ const PET_SLOT_OFFSETS: [(f32, f32); PET_FOLLOWER_COUNT] = [
     (0.6, 3.9),
 ];
 const INPUT_BROADCAST_INTERVAL: Duration = Duration::from_millis(67);
+const PEER_REALTIME_BROADCAST_INTERVAL: Duration = Duration::from_millis(33);
+const PEER_REALTIME_RADIUS: f32 = CHUNK_WIDTH as f32 * WEB_RADIUS as f32;
 const REMOTE_AVATAR_RUN_SPEED_THRESHOLD: f32 = 0.15;
 const REMOTE_AVATAR_IDLE_DELAY_SECS: f32 = 0.35;
 const REMOTE_AVATAR_DANCE_DELAY_SECS: f32 = 5.0;
@@ -203,6 +207,12 @@ enum AuthEvent {
 enum RemoteAvatarEvent {
     Loaded { url: String, bytes: Vec<u8> },
     Failed { url: String, message: String },
+}
+
+enum PeerRealtimeEvent {
+    Opened { player_id: u64 },
+    Closed { player_id: u64 },
+    Message { player_id: u64, bytes: Vec<u8> },
 }
 
 struct RemoteAvatarAsset {
@@ -446,6 +456,7 @@ struct WebApp {
     selected_hotbar: usize,
     player_id: Option<u64>,
     remote_players: HashMap<u64, [f32; 3]>,
+    remote_player_latest_ticks: HashMap<u64, u64>,
     remote_player_velocities: HashMap<u64, [f32; 3]>,
     remote_player_yaws: HashMap<u64, f32>,
     remote_player_avatar_selections: HashMap<u64, PlayerAvatarSelection>,
@@ -463,11 +474,14 @@ struct WebApp {
     webcam_requested: bool,
     webcam_tx: Sender<WebcamEvent>,
     webcam_rx: Receiver<WebcamEvent>,
+    peer_realtime_tx: Sender<PeerRealtimeEvent>,
+    peer_realtime_rx: Receiver<PeerRealtimeEvent>,
     webcam: Option<WebcamCapture>,
     last_sent_position: Option<[f32; 3]>,
     last_sent_velocity: Option<[f32; 3]>,
     last_sent_yaw: Option<f32>,
     last_input_broadcast_at: Option<Instant>,
+    last_peer_realtime_broadcast_at: Option<Instant>,
     tick_counter: u64,
     transport_open: bool,
     logged_in: bool,
@@ -526,6 +540,7 @@ impl WebApp {
         let (webcam_prompt, webcam_prompt_onclick) = create_webcam_prompt();
         let auth_rx = request_auth_session();
         let (remote_avatar_tx, remote_avatar_rx) = mpsc::channel();
+        let (peer_realtime_tx, peer_realtime_rx) = mpsc::channel();
         let (auth_overlay, auth_overlay_status, auth_button_onclicks) = create_auth_overlay();
         let (
             player_avatar_panel,
@@ -567,6 +582,7 @@ impl WebApp {
             selected_hotbar: 0,
             player_id: None,
             remote_players: HashMap::new(),
+            remote_player_latest_ticks: HashMap::new(),
             remote_player_velocities: HashMap::new(),
             remote_player_yaws: HashMap::new(),
             remote_player_avatar_selections: HashMap::new(),
@@ -584,11 +600,14 @@ impl WebApp {
             webcam_requested: false,
             webcam_tx,
             webcam_rx,
+            peer_realtime_tx,
+            peer_realtime_rx,
             webcam: None,
             last_sent_position: None,
             last_sent_velocity: None,
             last_sent_yaw: None,
             last_input_broadcast_at: None,
+            last_peer_realtime_broadcast_at: None,
             tick_counter: 0,
             transport_open: false,
             logged_in: false,
@@ -795,6 +814,47 @@ impl WebApp {
         });
     }
 
+    fn process_peer_realtime_events(&mut self) {
+        REMOTE_DATA_CHANNEL_REGISTRY.with(|registry| {
+            let mut registry = registry.borrow_mut();
+            for (player_id, registration) in registry.drain() {
+                if let Some(remote) = self.remote_media.get_mut(&player_id) {
+                    remote.data_channel = Some(registration.channel);
+                    remote.data_channel_bindings = Some(registration.bindings);
+                }
+            }
+        });
+
+        while let Ok(event) = self.peer_realtime_rx.try_recv() {
+            match event {
+                PeerRealtimeEvent::Opened { player_id } => {
+                    if let Some(remote) = self.remote_media.get_mut(&player_id) {
+                        remote.data_channel_open = true;
+                    }
+                    self.maybe_enable_peer_media(player_id);
+                }
+                PeerRealtimeEvent::Closed { player_id } => {
+                    if let Some(remote) = self.remote_media.get_mut(&player_id) {
+                        remote.data_channel_open = false;
+                    }
+                }
+                PeerRealtimeEvent::Message { player_id, bytes } => {
+                    let Ok(state) = decode::<PeerRealtimeState>(&bytes) else {
+                        continue;
+                    };
+                    self.apply_remote_motion_state(
+                        player_id,
+                        state.tick,
+                        state.position,
+                        state.velocity,
+                        state.yaw,
+                        state.pet_states,
+                    );
+                }
+            }
+        }
+    }
+
     fn process_remote_avatar_events(&mut self, renderer: &Renderer<'_>) {
         while let Ok(event) = self.remote_avatar_rx.try_recv() {
             match event {
@@ -855,6 +915,7 @@ impl WebApp {
                             self.login_request_sent = false;
                             self.player_id = None;
                             self.remote_players.clear();
+                            self.remote_player_latest_ticks.clear();
                             self.remote_player_velocities.clear();
                             self.remote_player_yaws.clear();
                             self.remote_player_avatar_selections.clear();
@@ -863,6 +924,7 @@ impl WebApp {
                             self.remote_media.clear();
                             self.remote_avatar_assets.clear();
                             self.pending_remote_avatar_urls.clear();
+                            clear_peer_connection_registries();
                             self.pet_asset = None;
                             self.pet_asset_attempted = false;
                             self.pet_followers.clear();
@@ -871,6 +933,7 @@ impl WebApp {
                             self.last_sent_velocity = None;
                             self.last_sent_yaw = None;
                             self.last_input_broadcast_at = None;
+                            self.last_peer_realtime_broadcast_at = None;
                             web_sys::console::error_1(&JsValue::from_str(&format!(
                                 "multiplayer disconnected: decode websocket message: {error}"
                             )));
@@ -891,6 +954,7 @@ impl WebApp {
                                 self.player_id = Some(response.player_id);
                                 self.pending_network_events.clear();
                                 self.remote_players.clear();
+                                self.remote_player_latest_ticks.clear();
                                 self.remote_player_velocities.clear();
                                 self.remote_player_yaws.clear();
                                 self.remote_player_avatar_selections.clear();
@@ -899,10 +963,12 @@ impl WebApp {
                                 self.remote_media.clear();
                                 self.remote_avatar_assets.clear();
                                 self.pending_remote_avatar_urls.clear();
+                                clear_peer_connection_registries();
                                 self.last_sent_position = None;
                                 self.last_sent_velocity = None;
                                 self.last_sent_yaw = None;
                                 self.last_input_broadcast_at = None;
+                                self.last_peer_realtime_broadcast_at = None;
                                 self.camera.position = Vec3::new(
                                     response.spawn_position.x as f32 + 0.5,
                                     response.spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
@@ -978,14 +1044,14 @@ impl WebApp {
                         }
                         ServerMessage::PlayerStateSnapshot(snapshot) => {
                             if Some(snapshot.player_id) != self.player_id {
-                                self.remote_players
-                                    .insert(snapshot.player_id, snapshot.position);
-                                self.remote_player_velocities
-                                    .insert(snapshot.player_id, snapshot.velocity);
-                                self.remote_player_yaws
-                                    .insert(snapshot.player_id, snapshot.yaw);
-                                self.remote_pet_states
-                                    .insert(snapshot.player_id, snapshot.pet_states.clone());
+                                self.apply_remote_motion_state(
+                                    snapshot.player_id,
+                                    snapshot.tick,
+                                    snapshot.position,
+                                    snapshot.velocity,
+                                    snapshot.yaw,
+                                    snapshot.pet_states.clone(),
+                                );
                                 let selection = PlayerAvatarSelection {
                                     idle_model_url: snapshot.idle_model_url.clone(),
                                     run_model_url: snapshot.run_model_url.clone(),
@@ -1006,7 +1072,14 @@ impl WebApp {
                                     state.active_url = None;
                                 }
                                 self.ensure_remote_avatar_selection_requested(&selection);
-                                self.ensure_peer_connection(snapshot.player_id);
+                                let peer_position = self
+                                    .remote_players
+                                    .get(&snapshot.player_id)
+                                    .copied()
+                                    .unwrap_or(snapshot.position);
+                                if self.player_is_nearby_for_peer_realtime(peer_position) {
+                                    self.ensure_peer_connection(snapshot.player_id);
+                                }
                             }
                         }
                         ServerMessage::WebRtcSignal(signal) => self.handle_webrtc_signal(signal),
@@ -1026,6 +1099,7 @@ impl WebApp {
                     self.player_id = None;
                     self.pending_network_events.clear();
                     self.remote_players.clear();
+                    self.remote_player_latest_ticks.clear();
                     self.remote_player_velocities.clear();
                     self.remote_player_yaws.clear();
                     self.remote_player_avatar_selections.clear();
@@ -1034,6 +1108,7 @@ impl WebApp {
                     self.remote_media.clear();
                     self.remote_avatar_assets.clear();
                     self.pending_remote_avatar_urls.clear();
+                    clear_peer_connection_registries();
                     self.pet_asset = None;
                     self.pet_asset_attempted = false;
                     self.pet_followers.clear();
@@ -1042,6 +1117,7 @@ impl WebApp {
                     self.last_sent_velocity = None;
                     self.last_sent_yaw = None;
                     self.last_input_broadcast_at = None;
+                    self.last_peer_realtime_broadcast_at = None;
                     web_sys::console::error_1(&JsValue::from_str(&format!(
                         "multiplayer disconnected: {reason}"
                     )));
@@ -1213,10 +1289,60 @@ impl WebApp {
         }));
     }
 
+    fn next_state_tick(&mut self) -> u64 {
+        self.tick_counter = self.tick_counter.wrapping_add(1);
+        self.tick_counter
+    }
+
+    fn current_pet_snapshots(&self) -> Vec<PetStateSnapshot> {
+        self.pet_followers
+            .iter()
+            .map(|pet| PetStateSnapshot {
+                position: pet.feet_position.to_array(),
+                yaw: pet.yaw,
+            })
+            .collect()
+    }
+
+    fn apply_remote_motion_state(
+        &mut self,
+        player_id: u64,
+        tick: u64,
+        position: [f32; 3],
+        velocity: [f32; 3],
+        yaw: f32,
+        pet_states: Vec<PetStateSnapshot>,
+    ) {
+        if Some(player_id) == self.player_id {
+            return;
+        }
+
+        let should_apply = self
+            .remote_player_latest_ticks
+            .get(&player_id)
+            .map(|latest| tick >= *latest)
+            .unwrap_or(true);
+        if !should_apply {
+            return;
+        }
+
+        self.remote_player_latest_ticks.insert(player_id, tick);
+        self.remote_players.insert(player_id, position);
+        self.remote_player_velocities.insert(player_id, velocity);
+        self.remote_player_yaws.insert(player_id, yaw);
+        self.remote_pet_states.insert(player_id, pet_states);
+    }
+
+    fn player_is_nearby_for_peer_realtime(&self, position: [f32; 3]) -> bool {
+        let delta = Vec3::from_array(position) - self.camera.position;
+        delta.length_squared() <= PEER_REALTIME_RADIUS * PEER_REALTIME_RADIUS
+    }
+
     fn tick(&mut self) {
         self.sync_pointer_lock_state();
         self.process_auth_events();
         self.drain_network();
+        self.process_peer_realtime_events();
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
@@ -1303,38 +1429,68 @@ impl WebApp {
             .map(|last| (self.camera.yaw - last).abs() > 0.0025)
             .unwrap_or(true);
         let always_broadcast_motion = true;
-        let send_due = self
+        let websocket_send_due = self
             .last_input_broadcast_at
             .map(|last| now.duration_since(last) >= INPUT_BROADCAST_INTERVAL)
             .unwrap_or(true);
+        let peer_channels = self
+            .remote_media
+            .iter()
+            .filter_map(|(&player_id, remote)| {
+                if !remote.data_channel_open {
+                    return None;
+                }
+                let channel = remote.data_channel.as_ref()?;
+                let position = *self.remote_players.get(&player_id)?;
+                self.player_is_nearby_for_peer_realtime(position)
+                    .then(|| channel.clone())
+            })
+            .collect::<Vec<_>>();
+        let peer_send_due = !peer_channels.is_empty()
+            && self
+                .last_peer_realtime_broadcast_at
+                .map(|last| now.duration_since(last) >= PEER_REALTIME_BROADCAST_INTERVAL)
+                .unwrap_or(true);
 
-        if send_due
-            && (always_broadcast_motion
-            || (should_broadcast_motion && (position_changed || velocity_changed))
-            || yaw_changed)
-        {
-            self.tick_counter = self.tick_counter.wrapping_add(1);
-            self.send_client_message(&ClientMessage::PlayerInputTick(PlayerInputTick {
-                tick: self.tick_counter,
-                client_sent_at_ms: Some(js_sys::Date::now().max(0.0) as u64),
-                movement: [world_movement.x, 0.0, world_movement.z],
-                position: Some(position),
-                velocity: Some(velocity),
-                yaw: Some(self.camera.yaw),
-                jump,
-                pet_states: self
-                    .pet_followers
-                    .iter()
-                    .map(|pet| PetStateSnapshot {
-                        position: pet.feet_position.to_array(),
-                        yaw: pet.yaw,
-                    })
-                    .collect(),
-            }));
-            self.last_sent_position = Some(position);
-            self.last_sent_velocity = Some(velocity);
-            self.last_sent_yaw = Some(self.camera.yaw);
-            self.last_input_broadcast_at = Some(now);
+        if peer_send_due || websocket_send_due {
+            let state_tick = self.next_state_tick();
+            let pet_states = self.current_pet_snapshots();
+
+            if peer_send_due {
+                if let Ok(bytes) = encode(&PeerRealtimeState {
+                    tick: state_tick,
+                    position,
+                    velocity,
+                    yaw: self.camera.yaw,
+                    pet_states: pet_states.clone(),
+                }) {
+                    for channel in peer_channels {
+                        let _ = channel.send_with_u8_array(&bytes);
+                    }
+                    self.last_peer_realtime_broadcast_at = Some(now);
+                }
+            }
+
+            if websocket_send_due
+                && (always_broadcast_motion
+                    || (should_broadcast_motion && (position_changed || velocity_changed))
+                    || yaw_changed)
+            {
+                self.send_client_message(&ClientMessage::PlayerInputTick(PlayerInputTick {
+                    tick: state_tick,
+                    client_sent_at_ms: Some(js_sys::Date::now().max(0.0) as u64),
+                    movement: [world_movement.x, 0.0, world_movement.z],
+                    position: Some(position),
+                    velocity: Some(velocity),
+                    yaw: Some(self.camera.yaw),
+                    jump,
+                    pet_states,
+                }));
+                self.last_sent_position = Some(position);
+                self.last_sent_velocity = Some(velocity);
+                self.last_sent_yaw = Some(self.camera.yaw);
+                self.last_input_broadcast_at = Some(now);
+            }
         }
     }
 
@@ -1867,12 +2023,7 @@ impl WebApp {
         };
 
         let mut draws = Vec::with_capacity(
-            self.pet_followers.len()
-                + self
-                    .remote_pet_states
-                    .values()
-                    .map(Vec::len)
-                    .sum::<usize>(),
+            self.pet_followers.len() + self.remote_pet_states.values().map(Vec::len).sum::<usize>(),
         );
 
         for pet in &self.pet_followers {
@@ -2016,14 +2167,31 @@ impl WebApp {
     }
 
     fn maybe_enable_peer_media(&mut self, remote_player_id: u64) {
-        let (Some(local_player_id), Some(webcam)) = (self.player_id, self.webcam.as_ref()) else {
+        let Some(local_player_id) = self.player_id else {
             return;
         };
         let Some(remote) = self.remote_media.get_mut(&remote_player_id) else {
             return;
         };
+        let mut should_send_offer = false;
 
-        if !remote.local_tracks_attached {
+        if local_player_id < remote_player_id && remote.data_channel.is_none() {
+            let channel = remote.connection.create_data_channel("player-realtime");
+            let bindings =
+                bind_peer_realtime_channel(remote_player_id, &channel, &self.peer_realtime_tx);
+            remote.data_channel = Some(channel);
+            remote.data_channel_bindings = Some(bindings);
+            if !remote.offer_started {
+                remote.offer_started = true;
+                should_send_offer = true;
+            }
+        }
+
+        if let Some(webcam) = self
+            .webcam
+            .as_ref()
+            .filter(|_| !remote.local_tracks_attached)
+        {
             let tracks = webcam.stream.get_tracks();
             for index in 0..tracks.length() {
                 if let Ok(track) = tracks.get(index).dyn_into::<web_sys::MediaStreamTrack>() {
@@ -2041,37 +2209,20 @@ impl WebApp {
                 }
             }
             remote.local_tracks_attached = true;
+            remote.needs_media_renegotiation = true;
         }
 
-        if local_player_id < remote_player_id && !remote.offer_started {
-            remote.offer_started = true;
-            let connection = remote.connection.clone();
-            let ws = self.websocket.clone();
-            spawn_local(async move {
-                let Ok(offer) = JsFuture::from(connection.create_offer()).await else {
-                    return;
-                };
-                let Some(sdp) = js_sys::Reflect::get(&offer, &JsValue::from_str("sdp"))
-                    .ok()
-                    .and_then(|value| value.as_string())
-                else {
-                    return;
-                };
-                let description = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
-                description.set_sdp(&sdp);
-                if JsFuture::from(connection.set_local_description(&description))
-                    .await
-                    .is_ok()
-                {
-                    send_client_message_over_websocket(
-                        &ws,
-                        &ClientMessage::WebRtcSignal(ClientWebRtcSignal {
-                            target_player_id: remote_player_id,
-                            payload: WebRtcSignalPayload::Offer { sdp },
-                        }),
-                    );
-                }
-            });
+        if remote.data_channel_open && remote.needs_media_renegotiation {
+            remote.needs_media_renegotiation = false;
+            should_send_offer = true;
+        }
+
+        if should_send_offer {
+            spawn_webrtc_offer(
+                self.websocket.clone(),
+                remote.connection.clone(),
+                remote_player_id,
+            );
         }
     }
 
@@ -2167,16 +2318,35 @@ impl WebApp {
         }) as Box<dyn FnMut(RtcTrackEvent)>);
         connection.set_ontrack(Some(ontrack.as_ref().unchecked_ref()));
 
+        let peer_realtime_tx = self.peer_realtime_tx.clone();
+        let ondatachannel = Closure::wrap(Box::new(move |event: RtcDataChannelEvent| {
+            let channel = event.channel();
+            let bindings =
+                bind_peer_realtime_channel(remote_player_id, &channel, &peer_realtime_tx);
+            REMOTE_DATA_CHANNEL_REGISTRY.with(|registry| {
+                registry.borrow_mut().insert(
+                    remote_player_id,
+                    RemoteDataChannelRegistration { channel, bindings },
+                );
+            });
+        }) as Box<dyn FnMut(RtcDataChannelEvent)>);
+        connection.set_ondatachannel(Some(ondatachannel.as_ref().unchecked_ref()));
+
         let remote = RemotePeerMedia {
             connection: connection.clone(),
             video: None,
             canvas: None,
             context: None,
             texture: None,
+            data_channel: None,
+            data_channel_open: false,
+            data_channel_bindings: None,
             local_tracks_attached: false,
+            needs_media_renegotiation: false,
             offer_started: false,
             _onicecandidate: onicecandidate,
             _ontrack: ontrack,
+            _ondatachannel: ondatachannel,
         };
         self.remote_media.insert(remote_player_id, remote);
         self.maybe_enable_peer_media(remote_player_id);
@@ -2932,16 +3102,32 @@ struct RemotePeerMedia {
     canvas: Option<HtmlCanvasElement>,
     context: Option<CanvasRenderingContext2d>,
     texture: Option<DynamicTexture>,
+    data_channel: Option<RtcDataChannel>,
+    data_channel_open: bool,
+    data_channel_bindings: Option<PeerRealtimeChannelBindings>,
     local_tracks_attached: bool,
+    needs_media_renegotiation: bool,
     offer_started: bool,
     _onicecandidate: Closure<dyn FnMut(RtcPeerConnectionIceEvent)>,
     _ontrack: Closure<dyn FnMut(RtcTrackEvent)>,
+    _ondatachannel: Closure<dyn FnMut(RtcDataChannelEvent)>,
 }
 
 struct RemoteMediaRegistration {
     video: HtmlVideoElement,
     canvas: HtmlCanvasElement,
     context: CanvasRenderingContext2d,
+}
+
+struct PeerRealtimeChannelBindings {
+    _onopen: Closure<dyn FnMut(WebEvent)>,
+    _onclose: Closure<dyn FnMut(WebEvent)>,
+    _onmessage: Closure<dyn FnMut(MessageEvent)>,
+}
+
+struct RemoteDataChannelRegistration {
+    channel: RtcDataChannel,
+    bindings: PeerRealtimeChannelBindings,
 }
 
 #[derive(Clone)]
@@ -2953,6 +3139,7 @@ struct PendingIceCandidate {
 
 thread_local! {
     static REMOTE_MEDIA_REGISTRY: RefCell<HashMap<u64, RemoteMediaRegistration>> = RefCell::new(HashMap::new());
+    static REMOTE_DATA_CHANNEL_REGISTRY: RefCell<HashMap<u64, RemoteDataChannelRegistration>> = RefCell::new(HashMap::new());
     static PENDING_ICE_REGISTRY: RefCell<HashMap<u64, Vec<PendingIceCandidate>>> = RefCell::new(HashMap::new());
     static WEBCAM_PROMPT_QUEUE: RefCell<bool> = const { RefCell::new(false) };
 }
@@ -4626,6 +4813,71 @@ fn send_client_message_over_websocket(websocket: &WebSocket, message: &ClientMes
     }
 }
 
+fn bind_peer_realtime_channel(
+    player_id: u64,
+    channel: &RtcDataChannel,
+    sender: &Sender<PeerRealtimeEvent>,
+) -> PeerRealtimeChannelBindings {
+    let _ = js_sys::Reflect::set(
+        channel.as_ref(),
+        &JsValue::from_str("binaryType"),
+        &JsValue::from_str("arraybuffer"),
+    );
+
+    let open_tx = sender.clone();
+    let onopen = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let _ = open_tx.send(PeerRealtimeEvent::Opened { player_id });
+    }) as Box<dyn FnMut(WebEvent)>);
+    channel.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+
+    let close_tx = sender.clone();
+    let onclose = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let _ = close_tx.send(PeerRealtimeEvent::Closed { player_id });
+    }) as Box<dyn FnMut(WebEvent)>);
+    channel.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+
+    let message_tx = sender.clone();
+    let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let bytes = js_sys::Uint8Array::new(&event.data()).to_vec();
+        let _ = message_tx.send(PeerRealtimeEvent::Message { player_id, bytes });
+    }) as Box<dyn FnMut(MessageEvent)>);
+    channel.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+
+    PeerRealtimeChannelBindings {
+        _onopen: onopen,
+        _onclose: onclose,
+        _onmessage: onmessage,
+    }
+}
+
+fn spawn_webrtc_offer(websocket: WebSocket, connection: RtcPeerConnection, remote_player_id: u64) {
+    spawn_local(async move {
+        let Ok(offer) = JsFuture::from(connection.create_offer()).await else {
+            return;
+        };
+        let Some(sdp) = js_sys::Reflect::get(&offer, &JsValue::from_str("sdp"))
+            .ok()
+            .and_then(|value| value.as_string())
+        else {
+            return;
+        };
+        let description = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+        description.set_sdp(&sdp);
+        if JsFuture::from(connection.set_local_description(&description))
+            .await
+            .is_ok()
+        {
+            send_client_message_over_websocket(
+                &websocket,
+                &ClientMessage::WebRtcSignal(ClientWebRtcSignal {
+                    target_player_id: remote_player_id,
+                    payload: WebRtcSignalPayload::Offer { sdp },
+                }),
+            );
+        }
+    });
+}
+
 fn flush_pending_ice_candidates(player_id: u64, connection: &RtcPeerConnection) {
     let pending = PENDING_ICE_REGISTRY.with(|registry| registry.borrow_mut().remove(&player_id));
     let Some(pending) = pending else {
@@ -4642,6 +4894,12 @@ fn flush_pending_ice_candidates(player_id: u64, connection: &RtcPeerConnection) 
         }
         let _ = connection.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&init));
     }
+}
+
+fn clear_peer_connection_registries() {
+    REMOTE_MEDIA_REGISTRY.with(|registry| registry.borrow_mut().clear());
+    REMOTE_DATA_CHANNEL_REGISTRY.with(|registry| registry.borrow_mut().clear());
+    PENDING_ICE_REGISTRY.with(|registry| registry.borrow_mut().clear());
 }
 
 fn request_webcam_capture(sender: Sender<WebcamEvent>) {

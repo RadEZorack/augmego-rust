@@ -7,14 +7,15 @@ use shared_content::block_definitions;
 use shared_math::{CHUNK_HEIGHT, ChunkPos, WorldPos};
 use shared_protocol::{
     BlockActionResult, ChunkUnload, ClientHello, ClientMessage, InventorySnapshot, InventoryStack,
-    LoginResponse, PROTOCOL_VERSION, PlayerStateSnapshot, ServerHello, ServerMessage,
-    ServerWebRtcSignal, SubscribeChunks, decode, encode,
+    LoginResponse, PROTOCOL_VERSION, PetStateSnapshot, PlayerStateSnapshot, ServerHello,
+    ServerMessage, ServerWebRtcSignal, SubscribeChunks, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::yield_now;
@@ -25,6 +26,7 @@ const PLAYER_HEIGHT: f32 = 1.8;
 const PLAYER_EYE_HEIGHT: f32 = 1.62;
 const COLLISION_STEP: f32 = 0.2;
 const STEP_HEIGHT: f32 = 0.6;
+const MAX_ACCEPTED_INPUT_AGE_MS: u64 = 500;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -67,7 +69,24 @@ struct Player {
     idle_model_url: Option<String>,
     run_model_url: Option<String>,
     dance_model_url: Option<String>,
+    pet_states: Vec<PetStateSnapshot>,
     subscribed_chunks: HashSet<ChunkPos>,
+}
+
+impl Player {
+    fn snapshot(&self, tick: u64) -> PlayerStateSnapshot {
+        PlayerStateSnapshot {
+            player_id: self.id,
+            tick,
+            position: self.position,
+            velocity: self.velocity,
+            yaw: self.yaw,
+            idle_model_url: self.idle_model_url.clone(),
+            run_model_url: self.run_model_url.clone(),
+            dance_model_url: self.dance_model_url.clone(),
+            pet_states: self.pet_states.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -102,6 +121,7 @@ impl PlayerService {
             idle_model_url,
             run_model_url,
             dance_model_url,
+            pet_states: Vec::new(),
             subscribed_chunks: HashSet::new(),
         };
         *next_id += 1;
@@ -115,12 +135,14 @@ impl PlayerService {
         position: [f32; 3],
         velocity: [f32; 3],
         yaw: f32,
+        pet_states: Vec<PetStateSnapshot>,
     ) -> Option<Player> {
         let mut players = self.players.lock().await;
         let player = players.get_mut(&player_id)?;
         player.position = position;
         player.velocity = velocity;
         player.yaw = yaw;
+        player.pet_states = pet_states;
         Some(player.clone())
     }
 
@@ -517,16 +539,7 @@ impl ChunkStreamingService {
 
         let nearby_players = player_service.players_in_chunks(&desired, player_id).await;
         for player in nearby_players {
-            let _ = sender.send(ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
-                player_id: player.id,
-                tick: 0,
-                position: player.position,
-                velocity: player.velocity,
-                yaw: player.yaw,
-                idle_model_url: player.idle_model_url.clone(),
-                run_model_url: player.run_model_url.clone(),
-                dance_model_url: player.dance_model_url.clone(),
-            }));
+            let _ = sender.send(ServerMessage::PlayerStateSnapshot(player.snapshot(0)));
         }
 
         if !removals.is_empty() {
@@ -791,16 +804,7 @@ impl VoxelServer {
 
         write_message(
             &mut stream,
-            &ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
-                player_id: player.id,
-                tick: 0,
-                position: player.position,
-                velocity: player.velocity,
-                yaw: player.yaw,
-                idle_model_url: player.idle_model_url.clone(),
-                run_model_url: player.run_model_url.clone(),
-                dance_model_url: player.dance_model_url.clone(),
-            }),
+            &ServerMessage::PlayerStateSnapshot(player.snapshot(0)),
         )
         .await?;
 
@@ -899,16 +903,7 @@ impl VoxelServer {
             .update_subscription_ws(&sender, &self.player_service, player.id, subscribe)
             .await?;
 
-        let _ = sender.send(ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
-            player_id: player.id,
-            tick: 0,
-            position: player.position,
-            velocity: player.velocity,
-            yaw: player.yaw,
-            idle_model_url: player.idle_model_url.clone(),
-            run_model_url: player.run_model_url.clone(),
-            dance_model_url: player.dance_model_url.clone(),
-        }));
+        let _ = sender.send(ServerMessage::PlayerStateSnapshot(player.snapshot(0)));
 
         while let Ok(message) = read_ws_message::<ClientMessage, _>(&mut ws_read).await {
             self.handle_websocket_message(player.id, &sender, message)
@@ -936,6 +931,9 @@ impl VoxelServer {
             }
             ClientMessage::PlayerInputTick(input) => {
                 if let Some(current_player) = self.player_service.player(player_id).await {
+                    let tick = input.tick;
+                    let yaw = input.yaw.unwrap_or(current_player.yaw);
+                    let pet_states = input.pet_states;
                     let (position, velocity) = if let Some(position) = input.position {
                         (position, input.velocity.unwrap_or([0.0; 3]))
                     } else {
@@ -950,22 +948,14 @@ impl VoxelServer {
                             player_id,
                             position,
                             velocity,
-                            input.yaw.unwrap_or(current_player.yaw),
+                            yaw,
+                            pet_states,
                         )
                         .await
                     {
                         write_message(
                             stream,
-                            &ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
-                                player_id,
-                                tick: input.tick,
-                                position: player.position,
-                                velocity: player.velocity,
-                                yaw: player.yaw,
-                                idle_model_url: player.idle_model_url.clone(),
-                                run_model_url: player.run_model_url.clone(),
-                                dance_model_url: player.dance_model_url.clone(),
-                            }),
+                            &ServerMessage::PlayerStateSnapshot(player.snapshot(tick)),
                         )
                         .await?;
                     }
@@ -1038,7 +1028,13 @@ impl VoxelServer {
                     .await?;
             }
             ClientMessage::PlayerInputTick(input) => {
+                if player_input_is_stale(input.client_sent_at_ms) {
+                    return Ok(());
+                }
                 if let Some(current_player) = self.player_service.player(player_id).await {
+                    let tick = input.tick;
+                    let yaw = input.yaw.unwrap_or(current_player.yaw);
+                    let pet_states = input.pet_states;
                     let (position, velocity) = if let Some(position) = input.position {
                         (position, input.velocity.unwrap_or([0.0; 3]))
                     } else {
@@ -1053,32 +1049,14 @@ impl VoxelServer {
                             player_id,
                             position,
                             velocity,
-                            input.yaw.unwrap_or(current_player.yaw),
+                            yaw,
+                            pet_states,
                         )
                         .await
                     {
-                        let _ =
-                            sender.send(ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
-                                player_id,
-                                tick: input.tick,
-                                position: player.position,
-                                velocity: player.velocity,
-                                yaw: player.yaw,
-                                idle_model_url: player.idle_model_url.clone(),
-                                run_model_url: player.run_model_url.clone(),
-                                dance_model_url: player.dance_model_url.clone(),
-                            }));
-                        self.broadcast_player_snapshot(
-                            player_id,
-                            input.tick,
-                            player.position,
-                            player.velocity,
-                            player.yaw,
-                            player.idle_model_url.clone(),
-                            player.run_model_url.clone(),
-                            player.dance_model_url.clone(),
-                        )
-                        .await;
+                        let snapshot = player.snapshot(tick);
+                        let _ = sender.send(ServerMessage::PlayerStateSnapshot(snapshot.clone()));
+                        self.broadcast_player_snapshot(snapshot).await;
                     }
                 }
             }
@@ -1159,39 +1137,28 @@ impl VoxelServer {
             .await;
     }
 
-    async fn broadcast_player_snapshot(
-        &self,
-        player_id: u64,
-        tick: u64,
-        position: [f32; 3],
-        velocity: [f32; 3],
-        yaw: f32,
-        idle_model_url: Option<String>,
-        run_model_url: Option<String>,
-        dance_model_url: Option<String>,
-    ) {
+    async fn broadcast_player_snapshot(&self, snapshot: PlayerStateSnapshot) {
         let chunk = ChunkPos::from_world(WorldPos {
-            x: position[0].floor() as i64,
-            y: position[1].floor() as i32,
-            z: position[2].floor() as i64,
+            x: snapshot.position[0].floor() as i64,
+            y: snapshot.position[1].floor() as i32,
+            z: snapshot.position[2].floor() as i64,
         });
         let subscribers = self.player_service.subscribers_for_chunk(chunk).await;
         self.websocket_sessions
-            .broadcast_to(
-                &subscribers,
-                ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
-                    player_id,
-                    tick,
-                    position,
-                    velocity,
-                    yaw,
-                    idle_model_url,
-                    run_model_url,
-                    dance_model_url,
-                }),
-            )
+            .broadcast_to(&subscribers, ServerMessage::PlayerStateSnapshot(snapshot))
             .await;
     }
+}
+
+fn player_input_is_stale(client_sent_at_ms: Option<u64>) -> bool {
+    let Some(client_sent_at_ms) = client_sent_at_ms else {
+        return false;
+    };
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    let now_ms = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
+    now_ms.saturating_sub(client_sent_at_ms) > MAX_ACCEPTED_INPUT_AGE_MS
 }
 
 impl Clone for VoxelServer {

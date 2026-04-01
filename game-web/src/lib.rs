@@ -5,8 +5,8 @@ use glam::{Mat4, Quat, Vec3};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
     BreakBlockRequest, ClientHello, ClientMessage, ClientWebRtcSignal, InventorySnapshot,
-    LoginRequest, PROTOCOL_VERSION, PlaceBlockRequest, PlayerInputTick, ServerMessage,
-    ServerWebRtcSignal, SubscribeChunks, WebRtcSignalPayload, decode, encode,
+    LoginRequest, PROTOCOL_VERSION, PetStateSnapshot, PlaceBlockRequest, PlayerInputTick,
+    ServerMessage, ServerWebRtcSignal, SubscribeChunks, WebRtcSignalPayload, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::cell::RefCell;
@@ -51,7 +51,7 @@ const MESH_WORKER_COUNT: usize = 3;
 const DEFAULT_GENERATION_BUDGET_PER_UPDATE: usize = 2;
 const DEFAULT_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 1;
 const MAX_IDLE_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 2;
-const DEFAULT_NETWORK_MESSAGE_BUDGET_PER_TICK: usize = 8;
+const DEFAULT_NETWORK_MESSAGE_BUDGET_PER_TICK: usize = 32;
 const PENDING_REPRIORITIZE_DOT_THRESHOLD: f32 = 0.985;
 const WEB_RENDER_SCALE: f32 = 0.8;
 const PLAYER_RADIUS: f32 = 0.35;
@@ -101,6 +101,7 @@ const PET_SLOT_OFFSETS: [(f32, f32); PET_FOLLOWER_COUNT] = [
     (-0.6, 3.9),
     (0.6, 3.9),
 ];
+const INPUT_BROADCAST_INTERVAL: Duration = Duration::from_millis(67);
 const REMOTE_AVATAR_RUN_SPEED_THRESHOLD: f32 = 0.15;
 const REMOTE_AVATAR_IDLE_DELAY_SECS: f32 = 0.35;
 const REMOTE_AVATAR_DANCE_DELAY_SECS: f32 = 5.0;
@@ -345,6 +346,7 @@ async fn run() -> Result<()> {
                     app.handle_mouse_button(button);
                 }
                 WindowEvent::RedrawRequested => {
+                    app.tick();
                     app.process_webcam_events();
                     app.process_remote_avatar_events(&renderer);
                     app.process_generation_updates(
@@ -352,7 +354,6 @@ async fn run() -> Result<()> {
                         &mut chunk_meshes,
                         DEFAULT_GENERATION_BUDGET_PER_UPDATE,
                     );
-                    app.tick();
                     renderer.update_camera(app.camera_matrix());
                     let visible_meshes = chunk_meshes
                         .iter()
@@ -449,6 +450,7 @@ struct WebApp {
     remote_player_yaws: HashMap<u64, f32>,
     remote_player_avatar_selections: HashMap<u64, PlayerAvatarSelection>,
     remote_player_avatar_states: HashMap<u64, RemoteAvatarPlaybackState>,
+    remote_pet_states: HashMap<u64, Vec<PetStateSnapshot>>,
     remote_media: HashMap<u64, RemotePeerMedia>,
     remote_avatar_assets: HashMap<String, RemoteAvatarAsset>,
     pending_remote_avatar_urls: HashSet<String>,
@@ -465,6 +467,7 @@ struct WebApp {
     last_sent_position: Option<[f32; 3]>,
     last_sent_velocity: Option<[f32; 3]>,
     last_sent_yaw: Option<f32>,
+    last_input_broadcast_at: Option<Instant>,
     tick_counter: u64,
     transport_open: bool,
     logged_in: bool,
@@ -568,6 +571,7 @@ impl WebApp {
             remote_player_yaws: HashMap::new(),
             remote_player_avatar_selections: HashMap::new(),
             remote_player_avatar_states: HashMap::new(),
+            remote_pet_states: HashMap::new(),
             remote_media: HashMap::new(),
             remote_avatar_assets: HashMap::new(),
             pending_remote_avatar_urls: HashSet::new(),
@@ -584,6 +588,7 @@ impl WebApp {
             last_sent_position: None,
             last_sent_velocity: None,
             last_sent_yaw: None,
+            last_input_broadcast_at: None,
             tick_counter: 0,
             transport_open: false,
             logged_in: false,
@@ -854,6 +859,7 @@ impl WebApp {
                             self.remote_player_yaws.clear();
                             self.remote_player_avatar_selections.clear();
                             self.remote_player_avatar_states.clear();
+                            self.remote_pet_states.clear();
                             self.remote_media.clear();
                             self.remote_avatar_assets.clear();
                             self.pending_remote_avatar_urls.clear();
@@ -861,6 +867,10 @@ impl WebApp {
                             self.pet_asset_attempted = false;
                             self.pet_followers.clear();
                             self.pet_followers_need_reset = false;
+                            self.last_sent_position = None;
+                            self.last_sent_velocity = None;
+                            self.last_sent_yaw = None;
+                            self.last_input_broadcast_at = None;
                             web_sys::console::error_1(&JsValue::from_str(&format!(
                                 "multiplayer disconnected: decode websocket message: {error}"
                             )));
@@ -885,12 +895,14 @@ impl WebApp {
                                 self.remote_player_yaws.clear();
                                 self.remote_player_avatar_selections.clear();
                                 self.remote_player_avatar_states.clear();
+                                self.remote_pet_states.clear();
                                 self.remote_media.clear();
                                 self.remote_avatar_assets.clear();
                                 self.pending_remote_avatar_urls.clear();
                                 self.last_sent_position = None;
                                 self.last_sent_velocity = None;
                                 self.last_sent_yaw = None;
+                                self.last_input_broadcast_at = None;
                                 self.camera.position = Vec3::new(
                                     response.spawn_position.x as f32 + 0.5,
                                     response.spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
@@ -972,6 +984,8 @@ impl WebApp {
                                     .insert(snapshot.player_id, snapshot.velocity);
                                 self.remote_player_yaws
                                     .insert(snapshot.player_id, snapshot.yaw);
+                                self.remote_pet_states
+                                    .insert(snapshot.player_id, snapshot.pet_states.clone());
                                 let selection = PlayerAvatarSelection {
                                     idle_model_url: snapshot.idle_model_url.clone(),
                                     run_model_url: snapshot.run_model_url.clone(),
@@ -1016,6 +1030,7 @@ impl WebApp {
                     self.remote_player_yaws.clear();
                     self.remote_player_avatar_selections.clear();
                     self.remote_player_avatar_states.clear();
+                    self.remote_pet_states.clear();
                     self.remote_media.clear();
                     self.remote_avatar_assets.clear();
                     self.pending_remote_avatar_urls.clear();
@@ -1023,7 +1038,10 @@ impl WebApp {
                     self.pet_asset_attempted = false;
                     self.pet_followers.clear();
                     self.pet_followers_need_reset = false;
+                    self.last_sent_position = None;
+                    self.last_sent_velocity = None;
                     self.last_sent_yaw = None;
+                    self.last_input_broadcast_at = None;
                     web_sys::console::error_1(&JsValue::from_str(&format!(
                         "multiplayer disconnected: {reason}"
                     )));
@@ -1284,20 +1302,39 @@ impl WebApp {
             .last_sent_yaw
             .map(|last| (self.camera.yaw - last).abs() > 0.0025)
             .unwrap_or(true);
+        let always_broadcast_motion = true;
+        let send_due = self
+            .last_input_broadcast_at
+            .map(|last| now.duration_since(last) >= INPUT_BROADCAST_INTERVAL)
+            .unwrap_or(true);
 
-        if (should_broadcast_motion && (position_changed || velocity_changed)) || yaw_changed {
+        if send_due
+            && (always_broadcast_motion
+            || (should_broadcast_motion && (position_changed || velocity_changed))
+            || yaw_changed)
+        {
             self.tick_counter = self.tick_counter.wrapping_add(1);
             self.send_client_message(&ClientMessage::PlayerInputTick(PlayerInputTick {
                 tick: self.tick_counter,
+                client_sent_at_ms: Some(js_sys::Date::now().max(0.0) as u64),
                 movement: [world_movement.x, 0.0, world_movement.z],
                 position: Some(position),
                 velocity: Some(velocity),
                 yaw: Some(self.camera.yaw),
                 jump,
+                pet_states: self
+                    .pet_followers
+                    .iter()
+                    .map(|pet| PetStateSnapshot {
+                        position: pet.feet_position.to_array(),
+                        yaw: pet.yaw,
+                    })
+                    .collect(),
             }));
             self.last_sent_position = Some(position);
             self.last_sent_velocity = Some(velocity);
             self.last_sent_yaw = Some(self.camera.yaw);
+            self.last_input_broadcast_at = Some(now);
         }
     }
 
@@ -1800,7 +1837,14 @@ impl WebApp {
     }
 
     fn ensure_pet_asset_loaded(&mut self, renderer: &Renderer<'_>) {
-        if self.pet_followers.is_empty() || self.pet_asset.is_some() || self.pet_asset_attempted {
+        let has_remote_pets = self
+            .remote_pet_states
+            .values()
+            .any(|pet_states| !pet_states.is_empty());
+        if (self.pet_followers.is_empty() && !has_remote_pets)
+            || self.pet_asset.is_some()
+            || self.pet_asset_attempted
+        {
             return;
         }
 
@@ -1822,14 +1866,29 @@ impl WebApp {
             return Vec::new();
         };
 
-        self.pet_followers
-            .iter()
-            .map(|pet| {
-                let model =
-                    Mat4::from_translation(pet.feet_position) * Mat4::from_rotation_y(pet.yaw);
-                renderer.create_textured_draw(pet_asset, model)
-            })
-            .collect()
+        let mut draws = Vec::with_capacity(
+            self.pet_followers.len()
+                + self
+                    .remote_pet_states
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+        );
+
+        for pet in &self.pet_followers {
+            let model = Mat4::from_translation(pet.feet_position) * Mat4::from_rotation_y(pet.yaw);
+            draws.push(renderer.create_textured_draw(pet_asset, model));
+        }
+
+        for pet_states in self.remote_pet_states.values() {
+            for pet in pet_states {
+                let model = Mat4::from_translation(Vec3::from_array(pet.position))
+                    * Mat4::from_rotation_y(pet.yaw);
+                draws.push(renderer.create_textured_draw(pet_asset, model));
+            }
+        }
+
+        draws
     }
 
     fn chunk_is_visible(&self, position: ChunkPos) -> bool {
@@ -2224,6 +2283,10 @@ impl WebApp {
             return 0;
         }
 
+        if !self.pending_network_events.is_empty() {
+            return 0;
+        }
+
         if self.movement_active {
             return default_budget.saturating_div(2).max(1);
         }
@@ -2233,6 +2296,10 @@ impl WebApp {
 
     fn mesh_upload_budget(&self) -> usize {
         if self.completed_meshes.is_empty() {
+            return 0;
+        }
+
+        if !self.pending_network_events.is_empty() {
             return 0;
         }
 

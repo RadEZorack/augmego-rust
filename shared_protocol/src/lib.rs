@@ -3,7 +3,7 @@ use shared_math::{ChunkPos, WorldPos};
 use shared_world::{BlockId, ChunkData, ChunkDelta};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -48,11 +48,19 @@ pub struct ChunkUnload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerInputTick {
     pub tick: u64,
+    pub client_sent_at_ms: Option<u64>,
     pub movement: [f32; 3],
     pub position: Option<[f32; 3]>,
     pub velocity: Option<[f32; 3]>,
     pub yaw: Option<f32>,
     pub jump: bool,
+    pub pet_states: Vec<PetStateSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PetStateSnapshot {
+    pub position: [f32; 3],
+    pub yaw: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +73,7 @@ pub struct PlayerStateSnapshot {
     pub idle_model_url: Option<String>,
     pub run_model_url: Option<String>,
     pub dance_model_url: Option<String>,
+    pub pet_states: Vec<PetStateSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

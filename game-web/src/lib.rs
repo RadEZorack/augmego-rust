@@ -4,29 +4,31 @@ use anyhow::Result;
 use glam::{Mat4, Quat, Vec3};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
-    BreakBlockRequest, ClientHello, ClientMessage, ClientWebRtcSignal, InventorySnapshot, LoginRequest,
-    PROTOCOL_VERSION, PlaceBlockRequest, PlayerInputTick, ServerMessage, ServerWebRtcSignal,
-    SubscribeChunks, WebRtcSignalPayload, decode, encode,
+    BreakBlockRequest, ClientHello, ClientMessage, ClientWebRtcSignal, InventorySnapshot,
+    LoginRequest, PROTOCOL_VERSION, PlaceBlockRequest, PlayerInputTick, ServerMessage,
+    ServerWebRtcSignal, SubscribeChunks, WebRtcSignalPayload, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
+use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_time::Instant;
 use web_sys::{
     BinaryType, CanvasRenderingContext2d, CloseEvent, Document, Element, ErrorEvent,
     Event as WebEvent, FormData, HtmlCanvasElement, HtmlInputElement, HtmlVideoElement,
-    MediaStream, MediaStreamConstraints, MessageEvent, Request, RequestCredentials,
-    RequestInit, RequestMode, Response, RtcIceCandidateInit, RtcPeerConnection,
-    RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit, RtcTrackEvent,
-    WebSocket, Worker,
+    MediaStream, MediaStreamConstraints, MessageEvent, Request, RequestCredentials, RequestInit,
+    RequestMode, Response, RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent,
+    RtcSdpType, RtcSessionDescriptionInit, RtcTrackEvent, WebSocket, Worker,
 };
-use wgpu_lite::{AnimatedMesh, AnimatedMeshDraw, AnimatedVertex, DynamicTexture, MAX_SKIN_JOINTS, Mesh, Renderer, TexturedMesh, Vertex};
+use web_time::Instant;
+use wgpu_lite::{
+    AnimatedMesh, AnimatedMeshDraw, AnimatedVertex, DynamicTexture, MAX_SKIN_JOINTS, Mesh,
+    Renderer, TexturedMesh, TexturedMeshDraw, Vertex,
+};
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -34,7 +36,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::web::WindowExtWebSys;
 use winit::window::WindowBuilder;
 
-const FEATURED_MODEL_BYTES: &[u8] = include_bytes!(concat!(
+const PET_MODEL_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../assets/models/Meshy_AI_A_cute_dog_0326155854_texture.glb"
 ));
@@ -77,7 +79,28 @@ const REMOTE_PLAYER_HALF_WIDTH: f32 = 0.35;
 const REMOTE_PLAYER_HALF_HEIGHT: f32 = 0.9;
 const WEBCAM_PANEL_HALF_WIDTH: f32 = 0.55;
 const WEBCAM_PANEL_HALF_HEIGHT: f32 = 0.40;
-const FEATURED_MODEL_DESIRED_HEIGHT: f32 = 1.5;
+const PET_MODEL_DESIRED_HEIGHT: f32 = 1.2;
+const PET_FOLLOWER_COUNT: usize = 6;
+const PET_FOLLOW_SPEED: f32 = 5.8;
+const PET_FOLLOW_ACCELERATION: f32 = 18.0;
+const PET_AIR_ACCELERATION: f32 = 8.0;
+const PET_GRAVITY: f32 = 16.0;
+const PET_STOP_DISTANCE: f32 = 0.45;
+const PET_SLOW_RADIUS: f32 = 1.0;
+const PET_TELEPORT_DISTANCE: f32 = 10.0;
+const PET_STUCK_PROGRESS_EPSILON: f32 = 0.05;
+const PET_STUCK_DISTANCE: f32 = 1.5;
+const PET_STUCK_TIMEOUT_SECS: f32 = 1.25;
+const PET_CLIMB_BOOST_SPEED: f32 = 5.0;
+const PET_FALL_RESET_Y: f32 = -8.0;
+const PET_SLOT_OFFSETS: [(f32, f32); PET_FOLLOWER_COUNT] = [
+    (-1.0, 3.3),
+    (1.0, 3.3),
+    (-2.0, 3.1),
+    (2.0, 3.1),
+    (-0.6, 3.9),
+    (0.6, 3.9),
+];
 const REMOTE_AVATAR_RUN_SPEED_THRESHOLD: f32 = 0.15;
 const REMOTE_AVATAR_IDLE_DELAY_SECS: f32 = 0.35;
 const REMOTE_AVATAR_DANCE_DELAY_SECS: f32 = 5.0;
@@ -101,19 +124,30 @@ struct PlayerAvatarSelection {
 
 impl PlayerAvatarSelection {
     fn idle_url(&self) -> Option<&str> {
-        self.idle_model_url.as_deref().map(str::trim).filter(|url| !url.is_empty())
+        self.idle_model_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
     }
 
     fn run_url(&self) -> Option<&str> {
-        self.run_model_url.as_deref().map(str::trim).filter(|url| !url.is_empty())
+        self.run_model_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
     }
 
     fn dance_url(&self) -> Option<&str> {
-        self.dance_model_url.as_deref().map(str::trim).filter(|url| !url.is_empty())
+        self.dance_model_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
     }
 
     fn first_available_url(&self) -> Option<&str> {
-        self.idle_url().or_else(|| self.run_url()).or_else(|| self.dance_url())
+        self.idle_url()
+            .or_else(|| self.run_url())
+            .or_else(|| self.dance_url())
     }
 
     fn url_for_animation(&self, animation: RemoteAvatarAnimation) -> Option<&str> {
@@ -166,14 +200,8 @@ enum AuthEvent {
 }
 
 enum RemoteAvatarEvent {
-    Loaded {
-        url: String,
-        bytes: Vec<u8>,
-    },
-    Failed {
-        url: String,
-        message: String,
-    },
+    Loaded { url: String, bytes: Vec<u8> },
+    Failed { url: String, message: String },
 }
 
 struct RemoteAvatarAsset {
@@ -309,18 +337,28 @@ async fn run() -> Result<()> {
                     app.resize(size);
                 }
                 WindowEvent::KeyboardInput { event, .. } => app.handle_key(event),
-                WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button,
+                    ..
+                } => {
                     app.handle_mouse_button(button);
                 }
                 WindowEvent::RedrawRequested => {
                     app.process_webcam_events();
                     app.process_remote_avatar_events(&renderer);
-                    app.process_generation_updates(&renderer, &mut chunk_meshes, DEFAULT_GENERATION_BUDGET_PER_UPDATE);
+                    app.process_generation_updates(
+                        &renderer,
+                        &mut chunk_meshes,
+                        DEFAULT_GENERATION_BUDGET_PER_UPDATE,
+                    );
                     app.tick();
                     renderer.update_camera(app.camera_matrix());
                     let visible_meshes = chunk_meshes
                         .iter()
-                        .filter_map(|(position, mesh)| app.chunk_is_visible(*position).then_some(mesh))
+                        .filter_map(|(position, mesh)| {
+                            app.chunk_is_visible(*position).then_some(mesh)
+                        })
                         .collect::<Vec<_>>();
                     let link_panel_mesh = app.build_link_panel_mesh(&renderer);
                     let mut visible_mesh_refs = visible_meshes;
@@ -331,11 +369,12 @@ async fn run() -> Result<()> {
                     if let Some(mesh) = &remote_players_mesh {
                         visible_mesh_refs.push(mesh);
                     }
-                    let remote_media_placeholder_mesh = app.build_remote_media_placeholder_mesh(&renderer);
+                    let remote_media_placeholder_mesh =
+                        app.build_remote_media_placeholder_mesh(&renderer);
                     if let Some(mesh) = &remote_media_placeholder_mesh {
                         visible_mesh_refs.push(mesh);
                     }
-                    app.ensure_featured_model_loaded(&renderer);
+                    app.ensure_pet_asset_loaded(&renderer);
                     app.update_remote_media_textures(&renderer);
                     let textured_meshes = app.build_remote_media_meshes(&renderer);
                     let mut overlay_meshes = Vec::new();
@@ -346,15 +385,14 @@ async fn run() -> Result<()> {
                         overlay_meshes.push(mesh);
                     }
                     let remote_avatar_meshes = app.build_remote_avatar_meshes(&renderer);
-                    let mut textured_mesh_refs = textured_meshes.iter().collect::<Vec<_>>();
-                    if let Some(featured_model) = app.featured_model.as_ref() {
-                        textured_mesh_refs.push(featured_model);
-                    }
+                    let textured_mesh_refs = textured_meshes.iter().collect::<Vec<_>>();
+                    let pet_mesh_draws = app.build_pet_mesh_draws(&renderer);
                     let overlay_refs = overlay_meshes.iter().collect::<Vec<_>>();
 
                     if let Err(error) = renderer.render(
                         &visible_mesh_refs,
                         &textured_mesh_refs,
+                        &pet_mesh_draws,
                         &remote_avatar_meshes,
                         &overlay_refs,
                     ) {
@@ -363,7 +401,10 @@ async fn run() -> Result<()> {
                 }
                 _ => {}
             },
-            Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta }, .. } => {
+            Event::DeviceEvent {
+                event: DeviceEvent::MouseMotion { delta },
+                ..
+            } => {
                 if app.mouse_captured {
                     app.handle_mouse_motion(delta.0 as f32, delta.1 as f32);
                 }
@@ -411,8 +452,10 @@ struct WebApp {
     remote_media: HashMap<u64, RemotePeerMedia>,
     remote_avatar_assets: HashMap<String, RemoteAvatarAsset>,
     pending_remote_avatar_urls: HashSet<String>,
-    featured_model: Option<TexturedMesh>,
-    featured_model_attempted: bool,
+    pet_asset: Option<TexturedMesh>,
+    pet_asset_attempted: bool,
+    pet_followers: Vec<PetFollowerState>,
+    pet_followers_need_reset: bool,
     spawn_position: Option<WorldPos>,
     world_seed: u64,
     webcam_requested: bool,
@@ -481,8 +524,12 @@ impl WebApp {
         let auth_rx = request_auth_session();
         let (remote_avatar_tx, remote_avatar_rx) = mpsc::channel();
         let (auth_overlay, auth_overlay_status, auth_button_onclicks) = create_auth_overlay();
-        let (player_avatar_panel, player_avatar_modal, player_avatar_panel_status, player_avatar_panel_onclick) =
-            create_player_avatar_panel();
+        let (
+            player_avatar_panel,
+            player_avatar_modal,
+            player_avatar_panel_status,
+            player_avatar_panel_onclick,
+        ) = create_player_avatar_panel();
         update_hotbar_ui(&hotbar_slots, &hotbar_blocks, 0);
         let current_chunk = chunk_from_world_position(camera.position);
         let desired_chunks = HashSet::new();
@@ -524,8 +571,10 @@ impl WebApp {
             remote_media: HashMap::new(),
             remote_avatar_assets: HashMap::new(),
             pending_remote_avatar_urls: HashSet::new(),
-            featured_model: None,
-            featured_model_attempted: false,
+            pet_asset: None,
+            pet_asset_attempted: false,
+            pet_followers: Vec::new(),
+            pet_followers_need_reset: false,
             spawn_position: None,
             world_seed: DEFAULT_WORLD_SEED,
             webcam_requested: false,
@@ -572,7 +621,9 @@ impl WebApp {
     fn sync_pointer_lock_state(&mut self) {
         self.mouse_captured = pointer_is_locked(&self.canvas);
         if self.mouse_captured {
-            let _ = self.mouse_lock_prompt.set_attribute("style", "display:none;");
+            let _ = self
+                .mouse_lock_prompt
+                .set_attribute("style", "display:none;");
         } else {
             let _ = self.mouse_lock_prompt.set_attribute(
                 "style",
@@ -622,7 +673,11 @@ impl WebApp {
     fn set_selected_hotbar(&mut self, index: usize) {
         if index < self.hotbar_blocks.len() {
             self.selected_hotbar = index;
-            update_hotbar_ui(&self.hotbar_slots, &self.hotbar_blocks, self.selected_hotbar);
+            update_hotbar_ui(
+                &self.hotbar_slots,
+                &self.hotbar_blocks,
+                self.selected_hotbar,
+            );
         }
     }
 
@@ -669,7 +724,11 @@ impl WebApp {
                     };
 
                     let selected_block = self.selected_hotbar_block();
-                    if self.player_collides_with_world_pos(self.camera.position, place_at, selected_block) {
+                    if self.player_collides_with_world_pos(
+                        self.camera.position,
+                        place_at,
+                        selected_block,
+                    ) {
                         return;
                     }
 
@@ -798,8 +857,10 @@ impl WebApp {
                             self.remote_media.clear();
                             self.remote_avatar_assets.clear();
                             self.pending_remote_avatar_urls.clear();
-                            self.featured_model = None;
-                            self.featured_model_attempted = false;
+                            self.pet_asset = None;
+                            self.pet_asset_attempted = false;
+                            self.pet_followers.clear();
+                            self.pet_followers_need_reset = false;
                             web_sys::console::error_1(&JsValue::from_str(&format!(
                                 "multiplayer disconnected: decode websocket message: {error}"
                             )));
@@ -808,126 +869,139 @@ impl WebApp {
                     };
 
                     match message {
-                    ServerMessage::ServerHello(hello) => {
-                        self.world_seed = hello.world_seed;
-                        self.server_ready_for_login = true;
-                        self.maybe_send_login_request();
-                    }
-                    ServerMessage::LoginResponse(response) => {
-                        if response.accepted {
-                            self.logged_in = true;
-                            self.login_request_sent = false;
-                            self.player_id = Some(response.player_id);
-                            self.pending_network_events.clear();
-                            self.remote_players.clear();
-                            self.remote_player_velocities.clear();
-                            self.remote_player_yaws.clear();
-                            self.remote_player_avatar_selections.clear();
-                            self.remote_player_avatar_states.clear();
-                            self.remote_media.clear();
-                            self.remote_avatar_assets.clear();
-                            self.pending_remote_avatar_urls.clear();
-                            self.last_sent_position = None;
-                            self.last_sent_velocity = None;
-                            self.last_sent_yaw = None;
-                            self.camera.position = Vec3::new(
-                                response.spawn_position.x as f32 + 0.5,
-                                response.spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
-                                response.spawn_position.z as f32 + 0.5,
-                            );
-                            self.camera.vertical_velocity = 0.0;
-                            self.camera.on_ground = false;
-                            self.spawn_settled = false;
-                            self.current_chunk = chunk_from_world_position(self.camera.position);
-                            self.desired_chunks = desired_chunk_set(self.current_chunk, WEB_RADIUS);
-                            self.completed_meshes.clear();
-                            self.last_reprioritize_chunk = self.current_chunk;
-                            self.last_reprioritize_forward = self.camera.forward();
-                            self.pending_generation.clear();
-                            self.inflight_generation.clear();
-                            self.dirty_generation.clear();
-                            let desired_positions =
-                                ordered_desired_chunk_positions(self.current_chunk, WEB_RADIUS);
-                            for position in desired_positions {
-                                self.schedule_chunk_rebuild_deferred(position);
+                        ServerMessage::ServerHello(hello) => {
+                            self.world_seed = hello.world_seed;
+                            self.server_ready_for_login = true;
+                            self.maybe_send_login_request();
+                        }
+                        ServerMessage::LoginResponse(response) => {
+                            if response.accepted {
+                                self.logged_in = true;
+                                self.login_request_sent = false;
+                                self.player_id = Some(response.player_id);
+                                self.pending_network_events.clear();
+                                self.remote_players.clear();
+                                self.remote_player_velocities.clear();
+                                self.remote_player_yaws.clear();
+                                self.remote_player_avatar_selections.clear();
+                                self.remote_player_avatar_states.clear();
+                                self.remote_media.clear();
+                                self.remote_avatar_assets.clear();
+                                self.pending_remote_avatar_urls.clear();
+                                self.last_sent_position = None;
+                                self.last_sent_velocity = None;
+                                self.last_sent_yaw = None;
+                                self.camera.position = Vec3::new(
+                                    response.spawn_position.x as f32 + 0.5,
+                                    response.spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
+                                    response.spawn_position.z as f32 + 0.5,
+                                );
+                                self.camera.vertical_velocity = 0.0;
+                                self.camera.on_ground = false;
+                                self.spawn_settled = false;
+                                self.current_chunk =
+                                    chunk_from_world_position(self.camera.position);
+                                self.desired_chunks =
+                                    desired_chunk_set(self.current_chunk, WEB_RADIUS);
+                                self.completed_meshes.clear();
+                                self.last_reprioritize_chunk = self.current_chunk;
+                                self.last_reprioritize_forward = self.camera.forward();
+                                self.pending_generation.clear();
+                                self.inflight_generation.clear();
+                                self.dirty_generation.clear();
+                                let desired_positions =
+                                    ordered_desired_chunk_positions(self.current_chunk, WEB_RADIUS);
+                                for position in desired_positions {
+                                    self.schedule_chunk_rebuild_deferred(position);
+                                }
+                                self.send_chunk_subscription(self.current_chunk);
+                                self.link_panel = LinkPanel::near_spawn(self.camera.position);
+                                self.spawn_position = Some(response.spawn_position);
+                                self.pet_asset = None;
+                                self.pet_asset_attempted = false;
+                                self.pet_followers.clear();
+                                self.pet_followers_need_reset = true;
                             }
-                            self.send_chunk_subscription(self.current_chunk);
-                            self.link_panel = LinkPanel::near_spawn(self.camera.position);
-                            self.spawn_position = Some(response.spawn_position);
-                            self.featured_model = None;
-                            self.featured_model_attempted = false;
                         }
-                    }
-                    ServerMessage::ChunkData(chunk) => {
-                        let position = chunk.position;
-                        self.chunk_edits.remove(&position);
-                        let changed = self
-                            .authoritative_chunks
-                            .get(&position)
-                            .map(|existing| existing != &chunk)
-                            .unwrap_or(true);
-                        self.authoritative_chunks.insert(position, chunk);
-                        if changed && self.desired_chunks.contains(&position) {
-                            self.schedule_chunk_rebuild(position);
-                        }
-                    }
-                    ServerMessage::ChunkUnload(unload) => {
-                        for position in unload.positions {
-                            self.authoritative_chunks.remove(&position);
-                            self.collision_voxels.remove(&position);
+                        ServerMessage::ChunkData(chunk) => {
+                            let position = chunk.position;
                             self.chunk_edits.remove(&position);
-                            self.pending_generation.retain(|pending| *pending != position);
-                            self.inflight_generation.remove(&position);
-                            self.dirty_generation.remove(&position);
-                            self.completed_meshes.retain(|mesh| mesh.position != position);
-                        }
-                    }
-                    ServerMessage::InventorySnapshot(InventorySnapshot { slots }) => {
-                        self.hotbar_blocks = slots.into_iter().map(|slot| slot.block).collect();
-                        if self.hotbar_blocks.is_empty() {
-                            self.hotbar_blocks = vec![BlockId::Grass, BlockId::Stone, BlockId::Planks];
-                        }
-                        if self.selected_hotbar >= self.hotbar_blocks.len() {
-                            self.selected_hotbar = self.hotbar_blocks.len().saturating_sub(1);
-                        }
-                        update_hotbar_ui(&self.hotbar_slots, &self.hotbar_blocks, self.selected_hotbar);
-                    }
-                    ServerMessage::PlayerStateSnapshot(snapshot) => {
-                        if Some(snapshot.player_id) != self.player_id {
-                            self.remote_players.insert(snapshot.player_id, snapshot.position);
-                            self.remote_player_velocities
-                                .insert(snapshot.player_id, snapshot.velocity);
-                            self.remote_player_yaws.insert(snapshot.player_id, snapshot.yaw);
-                            let selection = PlayerAvatarSelection {
-                                idle_model_url: snapshot.idle_model_url.clone(),
-                                run_model_url: snapshot.run_model_url.clone(),
-                                dance_model_url: snapshot.dance_model_url.clone(),
-                            };
-                            let selection_changed = self
-                                .remote_player_avatar_selections
-                                .get(&snapshot.player_id)
-                                .map(|existing| existing != &selection)
+                            let changed = self
+                                .authoritative_chunks
+                                .get(&position)
+                                .map(|existing| existing != &chunk)
                                 .unwrap_or(true);
-                            self.remote_player_avatar_selections
-                                .insert(snapshot.player_id, selection.clone());
-                            let state = self
-                                .remote_player_avatar_states
-                                .entry(snapshot.player_id)
-                                .or_default();
-                            if selection_changed {
-                                state.active_url = None;
+                            self.authoritative_chunks.insert(position, chunk);
+                            if changed && self.desired_chunks.contains(&position) {
+                                self.schedule_chunk_rebuild(position);
                             }
-                            self.ensure_remote_avatar_selection_requested(&selection);
-                            self.ensure_peer_connection(snapshot.player_id);
                         }
-                    }
-                    ServerMessage::WebRtcSignal(signal) => self.handle_webrtc_signal(signal),
-                    ServerMessage::BlockActionResult(result) => {
-                        if !result.accepted {
-                            web_sys::console::warn_1(&JsValue::from_str(&result.reason));
+                        ServerMessage::ChunkUnload(unload) => {
+                            for position in unload.positions {
+                                self.authoritative_chunks.remove(&position);
+                                self.collision_voxels.remove(&position);
+                                self.chunk_edits.remove(&position);
+                                self.pending_generation
+                                    .retain(|pending| *pending != position);
+                                self.inflight_generation.remove(&position);
+                                self.dirty_generation.remove(&position);
+                                self.completed_meshes
+                                    .retain(|mesh| mesh.position != position);
+                            }
                         }
-                    }
-                    ServerMessage::ChunkDelta(_) | ServerMessage::ChatMessage(_) => {}
+                        ServerMessage::InventorySnapshot(InventorySnapshot { slots }) => {
+                            self.hotbar_blocks = slots.into_iter().map(|slot| slot.block).collect();
+                            if self.hotbar_blocks.is_empty() {
+                                self.hotbar_blocks =
+                                    vec![BlockId::Grass, BlockId::Stone, BlockId::Planks];
+                            }
+                            if self.selected_hotbar >= self.hotbar_blocks.len() {
+                                self.selected_hotbar = self.hotbar_blocks.len().saturating_sub(1);
+                            }
+                            update_hotbar_ui(
+                                &self.hotbar_slots,
+                                &self.hotbar_blocks,
+                                self.selected_hotbar,
+                            );
+                        }
+                        ServerMessage::PlayerStateSnapshot(snapshot) => {
+                            if Some(snapshot.player_id) != self.player_id {
+                                self.remote_players
+                                    .insert(snapshot.player_id, snapshot.position);
+                                self.remote_player_velocities
+                                    .insert(snapshot.player_id, snapshot.velocity);
+                                self.remote_player_yaws
+                                    .insert(snapshot.player_id, snapshot.yaw);
+                                let selection = PlayerAvatarSelection {
+                                    idle_model_url: snapshot.idle_model_url.clone(),
+                                    run_model_url: snapshot.run_model_url.clone(),
+                                    dance_model_url: snapshot.dance_model_url.clone(),
+                                };
+                                let selection_changed = self
+                                    .remote_player_avatar_selections
+                                    .get(&snapshot.player_id)
+                                    .map(|existing| existing != &selection)
+                                    .unwrap_or(true);
+                                self.remote_player_avatar_selections
+                                    .insert(snapshot.player_id, selection.clone());
+                                let state = self
+                                    .remote_player_avatar_states
+                                    .entry(snapshot.player_id)
+                                    .or_default();
+                                if selection_changed {
+                                    state.active_url = None;
+                                }
+                                self.ensure_remote_avatar_selection_requested(&selection);
+                                self.ensure_peer_connection(snapshot.player_id);
+                            }
+                        }
+                        ServerMessage::WebRtcSignal(signal) => self.handle_webrtc_signal(signal),
+                        ServerMessage::BlockActionResult(result) => {
+                            if !result.accepted {
+                                web_sys::console::warn_1(&JsValue::from_str(&result.reason));
+                            }
+                        }
+                        ServerMessage::ChunkDelta(_) | ServerMessage::ChatMessage(_) => {}
                     }
                 }
                 NetworkEvent::Disconnected(reason) => {
@@ -945,10 +1019,14 @@ impl WebApp {
                     self.remote_media.clear();
                     self.remote_avatar_assets.clear();
                     self.pending_remote_avatar_urls.clear();
-                    self.featured_model = None;
-                    self.featured_model_attempted = false;
+                    self.pet_asset = None;
+                    self.pet_asset_attempted = false;
+                    self.pet_followers.clear();
+                    self.pet_followers_need_reset = false;
                     self.last_sent_yaw = None;
-                    web_sys::console::error_1(&JsValue::from_str(&format!("multiplayer disconnected: {reason}")));
+                    web_sys::console::error_1(&JsValue::from_str(&format!(
+                        "multiplayer disconnected: {reason}"
+                    )));
                 }
             }
         }
@@ -993,12 +1071,16 @@ impl WebApp {
     fn sync_auth_overlay(&self) {
         match &self.auth_status {
             AuthStatus::Checking => {
-                let _ = self.auth_overlay.set_attribute("style", auth_overlay_style());
+                let _ = self
+                    .auth_overlay
+                    .set_attribute("style", auth_overlay_style());
                 self.auth_overlay_status
                     .set_text_content(Some(AUTH_STATUS_CHECKING));
             }
             AuthStatus::SignedOut => {
-                let _ = self.auth_overlay.set_attribute("style", auth_overlay_style());
+                let _ = self
+                    .auth_overlay
+                    .set_attribute("style", auth_overlay_style());
                 self.auth_overlay_status
                     .set_text_content(Some(AUTH_STATUS_SIGNED_OUT));
             }
@@ -1006,7 +1088,9 @@ impl WebApp {
                 let _ = self.auth_overlay.set_attribute("style", "display:none;");
             }
             AuthStatus::Failed(message) => {
-                let _ = self.auth_overlay.set_attribute("style", auth_overlay_style());
+                let _ = self
+                    .auth_overlay
+                    .set_attribute("style", auth_overlay_style());
                 self.auth_overlay_status.set_text_content(Some(message));
             }
         }
@@ -1038,7 +1122,8 @@ impl WebApp {
                         } else {
                             "Avatar animations ready. Upload again to replace any slot."
                         };
-                        self.player_avatar_panel_status.set_text_content(Some(message));
+                        self.player_avatar_panel_status
+                            .set_text_content(Some(message));
                     }
                 }
             }
@@ -1054,7 +1139,11 @@ impl WebApp {
     }
 
     fn maybe_send_login_request(&mut self) {
-        if !self.transport_open || !self.server_ready_for_login || self.logged_in || self.login_request_sent {
+        if !self.transport_open
+            || !self.server_ready_for_login
+            || self.logged_in
+            || self.login_request_sent
+        {
             return;
         }
 
@@ -1089,7 +1178,9 @@ impl WebApp {
                 let _ = self.websocket.send_with_u8_array(&bytes);
             }
             Err(error) => {
-                web_sys::console::error_1(&JsValue::from_str(&format!("encode client message: {error}")));
+                web_sys::console::error_1(&JsValue::from_str(&format!(
+                    "encode client message: {error}"
+                )));
             }
         }
     }
@@ -1144,12 +1235,17 @@ impl WebApp {
         if movement_for_server.length_squared() > 1.0 {
             movement_for_server = movement_for_server.normalize();
         }
-        let forward = Vec3::new(self.camera.yaw.sin(), 0.0, self.camera.yaw.cos()).normalize_or_zero();
+        let forward =
+            Vec3::new(self.camera.yaw.sin(), 0.0, self.camera.yaw.cos()).normalize_or_zero();
         let right = Vec3::new(-forward.z, 0.0, forward.x);
         let world_movement = forward * -movement_for_server.z + right * movement_for_server.x;
 
         let previous_position = self.camera.position;
         self.update_camera_physics(dt, movement, jump, sprint);
+        if self.logged_in {
+            self.ensure_pet_followers_initialized();
+            self.update_pet_followers(dt);
+        }
         if !self.logged_in {
             return;
         }
@@ -1159,7 +1255,11 @@ impl WebApp {
             Vec3::ZERO
         };
         let position = self.camera.position.to_array();
-        let velocity = [actual_velocity.x, self.camera.vertical_velocity, actual_velocity.z];
+        let velocity = [
+            actual_velocity.x,
+            self.camera.vertical_velocity,
+            actual_velocity.z,
+        ];
         let input_active = movement != Vec3::ZERO || jump || sprint;
         let should_broadcast_motion = input_active || !self.camera.on_ground;
         let position_changed = self
@@ -1199,6 +1299,199 @@ impl WebApp {
             self.last_sent_velocity = Some(velocity);
             self.last_sent_yaw = Some(self.camera.yaw);
         }
+    }
+
+    fn player_feet_position(&self) -> Vec3 {
+        self.camera.position - Vec3::Y * PLAYER_EYE_HEIGHT
+    }
+
+    fn ensure_pet_followers_initialized(&mut self) {
+        if !self.spawn_settled
+            || (!self.pet_followers_need_reset && self.pet_followers.len() == PET_FOLLOWER_COUNT)
+        {
+            return;
+        }
+
+        let player_feet = self.player_feet_position();
+        let (forward, right) = horizontal_basis_from_yaw(self.camera.yaw);
+        self.pet_followers = PET_SLOT_OFFSETS
+            .into_iter()
+            .map(|(right_offset, forward_offset)| {
+                let slot_target = player_feet + right * right_offset + forward * forward_offset;
+                let feet_position = self.find_safe_pet_position(slot_target, player_feet);
+                let distance = horizontal_distance(feet_position, slot_target);
+                PetFollowerState::new(feet_position, self.camera.yaw, distance)
+            })
+            .collect();
+        self.pet_followers_need_reset = false;
+    }
+
+    fn update_pet_followers(&mut self, dt: Duration) {
+        let dt_secs = dt.as_secs_f32();
+        if dt_secs <= 0.0 || self.pet_followers.is_empty() {
+            return;
+        }
+
+        let player_feet = self.player_feet_position();
+        let (forward, right) = horizontal_basis_from_yaw(self.camera.yaw);
+        for index in 0..self.pet_followers.len() {
+            let (right_offset, forward_offset) = PET_SLOT_OFFSETS[index];
+            let slot_target = player_feet + right * right_offset + forward * forward_offset;
+            let mut pet = self.pet_followers[index];
+            self.update_pet_follower(&mut pet, slot_target, player_feet, dt_secs);
+            self.pet_followers[index] = pet;
+        }
+    }
+
+    fn update_pet_follower(
+        &mut self,
+        pet: &mut PetFollowerState,
+        slot_target: Vec3,
+        player_feet: Vec3,
+        dt_secs: f32,
+    ) {
+        if self.pet_needs_reset(pet, slot_target) {
+            self.reset_pet_follower(pet, slot_target, player_feet);
+            return;
+        }
+
+        let to_target = Vec3::new(
+            slot_target.x - pet.feet_position.x,
+            0.0,
+            slot_target.z - pet.feet_position.z,
+        );
+        let slot_distance = to_target.length();
+        let desired_velocity = if slot_distance <= PET_STOP_DISTANCE {
+            Vec3::ZERO
+        } else {
+            let slow_factor = if slot_distance < PET_SLOW_RADIUS {
+                ((slot_distance - PET_STOP_DISTANCE) / (PET_SLOW_RADIUS - PET_STOP_DISTANCE))
+                    .clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            to_target.normalize_or_zero() * (PET_FOLLOW_SPEED * slow_factor)
+        };
+        let acceleration = if pet.on_ground {
+            PET_FOLLOW_ACCELERATION
+        } else {
+            PET_AIR_ACCELERATION
+        };
+        pet.horizontal_velocity = move_towards_vec3(
+            pet.horizontal_velocity,
+            desired_velocity,
+            acceleration * dt_secs,
+        );
+        pet.horizontal_velocity.y = 0.0;
+
+        pet.vertical_velocity -= PET_GRAVITY * dt_secs;
+        let previous_feet = pet.feet_position;
+        let horizontal_delta = pet.horizontal_velocity * dt_secs;
+        self.sweep_collider_axis(
+            &mut pet.feet_position,
+            horizontal_delta.x,
+            Axis::X,
+            pet.on_ground,
+            PET_COLLIDER,
+        );
+        self.sweep_collider_axis(
+            &mut pet.feet_position,
+            horizontal_delta.z,
+            Axis::Z,
+            pet.on_ground,
+            PET_COLLIDER,
+        );
+
+        let requested_horizontal = Vec3::new(horizontal_delta.x, 0.0, horizontal_delta.z).length();
+        let moved_horizontal = horizontal_distance(previous_feet, pet.feet_position);
+        if slot_distance > PET_STUCK_DISTANCE
+            && requested_horizontal > 0.01
+            && moved_horizontal + 0.02 < requested_horizontal
+        {
+            pet.vertical_velocity = pet.vertical_velocity.max(PET_CLIMB_BOOST_SPEED);
+            pet.on_ground = false;
+        }
+
+        let moved_vertically = self.sweep_collider_axis(
+            &mut pet.feet_position,
+            pet.vertical_velocity * dt_secs,
+            Axis::Y,
+            false,
+            PET_COLLIDER,
+        );
+        if moved_vertically {
+            pet.on_ground = false;
+        } else {
+            if pet.vertical_velocity < 0.0 {
+                pet.on_ground = true;
+            }
+            pet.vertical_velocity = 0.0;
+        }
+
+        if pet.horizontal_velocity.length_squared() > 0.0025 {
+            pet.yaw = pet.horizontal_velocity.x.atan2(pet.horizontal_velocity.z);
+        }
+
+        let next_distance = horizontal_distance(pet.feet_position, slot_target);
+        let progress = pet.last_slot_distance - next_distance;
+        if next_distance > PET_STUCK_DISTANCE {
+            if progress < PET_STUCK_PROGRESS_EPSILON {
+                pet.stuck_timer += dt_secs;
+            } else {
+                pet.stuck_timer = 0.0;
+            }
+        } else {
+            pet.stuck_timer = 0.0;
+        }
+        pet.last_slot_distance = next_distance;
+
+        if self.pet_needs_reset(pet, slot_target) {
+            self.reset_pet_follower(pet, slot_target, player_feet);
+        }
+    }
+
+    fn pet_needs_reset(&self, pet: &PetFollowerState, slot_target: Vec3) -> bool {
+        let slot_distance = horizontal_distance(pet.feet_position, slot_target);
+        slot_distance > PET_TELEPORT_DISTANCE
+            || pet.feet_position.y < PET_FALL_RESET_Y
+            || (slot_distance > PET_STUCK_DISTANCE && pet.stuck_timer >= PET_STUCK_TIMEOUT_SECS)
+    }
+
+    fn reset_pet_follower(
+        &mut self,
+        pet: &mut PetFollowerState,
+        slot_target: Vec3,
+        player_feet: Vec3,
+    ) {
+        let safe_position = self.find_safe_pet_position(slot_target, player_feet);
+        let slot_distance = horizontal_distance(safe_position, slot_target);
+        *pet = PetFollowerState::new(safe_position, self.camera.yaw, slot_distance);
+    }
+
+    fn find_safe_pet_position(&mut self, slot_target: Vec3, player_feet: Vec3) -> Vec3 {
+        const SEARCH_OFFSETS: [(f32, f32); 9] = [
+            (0.0, 0.0),
+            (0.35, 0.0),
+            (-0.35, 0.0),
+            (0.0, 0.35),
+            (0.0, -0.35),
+            (0.35, 0.35),
+            (0.35, -0.35),
+            (-0.35, 0.35),
+            (-0.35, -0.35),
+        ];
+
+        for lift in 0..=6 {
+            let base_y = player_feet.y + lift as f32 * 0.45;
+            for (dx, dz) in SEARCH_OFFSETS {
+                let candidate = Vec3::new(slot_target.x + dx, base_y, slot_target.z + dz);
+                if !self.collider_collides(candidate, PET_COLLIDER, None) {
+                    return candidate;
+                }
+            }
+        }
+
+        player_feet + Vec3::new(0.0, 1.0, 0.0)
     }
 
     fn camera_matrix(&self) -> Mat4 {
@@ -1290,7 +1583,13 @@ impl WebApp {
     fn build_link_panel_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
-        add_link_panel_mesh(&mut vertices, &mut indices, self.link_panel, [1.0, 1.0, 1.0], LINK_PANEL_TILE);
+        add_link_panel_mesh(
+            &mut vertices,
+            &mut indices,
+            self.link_panel,
+            [1.0, 1.0, 1.0],
+            LINK_PANEL_TILE,
+        );
         Some(renderer.create_mesh(&vertices, &indices))
     }
 
@@ -1342,10 +1641,9 @@ impl WebApp {
                 .get(&player_id)
                 .map(|state| state.playback_time)
                 .unwrap_or(0.0);
-            let model =
-                Mat4::from_translation(anchor.body)
-                    * Mat4::from_rotation_y(yaw)
-                    * asset.model_normalization;
+            let model = Mat4::from_translation(anchor.body)
+                * Mat4::from_rotation_y(yaw)
+                * asset.model_normalization;
             let joints = evaluate_avatar_skin_matrices(asset, playback_time);
             meshes.push(renderer.create_animated_draw(&asset.mesh, model, &joints));
         }
@@ -1478,7 +1776,11 @@ impl WebApp {
     fn build_remote_media_meshes(&self, renderer: &Renderer<'_>) -> Vec<TexturedMesh> {
         let mut meshes = Vec::new();
         for (&player_id, position) in &self.remote_players {
-            let Some(texture) = self.remote_media.get(&player_id).and_then(|media| media.texture.as_ref()) else {
+            let Some(texture) = self
+                .remote_media
+                .get(&player_id)
+                .and_then(|media| media.texture.as_ref())
+            else {
                 continue;
             };
             let anchor = player_anchor_from_eye(Vec3::new(position[0], position[1], position[2]));
@@ -1497,26 +1799,37 @@ impl WebApp {
         meshes
     }
 
-    fn ensure_featured_model_loaded(&mut self, renderer: &Renderer<'_>) {
-        if self.featured_model.is_some() || self.featured_model_attempted {
+    fn ensure_pet_asset_loaded(&mut self, renderer: &Renderer<'_>) {
+        if self.pet_followers.is_empty() || self.pet_asset.is_some() || self.pet_asset_attempted {
             return;
         }
 
-        let Some(spawn_position) = self.spawn_position else {
-            return;
-        };
-
-        self.featured_model_attempted = true;
-        match load_featured_model_mesh(renderer, spawn_position) {
+        self.pet_asset_attempted = true;
+        match load_pet_model_mesh(renderer) {
             Ok(mesh) => {
-                self.featured_model = Some(mesh);
+                self.pet_asset = Some(mesh);
             }
             Err(error) => {
                 web_sys::console::error_1(&JsValue::from_str(&format!(
-                    "failed to load featured web model: {error:?}"
+                    "failed to load pet model: {error:?}"
                 )));
             }
         }
+    }
+
+    fn build_pet_mesh_draws(&self, renderer: &Renderer<'_>) -> Vec<TexturedMeshDraw<'_>> {
+        let Some(pet_asset) = self.pet_asset.as_ref() else {
+            return Vec::new();
+        };
+
+        self.pet_followers
+            .iter()
+            .map(|pet| {
+                let model =
+                    Mat4::from_translation(pet.feet_position) * Mat4::from_rotation_y(pet.yaw);
+                renderer.create_textured_draw(pet_asset, model)
+            })
+            .collect()
     }
 
     fn chunk_is_visible(&self, position: ChunkPos) -> bool {
@@ -1612,23 +1925,28 @@ impl WebApp {
 
     fn update_remote_media_textures(&mut self, renderer: &Renderer<'_>) {
         for media in self.remote_media.values_mut() {
-            let (Some(video), Some(canvas), Some(context)) =
-                (media.video.as_ref(), media.canvas.as_ref(), media.context.as_ref())
-            else {
+            let (Some(video), Some(canvas), Some(context)) = (
+                media.video.as_ref(),
+                media.canvas.as_ref(),
+                media.context.as_ref(),
+            ) else {
                 continue;
             };
             if video.video_width() == 0 || video.video_height() == 0 {
                 continue;
             }
             if media.texture.is_none() {
-                media.texture = Some(
-                    renderer.create_dynamic_texture(WEBCAM_SOURCE_SIZE as u32, WEBCAM_SOURCE_SIZE as u32),
-                );
+                media.texture =
+                    Some(renderer.create_dynamic_texture(
+                        WEBCAM_SOURCE_SIZE as u32,
+                        WEBCAM_SOURCE_SIZE as u32,
+                    ));
             }
 
             let width = canvas.width() as f64;
             let height = canvas.height() as f64;
-            let _ = context.draw_image_with_html_video_element_and_dw_and_dh(video, 0.0, 0.0, width, height);
+            let _ = context
+                .draw_image_with_html_video_element_and_dw_and_dh(video, 0.0, 0.0, width, height);
             let Ok(image_data) = context.get_image_data(0.0, 0.0, width, height) else {
                 continue;
             };
@@ -1653,9 +1971,10 @@ impl WebApp {
                     let args = js_sys::Array::new();
                     args.push(&track);
                     args.push(&webcam.stream);
-                    if let Ok(add_track) =
-                        js_sys::Reflect::get(remote.connection.as_ref(), &JsValue::from_str("addTrack"))
-                    {
+                    if let Ok(add_track) = js_sys::Reflect::get(
+                        remote.connection.as_ref(),
+                        &JsValue::from_str("addTrack"),
+                    ) {
                         if let Ok(add_track) = add_track.dyn_into::<js_sys::Function>() {
                             let _ = add_track.apply(remote.connection.as_ref(), &args);
                         }
@@ -1681,7 +2000,10 @@ impl WebApp {
                 };
                 let description = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
                 description.set_sdp(&sdp);
-                if JsFuture::from(connection.set_local_description(&description)).await.is_ok() {
+                if JsFuture::from(connection.set_local_description(&description))
+                    .await
+                    .is_ok()
+                {
                     send_client_message_over_websocket(
                         &ws,
                         &ClientMessage::WebRtcSignal(ClientWebRtcSignal {
@@ -1761,8 +2083,13 @@ impl WebApp {
             canvas.set_width(WEBCAM_SOURCE_SIZE as u32);
             canvas.set_height(WEBCAM_SOURCE_SIZE as u32);
             let options = js_sys::Object::new();
-            let _ = js_sys::Reflect::set(&options, &JsValue::from_str("willReadFrequently"), &JsValue::TRUE);
-            let Ok(Some(context_value)) = canvas.get_context_with_context_options("2d", &options) else {
+            let _ = js_sys::Reflect::set(
+                &options,
+                &JsValue::from_str("willReadFrequently"),
+                &JsValue::TRUE,
+            );
+            let Ok(Some(context_value)) = canvas.get_context_with_context_options("2d", &options)
+            else {
                 return;
             };
             let Ok(context) = context_value.dyn_into::<CanvasRenderingContext2d>() else {
@@ -1810,7 +2137,10 @@ impl WebApp {
                 spawn_local(async move {
                     let description = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
                     description.set_sdp(&sdp);
-                    if JsFuture::from(connection.set_remote_description(&description)).await.is_err() {
+                    if JsFuture::from(connection.set_remote_description(&description))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     flush_pending_ice_candidates(source_player_id, &connection);
@@ -1825,7 +2155,10 @@ impl WebApp {
                     };
                     let answer_description = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
                     answer_description.set_sdp(&answer_sdp);
-                    if JsFuture::from(connection.set_local_description(&answer_description)).await.is_ok() {
+                    if JsFuture::from(connection.set_local_description(&answer_description))
+                        .await
+                        .is_ok()
+                    {
                         send_client_message_over_websocket(
                             &websocket,
                             &ClientMessage::WebRtcSignal(ClientWebRtcSignal {
@@ -1841,7 +2174,10 @@ impl WebApp {
                 spawn_local(async move {
                     let description = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
                     description.set_sdp(&sdp);
-                    if JsFuture::from(connection.set_remote_description(&description)).await.is_ok() {
+                    if JsFuture::from(connection.set_remote_description(&description))
+                        .await
+                        .is_ok()
+                    {
                         flush_pending_ice_candidates(source_player_id, &connection);
                     }
                 });
@@ -1951,8 +2287,9 @@ impl WebApp {
 
         let mut pending = self.pending_generation.drain(..).collect::<Vec<_>>();
         pending.sort_by(|a, b| {
-            chunk_priority(*a, self.current_chunk, self.camera.position, forward)
-                .total_cmp(&chunk_priority(*b, self.current_chunk, self.camera.position, forward))
+            chunk_priority(*a, self.current_chunk, self.camera.position, forward).total_cmp(
+                &chunk_priority(*b, self.current_chunk, self.camera.position, forward),
+            )
         });
         self.pending_generation = pending.into();
         self.last_reprioritize_chunk = self.current_chunk;
@@ -1971,7 +2308,13 @@ impl WebApp {
         self.last_reprioritize_forward.dot(forward) < PENDING_REPRIORITIZE_DOT_THRESHOLD
     }
 
-    fn update_camera_physics(&mut self, dt: Duration, local_movement: Vec3, jump: bool, sprint: bool) {
+    fn update_camera_physics(
+        &mut self,
+        dt: Duration,
+        local_movement: Vec3,
+        jump: bool,
+        sprint: bool,
+    ) {
         let dt_secs = dt.as_secs_f32();
         if dt_secs <= 0.0 {
             return;
@@ -1982,7 +2325,8 @@ impl WebApp {
             horizontal = horizontal.normalize();
         }
 
-        let forward = Vec3::new(self.camera.yaw.sin(), 0.0, self.camera.yaw.cos()).normalize_or_zero();
+        let forward =
+            Vec3::new(self.camera.yaw.sin(), 0.0, self.camera.yaw.cos()).normalize_or_zero();
         let right = Vec3::new(-forward.z, 0.0, forward.x);
         let speed = if sprint {
             PLAYER_SPRINT_SPEED
@@ -1997,13 +2341,29 @@ impl WebApp {
         }
 
         self.camera.vertical_velocity -= PLAYER_GRAVITY * dt_secs;
-        let vertical_delta = self.camera.vertical_velocity * dt_secs;
+        let mut feet_position = self.player_feet_position();
+        self.sweep_collider_axis(
+            &mut feet_position,
+            horizontal_delta.x,
+            Axis::X,
+            self.camera.on_ground,
+            PLAYER_COLLIDER,
+        );
+        self.sweep_collider_axis(
+            &mut feet_position,
+            horizontal_delta.z,
+            Axis::Z,
+            self.camera.on_ground,
+            PLAYER_COLLIDER,
+        );
 
-        let mut position = self.camera.position;
-        self.sweep_axis(&mut position, horizontal_delta.x, Axis::X, self.camera.on_ground);
-        self.sweep_axis(&mut position, horizontal_delta.z, Axis::Z, self.camera.on_ground);
-
-        let moved_vertically = self.sweep_axis(&mut position, vertical_delta, Axis::Y, false);
+        let moved_vertically = self.sweep_collider_axis(
+            &mut feet_position,
+            self.camera.vertical_velocity * dt_secs,
+            Axis::Y,
+            false,
+            PLAYER_COLLIDER,
+        );
         if moved_vertically {
             self.camera.on_ground = false;
         } else {
@@ -2013,10 +2373,17 @@ impl WebApp {
             self.camera.vertical_velocity = 0.0;
         }
 
-        self.camera.position = position;
+        self.camera.position = feet_position + Vec3::Y * PLAYER_EYE_HEIGHT;
     }
 
-    fn sweep_axis(&mut self, position: &mut Vec3, delta: f32, axis: Axis, allow_step: bool) -> bool {
+    fn sweep_collider_axis(
+        &mut self,
+        position: &mut Vec3,
+        delta: f32,
+        axis: Axis,
+        allow_step: bool,
+        collider: ColliderSpec,
+    ) -> bool {
         if delta.abs() <= f32::EPSILON {
             return false;
         }
@@ -2033,11 +2400,11 @@ impl WebApp {
                 Axis::Z => candidate.z += step,
             }
 
-            if self.player_collides(candidate) {
+            if self.collider_collides(candidate, collider, None) {
                 if allow_step && matches!(axis, Axis::X | Axis::Z) {
                     let mut stepped = candidate;
-                    stepped.y += STEP_HEIGHT;
-                    if !self.player_collides(stepped) {
+                    stepped.y += collider.step_height;
+                    if !self.collider_collides(stepped, collider, None) {
                         *position = stepped;
                         moved = true;
                         continue;
@@ -2054,35 +2421,11 @@ impl WebApp {
     }
 
     fn player_collides(&mut self, eye_position: Vec3) -> bool {
-        let min = Vec3::new(
-            eye_position.x - PLAYER_RADIUS,
-            eye_position.y - PLAYER_EYE_HEIGHT,
-            eye_position.z - PLAYER_RADIUS,
-        );
-        let max = Vec3::new(
-            eye_position.x + PLAYER_RADIUS,
-            eye_position.y + (PLAYER_HEIGHT - PLAYER_EYE_HEIGHT),
-            eye_position.z + PLAYER_RADIUS,
-        );
-
-        let min_x = min.x.floor() as i32;
-        let max_x = (max.x - 0.001).floor() as i32;
-        let min_y = min.y.floor() as i32;
-        let max_y = (max.y - 0.001).floor() as i32;
-        let min_z = min.z.floor() as i32;
-        let max_z = (max.z - 0.001).floor() as i32;
-
-        for y in min_y..=max_y {
-            for z in min_z..=max_z {
-                for x in min_x..=max_x {
-                    if self.world_block_is_solid(x, y, z) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
+        self.collider_collides(
+            eye_position - Vec3::Y * PLAYER_EYE_HEIGHT,
+            PLAYER_COLLIDER,
+            None,
+        )
     }
 
     fn world_block_is_solid(&mut self, x: i32, y: i32, z: i32) -> bool {
@@ -2128,16 +2471,21 @@ impl WebApp {
         false
     }
 
-    fn player_collides_with_world_pos(&mut self, eye_position: Vec3, position: WorldPos, block: BlockId) -> bool {
+    fn collider_collides(
+        &mut self,
+        feet_position: Vec3,
+        collider: ColliderSpec,
+        replace_block: Option<(WorldPos, BlockId)>,
+    ) -> bool {
         let min = Vec3::new(
-            eye_position.x - PLAYER_RADIUS,
-            eye_position.y - PLAYER_EYE_HEIGHT,
-            eye_position.z - PLAYER_RADIUS,
+            feet_position.x - collider.radius,
+            feet_position.y,
+            feet_position.z - collider.radius,
         );
         let max = Vec3::new(
-            eye_position.x + PLAYER_RADIUS,
-            eye_position.y + (PLAYER_HEIGHT - PLAYER_EYE_HEIGHT),
-            eye_position.z + PLAYER_RADIUS,
+            feet_position.x + collider.radius,
+            feet_position.y + collider.height,
+            feet_position.z + collider.radius,
         );
 
         let min_x = min.x.floor() as i32;
@@ -2150,11 +2498,16 @@ impl WebApp {
         for y in min_y..=max_y {
             for z in min_z..=max_z {
                 for x in min_x..=max_x {
-                    if i64::from(x) == position.x && y == position.y && i64::from(z) == position.z {
-                        if block_is_solid(block) {
-                            return true;
+                    if let Some((position, block)) = replace_block {
+                        if i64::from(x) == position.x
+                            && y == position.y
+                            && i64::from(z) == position.z
+                        {
+                            if block_is_solid(block) {
+                                return true;
+                            }
+                            continue;
                         }
-                        continue;
                     }
 
                     if self.world_block_is_solid(x, y, z) {
@@ -2165,6 +2518,19 @@ impl WebApp {
         }
 
         false
+    }
+
+    fn player_collides_with_world_pos(
+        &mut self,
+        eye_position: Vec3,
+        position: WorldPos,
+        block: BlockId,
+    ) -> bool {
+        self.collider_collides(
+            eye_position - Vec3::Y * PLAYER_EYE_HEIGHT,
+            PLAYER_COLLIDER,
+            Some((position, block)),
+        )
     }
 
     fn raycast_world(&mut self, max_distance: f32) -> Option<RaycastHit> {
@@ -2214,9 +2580,11 @@ impl WebApp {
         self.schedule_chunk_rebuild(chunk_pos);
 
         match block {
-            BlockId::Air => self.send_client_message(&ClientMessage::BreakBlockRequest(BreakBlockRequest {
-                position,
-            })),
+            BlockId::Air => {
+                self.send_client_message(&ClientMessage::BreakBlockRequest(BreakBlockRequest {
+                    position,
+                }))
+            }
             _ => self.send_client_message(&ClientMessage::PlaceBlockRequest(PlaceBlockRequest {
                 position,
                 block,
@@ -2306,17 +2674,13 @@ struct AnimatedImportedVertex {
     weights: [f32; 4],
 }
 
-fn load_featured_model_mesh(renderer: &Renderer<'_>, spawn_position: WorldPos) -> Result<TexturedMesh> {
-    let (mut vertices, indices, image) = load_glb_model(FEATURED_MODEL_BYTES)?;
-    let (min, max) = model_bounds(&vertices).ok_or_else(|| anyhow::anyhow!("featured model has no vertices"))?;
-    let scale = FEATURED_MODEL_DESIRED_HEIGHT / (max.y - min.y).max(0.001);
+fn load_pet_model_mesh(renderer: &Renderer<'_>) -> Result<TexturedMesh> {
+    let (mut vertices, indices, image) = load_glb_model(PET_MODEL_BYTES)?;
+    let (min, max) =
+        model_bounds(&vertices).ok_or_else(|| anyhow::anyhow!("pet model has no vertices"))?;
+    let scale = PET_MODEL_DESIRED_HEIGHT / (max.y - min.y).max(0.001);
     let center_x = (min.x + max.x) * 0.5;
     let center_z = (min.z + max.z) * 0.5;
-    let anchor = Vec3::new(
-        spawn_position.x as f32 + 7.0,
-        spawn_position.y as f32 + 1.0,
-        spawn_position.z as f32 + 2.0,
-    );
 
     let vertices = vertices
         .drain(..)
@@ -2327,7 +2691,7 @@ fn load_featured_model_mesh(renderer: &Renderer<'_>, spawn_position: WorldPos) -
                 vertex.position.z - center_z,
             );
             Vertex {
-                position: (normalized * scale + anchor).to_array(),
+                position: (normalized * scale).to_array(),
                 color: [1.0, 1.0, 1.0],
                 normal: vertex.normal.normalize_or_zero().to_array(),
                 uv: vertex.uv,
@@ -2348,7 +2712,9 @@ fn load_featured_model_mesh(renderer: &Renderer<'_>, spawn_position: WorldPos) -
     Ok(renderer.create_textured_mesh(&vertices, &indices, &texture))
 }
 
-fn load_glb_model(bytes: &[u8]) -> Result<(Vec<ImportedVertex>, Vec<u32>, Option<gltf::image::Data>)> {
+fn load_glb_model(
+    bytes: &[u8],
+) -> Result<(Vec<ImportedVertex>, Vec<u32>, Option<gltf::image::Data>)> {
     let (document, buffers, images) = gltf::import_slice(bytes)?;
     let scene = document
         .default_scene()
@@ -2407,7 +2773,9 @@ fn append_gltf_node_meshes(
                 continue;
             };
             let primitive_positions = positions.collect::<Vec<_>>();
-            let normals = reader.read_normals().map(|values| values.collect::<Vec<_>>());
+            let normals = reader
+                .read_normals()
+                .map(|values| values.collect::<Vec<_>>());
             let texcoords = reader
                 .read_tex_coords(0)
                 .map(|coords| coords.into_f32().collect::<Vec<_>>());
@@ -2418,7 +2786,11 @@ fn append_gltf_node_meshes(
                 let normal = normals
                     .as_ref()
                     .and_then(|values| values.get(index))
-                    .map(|value| transform.transform_vector3(Vec3::from_array(*value)).normalize_or_zero())
+                    .map(|value| {
+                        transform
+                            .transform_vector3(Vec3::from_array(*value))
+                            .normalize_or_zero()
+                    })
                     .unwrap_or(Vec3::Y);
                 let uv = texcoords
                     .as_ref()
@@ -2435,7 +2807,8 @@ fn append_gltf_node_meshes(
             if let Some(read_indices) = reader.read_indices() {
                 indices.extend(read_indices.into_u32().map(|index| base_vertex + index));
             } else {
-                indices.extend((0..primitive_positions.len() as u32).map(|index| base_vertex + index));
+                indices
+                    .extend((0..primitive_positions.len() as u32).map(|index| base_vertex + index));
             }
         }
     }
@@ -2532,7 +2905,6 @@ struct Camera {
 }
 
 impl Camera {
-
     fn matrix(&self, aspect: f32) -> Mat4 {
         let look = self.forward();
         let view = Mat4::look_at_rh(self.position, self.position + look, Vec3::Y);
@@ -2555,6 +2927,70 @@ enum Axis {
     X,
     Y,
     Z,
+}
+
+#[derive(Clone, Copy)]
+struct ColliderSpec {
+    radius: f32,
+    height: f32,
+    step_height: f32,
+}
+
+const PLAYER_COLLIDER: ColliderSpec = ColliderSpec {
+    radius: PLAYER_RADIUS,
+    height: PLAYER_HEIGHT,
+    step_height: STEP_HEIGHT,
+};
+
+const PET_COLLIDER: ColliderSpec = ColliderSpec {
+    radius: 0.26,
+    height: 1.05,
+    step_height: STEP_HEIGHT,
+};
+
+#[derive(Clone, Copy)]
+struct PetFollowerState {
+    feet_position: Vec3,
+    horizontal_velocity: Vec3,
+    vertical_velocity: f32,
+    yaw: f32,
+    on_ground: bool,
+    last_slot_distance: f32,
+    stuck_timer: f32,
+}
+
+impl PetFollowerState {
+    fn new(feet_position: Vec3, yaw: f32, initial_distance: f32) -> Self {
+        Self {
+            feet_position,
+            horizontal_velocity: Vec3::ZERO,
+            vertical_velocity: 0.0,
+            yaw,
+            on_ground: false,
+            last_slot_distance: initial_distance,
+            stuck_timer: 0.0,
+        }
+    }
+}
+
+fn horizontal_basis_from_yaw(yaw: f32) -> (Vec3, Vec3) {
+    let forward = Vec3::new(yaw.sin(), 0.0, yaw.cos()).normalize_or_zero();
+    let right = Vec3::new(-forward.z, 0.0, forward.x);
+    (forward, right)
+}
+
+fn horizontal_distance(a: Vec3, b: Vec3) -> f32 {
+    Vec3::new(a.x - b.x, 0.0, a.z - b.z).length()
+}
+
+fn move_towards_vec3(current: Vec3, target: Vec3, max_delta: f32) -> Vec3 {
+    let delta = target - current;
+    let distance = delta.length();
+    if distance <= max_delta || distance <= f32::EPSILON {
+        target
+    } else {
+        current + delta / distance * max_delta
+    }
 }
 
 fn attach_canvas(canvas: HtmlCanvasElement) {
@@ -2608,7 +3044,9 @@ fn create_mouse_lock_prompt(canvas: &HtmlCanvasElement) -> (Element, Closure<dyn
         return (fallback, noop);
     };
     let body = document.body().expect("body");
-    let prompt = document.create_element("button").expect("mouse lock prompt");
+    let prompt = document
+        .create_element("button")
+        .expect("mouse lock prompt");
     prompt.set_text_content(Some("Click To Lock Mouse"));
     let _ = prompt.set_attribute(
         "style",
@@ -2709,7 +3147,9 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
         ("apple", "Continue With Apple"),
         ("linkedin", "Continue With LinkedIn"),
     ] {
-        let button = document.create_element("button").expect("auth provider button");
+        let button = document
+            .create_element("button")
+            .expect("auth provider button");
         button.set_text_content(Some(label));
         let _ = button.set_attribute(
             "style",
@@ -2726,7 +3166,9 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
         onclicks.push(onclick);
     }
 
-    let guest_button = document.create_element("button").expect("auth guest button");
+    let guest_button = document
+        .create_element("button")
+        .expect("auth guest button");
     guest_button.set_text_content(Some("Continue As Guest"));
     let _ = guest_button.set_attribute(
         "style",
@@ -2901,7 +3343,10 @@ async fn fetch_auth_user() -> Result<Option<AuthUser>> {
         .map_err(|_| anyhow::anyhow!("convert auth response"))?;
 
     if !response.ok() {
-        return Err(anyhow::anyhow!("auth endpoint returned HTTP {}", response.status()));
+        return Err(anyhow::anyhow!(
+            "auth endpoint returned HTTP {}",
+            response.status()
+        ));
     }
 
     let body = JsFuture::from(
@@ -2949,15 +3394,29 @@ fn js_get_string(value: &JsValue, key: &str) -> Option<String> {
 
 fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut(WebEvent)>) {
     let Some(document) = document() else {
-        let closure = Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
-        return (fallback_element(), fallback_element(), fallback_element(), closure);
+        let closure =
+            Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        return (
+            fallback_element(),
+            fallback_element(),
+            fallback_element(),
+            closure,
+        );
     };
     let Some(body) = document.body() else {
-        let closure = Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
-        return (fallback_element(), fallback_element(), fallback_element(), closure);
+        let closure =
+            Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        return (
+            fallback_element(),
+            fallback_element(),
+            fallback_element(),
+            closure,
+        );
     };
 
-    let root = document.create_element("button").expect("player avatar launcher");
+    let root = document
+        .create_element("button")
+        .expect("player avatar launcher");
     root.set_text_content(Some("Player Avatar Animations"));
     let _ = root.set_attribute("style", "display:none;");
     let _ = root.set_attribute("type", "button");
@@ -2965,7 +3424,9 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
     let modal = document.create_element("div").expect("player avatar modal");
     let _ = modal.set_attribute("style", player_avatar_modal_style());
 
-    let card = document.create_element("div").expect("player avatar modal card");
+    let card = document
+        .create_element("div")
+        .expect("player avatar modal card");
     let _ = card.set_attribute("style", player_avatar_modal_card_style());
 
     let close_button = document
@@ -3001,9 +3462,11 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
     ));
     let _ = card.append_child(&copy);
 
-    let idle_input = create_player_avatar_file_input(&document, &card, "Idle", "player-avatar-idle");
+    let idle_input =
+        create_player_avatar_file_input(&document, &card, "Idle", "player-avatar-idle");
     let run_input = create_player_avatar_file_input(&document, &card, "Run", "player-avatar-run");
-    let dance_input = create_player_avatar_file_input(&document, &card, "Dance", "player-avatar-dance");
+    let dance_input =
+        create_player_avatar_file_input(&document, &card, "Dance", "player-avatar-dance");
 
     let divider = document
         .create_element("div")
@@ -3081,13 +3544,16 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
         spawn_local(async move {
             let _ = upload_button.set_attribute("disabled", "true");
             status.set_text_content(Some("Uploading avatar GLBs..."));
-            if let Err(error) = upload_player_avatar_set(&idle_input, &run_input, &dance_input, &status).await {
+            if let Err(error) =
+                upload_player_avatar_set(&idle_input, &run_input, &dance_input, &status).await
+            {
                 status.set_text_content(Some(&error.to_string()));
             }
             let _ = upload_button.remove_attribute("disabled");
         });
     }) as Box<dyn FnMut(WebEvent)>);
-    let _ = upload_button.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+    let _ =
+        upload_button.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
 
     let status_for_url_click = status.clone();
     let idle_url_input_for_click = idle_url_input.clone();
@@ -3103,23 +3569,17 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
         spawn_local(async move {
             let _ = save_urls_button.set_attribute("disabled", "true");
             status.set_text_content(Some("Saving avatar URLs..."));
-            if let Err(error) = save_player_avatar_urls(
-                &idle_url_input,
-                &run_url_input,
-                &dance_url_input,
-                &status,
-            )
-            .await
+            if let Err(error) =
+                save_player_avatar_urls(&idle_url_input, &run_url_input, &dance_url_input, &status)
+                    .await
             {
                 status.set_text_content(Some(&error.to_string()));
             }
             let _ = save_urls_button.remove_attribute("disabled");
         });
     }) as Box<dyn FnMut(WebEvent)>);
-    let _ = save_urls_button.add_event_listener_with_callback(
-        "click",
-        save_urls_onclick.as_ref().unchecked_ref(),
-    );
+    let _ = save_urls_button
+        .add_event_listener_with_callback("click", save_urls_onclick.as_ref().unchecked_ref());
     save_urls_onclick.forget();
 
     let modal_for_open = modal.clone();
@@ -3221,9 +3681,7 @@ async fn upload_player_avatar_set(
     let run_file = input_selected_file(run_input);
     let dance_file = input_selected_file(dance_input);
     if idle_file.is_none() && run_file.is_none() && dance_file.is_none() {
-        return Err(anyhow::anyhow!(
-            "Choose at least one GLB before uploading."
-        ));
+        return Err(anyhow::anyhow!("Choose at least one GLB before uploading."));
     }
 
     let mut idle_url = None;
@@ -3271,7 +3729,8 @@ async fn upload_player_avatar_slot(slot: &str, file: &web_sys::File) -> Result<O
         return Ok(Some(public_url));
     }
 
-    let form_data = FormData::new().map_err(|error| anyhow::anyhow!("create form data: {error:?}"))?;
+    let form_data =
+        FormData::new().map_err(|error| anyhow::anyhow!("create form data: {error:?}"))?;
     form_data
         .append_with_str("slot", slot)
         .map_err(|error| anyhow::anyhow!("append upload slot: {error:?}"))?;
@@ -3317,8 +3776,12 @@ async fn upload_player_avatar_slot_direct(slot: &str, file: &web_sys::File) -> R
     init.set_credentials(RequestCredentials::Include);
 
     let payload = js_sys::Object::new();
-    js_sys::Reflect::set(&payload, &JsValue::from_str("slot"), &JsValue::from_str(slot))
-        .map_err(|error| anyhow::anyhow!("set direct upload slot: {error:?}"))?;
+    js_sys::Reflect::set(
+        &payload,
+        &JsValue::from_str("slot"),
+        &JsValue::from_str(slot),
+    )
+    .map_err(|error| anyhow::anyhow!("set direct upload slot: {error:?}"))?;
     js_sys::Reflect::set(
         &payload,
         &JsValue::from_str("fileName"),
@@ -3495,11 +3958,9 @@ async fn save_player_avatar_url_values(
     init.set_credentials(RequestCredentials::Include);
     init.set_body(&JsValue::from_str(&json));
 
-    let request = Request::new_with_str_and_init(
-        &format!("{}/auth/player-avatar", api_base_url()?),
-        &init,
-    )
-    .map_err(|error| anyhow::anyhow!("build avatar URL save request: {error:?}"))?;
+    let request =
+        Request::new_with_str_and_init(&format!("{}/auth/player-avatar", api_base_url()?), &init)
+            .map_err(|error| anyhow::anyhow!("build avatar URL save request: {error:?}"))?;
     request
         .headers()
         .set("Content-Type", "application/json")
@@ -3711,7 +4172,10 @@ fn append_skinned_gltf_node_meshes(
         };
 
         let parsed_skin = selected_skin.get_or_insert_with(|| {
-            let joint_nodes = node_skin.joints().map(|joint| joint.index()).collect::<Vec<_>>();
+            let joint_nodes = node_skin
+                .joints()
+                .map(|joint| joint.index())
+                .collect::<Vec<_>>();
             let inverse_bind_matrices = node_skin
                 .reader(|buffer| Some(&buffers[buffer.index()].0))
                 .read_inverse_bind_matrices()
@@ -3728,7 +4192,10 @@ fn append_skinned_gltf_node_meshes(
         });
 
         if parsed_skin.joint_nodes
-            != node_skin.joints().map(|joint| joint.index()).collect::<Vec<_>>()
+            != node_skin
+                .joints()
+                .map(|joint| joint.index())
+                .collect::<Vec<_>>()
         {
             for child in node.children() {
                 append_skinned_gltf_node_meshes(
@@ -3769,14 +4236,19 @@ fn append_skinned_gltf_node_meshes(
             let primitive_positions = positions.collect::<Vec<_>>();
             let primitive_joints = joints.into_u16().collect::<Vec<_>>();
             let primitive_weights = weights.into_f32().collect::<Vec<_>>();
-            let normals = reader.read_normals().map(|values| values.collect::<Vec<_>>());
+            let normals = reader
+                .read_normals()
+                .map(|values| values.collect::<Vec<_>>());
             let texcoords = reader
                 .read_tex_coords(0)
                 .map(|coords| coords.into_f32().collect::<Vec<_>>());
             let base_vertex = vertices.len() as u32;
 
             for index in 0..primitive_positions.len() {
-                let mut weight_values = primitive_weights.get(index).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+                let mut weight_values = primitive_weights
+                    .get(index)
+                    .copied()
+                    .unwrap_or([1.0, 0.0, 0.0, 0.0]);
                 let weight_sum = weight_values.iter().sum::<f32>();
                 if weight_sum > 0.0001 {
                     for weight in &mut weight_values {
@@ -3806,7 +4278,8 @@ fn append_skinned_gltf_node_meshes(
             if let Some(read_indices) = reader.read_indices() {
                 indices.extend(read_indices.into_u32().map(|index| base_vertex + index));
             } else {
-                indices.extend((0..primitive_positions.len() as u32).map(|index| base_vertex + index));
+                indices
+                    .extend((0..primitive_positions.len() as u32).map(|index| base_vertex + index));
             }
         }
     }
@@ -3959,13 +4432,16 @@ fn apply_animation_to_locals(
         let node_local = &mut locals[channel.node_index];
         match (&channel.property, &channel.outputs) {
             (AnimationProperty::Translation, AnimationOutputs::Vec3(values)) => {
-                node_local.translation = sample_vec3_channel(&channel.keyframe_times, values, playback_time);
+                node_local.translation =
+                    sample_vec3_channel(&channel.keyframe_times, values, playback_time);
             }
             (AnimationProperty::Scale, AnimationOutputs::Vec3(values)) => {
-                node_local.scale = sample_vec3_channel(&channel.keyframe_times, values, playback_time);
+                node_local.scale =
+                    sample_vec3_channel(&channel.keyframe_times, values, playback_time);
             }
             (AnimationProperty::Rotation, AnimationOutputs::Quat(values)) => {
-                node_local.rotation = sample_quat_channel(&channel.keyframe_times, values, playback_time);
+                node_local.rotation =
+                    sample_quat_channel(&channel.keyframe_times, values, playback_time);
             }
             _ => {}
         }
@@ -4038,14 +4514,12 @@ fn parse_avatar_animation_clip(
             Some(gltf::animation::util::ReadOutputs::Scales(values)) => {
                 AnimationOutputs::Vec3(values.map(Vec3::from_array).collect())
             }
-            Some(gltf::animation::util::ReadOutputs::Rotations(values)) => {
-                AnimationOutputs::Quat(
-                    values
-                        .into_f32()
-                        .map(|value| Quat::from_xyzw(value[0], value[1], value[2], value[3]))
-                        .collect(),
-                )
-            }
+            Some(gltf::animation::util::ReadOutputs::Rotations(values)) => AnimationOutputs::Quat(
+                values
+                    .into_f32()
+                    .map(|value| Quat::from_xyzw(value[0], value[1], value[2], value[3]))
+                    .collect(),
+            ),
             _ => continue,
         };
 
@@ -4127,7 +4601,9 @@ fn request_webcam_capture(sender: Sender<WebcamEvent>) {
                 .dyn_into()
                 .map_err(|_| anyhow::anyhow!("media stream cast failed"))?;
 
-            let document = window.document().ok_or_else(|| anyhow::anyhow!("document unavailable"))?;
+            let document = window
+                .document()
+                .ok_or_else(|| anyhow::anyhow!("document unavailable"))?;
             let video: HtmlVideoElement = document
                 .create_element("video")
                 .map_err(|error| anyhow::anyhow!("video element create failed: {error:?}"))?
@@ -4135,7 +4611,8 @@ fn request_webcam_capture(sender: Sender<WebcamEvent>) {
                 .map_err(|_| anyhow::anyhow!("video element cast failed"))?;
             video.set_autoplay(true);
             video.set_muted(true);
-            video.set_attribute("playsinline", "true")
+            video
+                .set_attribute("playsinline", "true")
                 .map_err(|error| anyhow::anyhow!("playsinline failed: {error:?}"))?;
             video.set_src_object(Some(&stream));
             let _ = video.play();
@@ -4172,7 +4649,8 @@ fn find_safe_spawn_position(terrain: &TerrainGenerator) -> Vec3 {
                 for (offset_x, offset_z) in spawn_offsets {
                     let sample_x = x as f32 + offset_x;
                     let sample_z = z as f32 + offset_z;
-                    let surface = terrain.surface_height(sample_x.floor() as i64, sample_z.floor() as i64);
+                    let surface =
+                        terrain.surface_height(sample_x.floor() as i64, sample_z.floor() as i64);
 
                     for lift in 0..=12 {
                         let candidate = Vec3::new(
@@ -4190,7 +4668,11 @@ fn find_safe_spawn_position(terrain: &TerrainGenerator) -> Vec3 {
         }
     }
 
-    Vec3::new(0.5, terrain.surface_height(0, 0) as f32 + 3.0 + PLAYER_EYE_HEIGHT, 0.5)
+    Vec3::new(
+        0.5,
+        terrain.surface_height(0, 0) as f32 + 3.0 + PLAYER_EYE_HEIGHT,
+        0.5,
+    )
 }
 
 #[allow(dead_code)]
@@ -4270,7 +4752,11 @@ fn generated_world_block_is_solid(
 
 fn start_mesh_worker_pool(
     worker_count: usize,
-) -> Result<(Receiver<MeshBuildResult>, Vec<Worker>, Vec<Closure<dyn FnMut(MessageEvent)>>)> {
+) -> Result<(
+    Receiver<MeshBuildResult>,
+    Vec<Worker>,
+    Vec<Closure<dyn FnMut(MessageEvent)>>,
+)> {
     let (tx, rx) = mpsc::channel::<MeshBuildResult>();
     let mut workers = Vec::with_capacity(worker_count);
     let mut onmessages = Vec::with_capacity(worker_count);
@@ -4313,8 +4799,10 @@ fn start_mesh_worker_pool(
                 return;
             }
 
-            let vertices_value = js_sys::Reflect::get(&object, &JsValue::from_str("vertices")).unwrap();
-            let indices_value = js_sys::Reflect::get(&object, &JsValue::from_str("indices")).unwrap();
+            let vertices_value =
+                js_sys::Reflect::get(&object, &JsValue::from_str("vertices")).unwrap();
+            let indices_value =
+                js_sys::Reflect::get(&object, &JsValue::from_str("indices")).unwrap();
             let voxels_value = js_sys::Reflect::get(&object, &JsValue::from_str("voxels")).unwrap();
             let vertex_floats = js_sys::Float32Array::new(&vertices_value).to_vec();
             let indices = js_sys::Uint32Array::new(&indices_value).to_vec();
@@ -4339,7 +4827,8 @@ fn start_mesh_worker_pool(
 
 fn start_websocket_client() -> Result<(Receiver<NetworkEvent>, WebSocket, WebSocketBindings)> {
     let url = websocket_url()?;
-    let websocket = WebSocket::new(&url).map_err(|error| anyhow::anyhow!("create websocket: {error:?}"))?;
+    let websocket =
+        WebSocket::new(&url).map_err(|error| anyhow::anyhow!("create websocket: {error:?}"))?;
     websocket.set_binary_type(BinaryType::Arraybuffer);
 
     let (tx, rx) = mpsc::channel::<NetworkEvent>();
@@ -4392,9 +4881,21 @@ fn dispatch_mesh_job(
     world_seed: u64,
 ) {
     let job = js_sys::Object::new();
-    let _ = js_sys::Reflect::set(&job, &JsValue::from_str("kind"), &JsValue::from_str("build"));
-    let _ = js_sys::Reflect::set(&job, &JsValue::from_str("x"), &JsValue::from_f64(f64::from(position.x)));
-    let _ = js_sys::Reflect::set(&job, &JsValue::from_str("z"), &JsValue::from_f64(f64::from(position.z)));
+    let _ = js_sys::Reflect::set(
+        &job,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str("build"),
+    );
+    let _ = js_sys::Reflect::set(
+        &job,
+        &JsValue::from_str("x"),
+        &JsValue::from_f64(f64::from(position.x)),
+    );
+    let _ = js_sys::Reflect::set(
+        &job,
+        &JsValue::from_str("z"),
+        &JsValue::from_f64(f64::from(position.z)),
+    );
     let _ = js_sys::Reflect::set(
         &job,
         &JsValue::from_str("worldSeed"),
@@ -4417,7 +4918,11 @@ fn dispatch_mesh_job(
 
 fn dispatch_chunk_mesh_job(worker: &Worker, chunk: &ChunkData) {
     let job = js_sys::Object::new();
-    let _ = js_sys::Reflect::set(&job, &JsValue::from_str("kind"), &JsValue::from_str("mesh_chunk"));
+    let _ = js_sys::Reflect::set(
+        &job,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str("mesh_chunk"),
+    );
     let _ = js_sys::Reflect::set(
         &job,
         &JsValue::from_str("x"),
@@ -4435,7 +4940,8 @@ fn dispatch_chunk_mesh_job(worker: &Worker, chunk: &ChunkData) {
 }
 
 fn expand_chunk_voxels(chunk: &ChunkData) -> Vec<u16> {
-    let mut voxels = Vec::with_capacity(CHUNK_WIDTH as usize * CHUNK_HEIGHT as usize * CHUNK_DEPTH as usize);
+    let mut voxels =
+        Vec::with_capacity(CHUNK_WIDTH as usize * CHUNK_HEIGHT as usize * CHUNK_DEPTH as usize);
     for y in 0..CHUNK_HEIGHT {
         for z in 0..CHUNK_DEPTH {
             for x in 0..CHUNK_WIDTH {
@@ -4454,9 +4960,7 @@ fn expand_chunk_voxels(chunk: &ChunkData) -> Vec<u16> {
 fn websocket_url() -> Result<String> {
     let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window"))?;
     let location = window.location();
-    let protocol = location
-        .protocol()
-        .unwrap_or_else(|_| "http:".to_string());
+    let protocol = location.protocol().unwrap_or_else(|_| "http:".to_string());
     let host = location
         .host()
         .unwrap_or_else(|_| "127.0.0.1:3001".to_string());
@@ -4491,8 +4995,12 @@ fn chunk_from_world_position(position: Vec3) -> ChunkPos {
 }
 
 fn scaled_render_size(size: PhysicalSize<u32>) -> PhysicalSize<u32> {
-    let width = ((size.width.max(1) as f32) * WEB_RENDER_SCALE).round().max(1.0) as u32;
-    let height = ((size.height.max(1) as f32) * WEB_RENDER_SCALE).round().max(1.0) as u32;
+    let width = ((size.width.max(1) as f32) * WEB_RENDER_SCALE)
+        .round()
+        .max(1.0) as u32;
+    let height = ((size.height.max(1) as f32) * WEB_RENDER_SCALE)
+        .round()
+        .max(1.0) as u32;
     PhysicalSize::new(width, height)
 }
 
@@ -4525,8 +5033,12 @@ fn prioritize_chunks(
 ) -> VecDeque<ChunkPos> {
     let mut positions = positions;
     positions.sort_by(|a, b| {
-        chunk_priority(*a, current_chunk, camera_position, forward)
-            .total_cmp(&chunk_priority(*b, current_chunk, camera_position, forward))
+        chunk_priority(*a, current_chunk, camera_position, forward).total_cmp(&chunk_priority(
+            *b,
+            current_chunk,
+            camera_position,
+            forward,
+        ))
     });
 
     let mut pending = VecDeque::new();
@@ -4543,7 +5055,12 @@ fn prioritize_chunks(
     pending
 }
 
-fn chunk_priority(position: ChunkPos, camera_chunk: ChunkPos, camera_position: Vec3, forward: Vec3) -> f32 {
+fn chunk_priority(
+    position: ChunkPos,
+    camera_chunk: ChunkPos,
+    camera_position: Vec3,
+    forward: Vec3,
+) -> f32 {
     let dx = (position.x - camera_chunk.x) as f32;
     let dz = (position.z - camera_chunk.z) as f32;
     let distance_sq = dx * dx + dz * dz;
@@ -4883,12 +5400,48 @@ fn add_box_oriented(
         center - axis_x + axis_y + axis_z,
     ];
     let uvs = atlas_quad(tile);
-    add_face_indices(vertices, indices, [corners[3], corners[2], corners[1], corners[0]], color, uvs);
-    add_face_indices(vertices, indices, [corners[6], corners[7], corners[4], corners[5]], color, uvs);
-    add_face_indices(vertices, indices, [corners[2], corners[6], corners[5], corners[1]], color, uvs);
-    add_face_indices(vertices, indices, [corners[7], corners[3], corners[0], corners[4]], color, uvs);
-    add_face_indices(vertices, indices, [corners[7], corners[6], corners[2], corners[3]], color, uvs);
-    add_face_indices(vertices, indices, [corners[0], corners[1], corners[5], corners[4]], color, uvs);
+    add_face_indices(
+        vertices,
+        indices,
+        [corners[3], corners[2], corners[1], corners[0]],
+        color,
+        uvs,
+    );
+    add_face_indices(
+        vertices,
+        indices,
+        [corners[6], corners[7], corners[4], corners[5]],
+        color,
+        uvs,
+    );
+    add_face_indices(
+        vertices,
+        indices,
+        [corners[2], corners[6], corners[5], corners[1]],
+        color,
+        uvs,
+    );
+    add_face_indices(
+        vertices,
+        indices,
+        [corners[7], corners[3], corners[0], corners[4]],
+        color,
+        uvs,
+    );
+    add_face_indices(
+        vertices,
+        indices,
+        [corners[7], corners[6], corners[2], corners[3]],
+        color,
+        uvs,
+    );
+    add_face_indices(
+        vertices,
+        indices,
+        [corners[0], corners[1], corners[5], corners[4]],
+        color,
+        uvs,
+    );
 }
 
 fn add_face_indices(
@@ -4936,7 +5489,12 @@ fn atlas_quad_span(tile: (u32, u32), span: u32) -> [[f32; 2]; 4] {
     let min_v = (tile.1 as f32 * span) / TILE_COUNT + EPS;
     let max_v = ((tile.1 as f32 * span) + span) / TILE_COUNT - EPS;
 
-    [[min_u, min_v], [max_u, min_v], [max_u, max_v], [min_u, max_v]]
+    [
+        [min_u, min_v],
+        [max_u, min_v],
+        [max_u, max_v],
+        [min_u, max_v],
+    ]
 }
 
 fn remote_player_color(player_id: u64) -> [f32; 3] {

@@ -14,7 +14,9 @@ pub struct PersistenceService {
 impl PersistenceService {
     pub async fn new(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root).await.context("create world root")?;
+        fs::create_dir_all(&root)
+            .await
+            .context("create world root")?;
         let (tx, mut rx) = mpsc::unbounded_channel::<ChunkData>();
         let worker_root = root.clone();
 
@@ -46,11 +48,15 @@ impl PersistenceService {
 async fn persist_chunk(root: &Path, chunk: &ChunkData) -> Result<()> {
     let path = chunk_path(root, chunk.position);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await.context("create chunk directory")?;
+        fs::create_dir_all(parent)
+            .await
+            .context("create chunk directory")?;
     }
 
     let bytes = serialize_chunk(chunk)?;
-    fs::write(path, bytes).await.context("write chunk to disk")?;
+    fs::write(path, bytes)
+        .await
+        .context("write chunk to disk")?;
     Ok(())
 }
 
@@ -60,4 +66,3 @@ fn chunk_path(root: &Path, position: ChunkPos) -> PathBuf {
     root.join(format!("r.{region_x}.{region_z}"))
         .join(format!("c.{}.{}.bin", position.x, position.z))
 }
-

@@ -13,4 +13,3 @@ async fn main() -> Result<()> {
     let server = VoxelServer::new(config).await?;
     server.run().await
 }
-

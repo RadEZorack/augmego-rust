@@ -59,6 +59,20 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 }
 
 @vertex
+fn vs_modeled_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    let world_position = skinning.model * vec4<f32>(input.position, 1.0);
+    let world_normal = normalize((skinning.model * vec4<f32>(input.normal, 0.0)).xyz);
+    output.clip_position = camera.view_proj * world_position;
+    output.color = input.color;
+    output.normal = world_normal;
+    output.uv = input.uv;
+    output.world_position = world_position.xyz;
+    output.material_id = input.material_id;
+    return output;
+}
+
+@vertex
 fn vs_skinned_main(input: SkinnedVertexInput) -> VertexOutput {
     var output: VertexOutput;
     var skinned_position = vec4<f32>(0.0, 0.0, 0.0, 0.0);

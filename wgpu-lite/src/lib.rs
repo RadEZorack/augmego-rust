@@ -120,6 +120,12 @@ pub struct TexturedMesh {
     bind_group: wgpu::BindGroup,
 }
 
+pub struct TexturedMeshDraw<'a> {
+    mesh: &'a TexturedMesh,
+    model_bind_group: wgpu::BindGroup,
+    _model_buffer: wgpu::Buffer,
+}
+
 pub struct AnimatedMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -186,7 +192,13 @@ impl MaterialTarget {
 
         for tile_y in 0..ATLAS_TILES {
             for tile_x in 0..ATLAS_TILES {
-                fill_tile(&mut pixels, atlas_size, tile_x, tile_y, tile_color(tile_x, tile_y));
+                fill_tile(
+                    &mut pixels,
+                    atlas_size,
+                    tile_x,
+                    tile_y,
+                    tile_color(tile_x, tile_y),
+                );
             }
         }
 
@@ -309,6 +321,7 @@ pub struct Renderer<'a> {
     size: PhysicalSize<u32>,
     max_surface_extent: u32,
     pipeline: wgpu::RenderPipeline,
+    modeled_textured_pipeline: wgpu::RenderPipeline,
     animated_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
@@ -357,7 +370,10 @@ impl<'a> Renderer<'a> {
             .copied()
             .find(|format| format.is_srgb())
             .unwrap_or(capabilities.formats[0]);
-        let present_mode = if capabilities.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+        let present_mode = if capabilities
+            .present_modes
+            .contains(&wgpu::PresentMode::Mailbox)
+        {
             wgpu::PresentMode::Mailbox
         } else {
             wgpu::PresentMode::Fifo
@@ -434,6 +450,13 @@ impl<'a> Renderer<'a> {
             push_constant_ranges: &[],
         });
 
+        let modeled_textured_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("modeled-textured-pipeline-layout"),
+                bind_group_layouts: &[&camera_layout, &material.layout, &skin_layout],
+                push_constant_ranges: &[],
+            });
+
         let animated_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("animated-pipeline-layout"),
@@ -479,6 +502,46 @@ impl<'a> Renderer<'a> {
             }),
             multiview: None,
         });
+
+        let modeled_textured_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("modeled-textured-pipeline"),
+                layout: Some(&modeled_textured_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_modeled_main",
+                    buffers: &[Vertex::layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth24Plus,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview: None,
+            });
 
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("overlay-pipeline"),
@@ -562,6 +625,7 @@ impl<'a> Renderer<'a> {
             size,
             max_surface_extent,
             pipeline,
+            modeled_textured_pipeline,
             animated_pipeline,
             overlay_pipeline,
             camera_buffer,
@@ -586,16 +650,20 @@ impl<'a> Renderer<'a> {
     }
 
     pub fn create_mesh(&self, vertices: &[Vertex], indices: &[u32]) -> Mesh {
-        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh-vertex-buffer"),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh-index-buffer"),
-            contents: bytemuck::cast_slice(indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh-vertex-buffer"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh-index-buffer"),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
 
         Mesh {
             vertex_buffer,
@@ -609,16 +677,20 @@ impl<'a> Renderer<'a> {
             return self.create_mesh(&[], &[]);
         }
 
-        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh-vertex-buffer"),
-            contents: bytemuck::cast_slice(vertex_floats),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh-index-buffer"),
-            contents: bytemuck::cast_slice(indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh-vertex-buffer"),
+                contents: bytemuck::cast_slice(vertex_floats),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh-index-buffer"),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
 
         Mesh {
             vertex_buffer,
@@ -702,22 +774,58 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    pub fn create_textured_draw<'b>(
+        &self,
+        mesh: &'b TexturedMesh,
+        model: Mat4,
+    ) -> TexturedMeshDraw<'b> {
+        let uniform = SkinUniform {
+            model: model.to_cols_array_2d(),
+            joints: [Mat4::IDENTITY.to_cols_array_2d(); MAX_SKIN_JOINTS],
+        };
+        let model_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("model-buffer"),
+                contents: bytemuck::bytes_of(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let model_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("model-bind-group"),
+            layout: &self.skin_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: model_buffer.as_entire_binding(),
+            }],
+        });
+
+        TexturedMeshDraw {
+            mesh,
+            model_bind_group,
+            _model_buffer: model_buffer,
+        }
+    }
+
     pub fn create_animated_mesh(
         &self,
         vertices: &[AnimatedVertex],
         indices: &[u32],
         texture: &DynamicTexture,
     ) -> AnimatedMesh {
-        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("animated-mesh-vertex-buffer"),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("animated-mesh-index-buffer"),
-            contents: bytemuck::cast_slice(indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("animated-mesh-vertex-buffer"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("animated-mesh-index-buffer"),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
 
         AnimatedMesh {
             vertex_buffer,
@@ -741,11 +849,13 @@ impl<'a> Renderer<'a> {
             uniform.joints[index] = joint.to_cols_array_2d();
         }
 
-        let skin_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("skin-buffer"),
-            contents: bytemuck::bytes_of(&uniform),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let skin_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("skin-buffer"),
+                contents: bytemuck::bytes_of(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
         let skin_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("skin-bind-group"),
             layout: &self.skin_layout,
@@ -805,6 +915,7 @@ impl<'a> Renderer<'a> {
         &mut self,
         meshes: &[&Mesh],
         textured_meshes: &[&TexturedMesh],
+        textured_draws: &[TexturedMeshDraw<'_>],
         animated_meshes: &[AnimatedMeshDraw<'_>],
         overlays: &[&Mesh],
     ) -> Result<()> {
@@ -812,16 +923,22 @@ impl<'a> Renderer<'a> {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 self.surface.configure(&self.device, &self.config);
-                self.surface.get_current_texture().context("acquire surface texture after reconfigure")?
+                self.surface
+                    .get_current_texture()
+                    .context("acquire surface texture after reconfigure")?
             }
             Err(wgpu::SurfaceError::OutOfMemory) => return Err(anyhow!("surface out of memory")),
             Err(wgpu::SurfaceError::Timeout) => return Ok(()),
         };
 
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("frame-encoder"),
-        });
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame-encoder"),
+            });
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -862,8 +979,25 @@ impl<'a> Renderer<'a> {
             for textured in textured_meshes {
                 pass.set_bind_group(1, &textured.bind_group, &[]);
                 pass.set_vertex_buffer(0, textured.mesh.vertex_buffer.slice(..));
-                pass.set_index_buffer(textured.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.set_index_buffer(
+                    textured.mesh.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
                 pass.draw_indexed(0..textured.mesh.index_count, 0, 0..1);
+            }
+            if !textured_draws.is_empty() {
+                pass.set_pipeline(&self.modeled_textured_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                for textured in textured_draws {
+                    pass.set_bind_group(1, &textured.mesh.bind_group, &[]);
+                    pass.set_bind_group(2, &textured.model_bind_group, &[]);
+                    pass.set_vertex_buffer(0, textured.mesh.mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(
+                        textured.mesh.mesh.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..textured.mesh.mesh.index_count, 0, 0..1);
+                }
             }
             if !animated_meshes.is_empty() {
                 pass.set_pipeline(&self.animated_pipeline);
@@ -945,7 +1079,10 @@ fn create_instance() -> wgpu::Instance {
 }
 
 fn clamp_surface_size(size: PhysicalSize<u32>, max_extent: u32) -> PhysicalSize<u32> {
-    PhysicalSize::new(size.width.clamp(1, max_extent), size.height.clamp(1, max_extent))
+    PhysicalSize::new(
+        size.width.clamp(1, max_extent),
+        size.height.clamp(1, max_extent),
+    )
 }
 
 fn fill_tile(pixels: &mut [u8], atlas_size: u32, tile_x: u32, tile_y: u32, base: [u8; 4]) {
@@ -971,7 +1108,13 @@ fn fill_tile(pixels: &mut [u8], atlas_size: u32, tile_x: u32, tile_y: u32, base:
     fill_checker_tile(pixels, atlas_size, start_x, start_y, base);
 }
 
-fn fill_checker_tile(pixels: &mut [u8], atlas_size: u32, start_x: u32, start_y: u32, base: [u8; 4]) {
+fn fill_checker_tile(
+    pixels: &mut [u8],
+    atlas_size: u32,
+    start_x: u32,
+    start_y: u32,
+    base: [u8; 4],
+) {
     for y in 0..TILE_SIZE {
         for x in 0..TILE_SIZE {
             let px = start_x + x;

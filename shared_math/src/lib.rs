@@ -100,12 +100,18 @@ pub fn section_index(y: u8) -> usize {
 
 pub fn raycast_grid(origin: [f32; 3], direction: [f32; 3], max_distance: f32) -> Vec<WorldPos> {
     let mut results = Vec::new();
-    let length = (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2]).sqrt();
+    let length =
+        (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2])
+            .sqrt();
     if length <= f32::EPSILON {
         return results;
     }
 
-    let norm = [direction[0] / length, direction[1] / length, direction[2] / length];
+    let norm = [
+        direction[0] / length,
+        direction[1] / length,
+        direction[2] / length,
+    ];
     let steps = (max_distance * 8.0).ceil() as i32;
     let mut previous = None;
 
@@ -140,11 +146,22 @@ mod tests {
 
     #[test]
     fn converts_negative_world_positions_to_chunk_space() {
-        let pos = WorldPos { x: -1, y: 42, z: -33 };
+        let pos = WorldPos {
+            x: -1,
+            y: 42,
+            z: -33,
+        };
         let (chunk, local) = pos.to_chunk_local().expect("valid position");
 
         assert_eq!(chunk, ChunkPos { x: -1, z: -2 });
-        assert_eq!(local, LocalVoxelPos { x: 31, y: 42, z: 31 });
+        assert_eq!(
+            local,
+            LocalVoxelPos {
+                x: 31,
+                y: 42,
+                z: 31
+            }
+        );
     }
 
     #[test]

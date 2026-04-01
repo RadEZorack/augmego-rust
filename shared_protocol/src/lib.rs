@@ -172,7 +172,8 @@ pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, ProtocolE
 
 pub fn frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtocolError> {
     let payload = encode(message)?;
-    let length = u32::try_from(payload.len()).map_err(|_| ProtocolError::PacketTooLarge(payload.len()))?;
+    let length =
+        u32::try_from(payload.len()).map_err(|_| ProtocolError::PacketTooLarge(payload.len()))?;
     let mut framed = Vec::with_capacity(payload.len() + 4);
     framed.extend_from_slice(&length.to_le_bytes());
     framed.extend_from_slice(&payload);

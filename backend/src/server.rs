@@ -6,9 +6,9 @@ use glam::Vec3;
 use shared_content::block_definitions;
 use shared_math::{CHUNK_HEIGHT, ChunkPos, WorldPos};
 use shared_protocol::{
-    BlockActionResult, ChunkUnload, ClientHello, ClientMessage, InventorySnapshot, InventoryStack, LoginResponse,
-    PROTOCOL_VERSION, PlayerStateSnapshot, ServerHello, ServerMessage, ServerWebRtcSignal, decode, encode,
-    SubscribeChunks,
+    BlockActionResult, ChunkUnload, ClientHello, ClientMessage, InventorySnapshot, InventoryStack,
+    LoginResponse, PROTOCOL_VERSION, PlayerStateSnapshot, ServerHello, ServerMessage,
+    ServerWebRtcSignal, SubscribeChunks, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
 use std::collections::{HashMap, HashSet};
@@ -38,14 +38,17 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_addr: std::env::var("BACKEND_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:4000".to_string()),
+            bind_addr: std::env::var("BACKEND_BIND_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:4000".to_string()),
             ws_bind_addr: std::env::var("BACKEND_WS_BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:4001".to_string()),
             world_seed: std::env::var("BACKEND_WORLD_SEED")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0xA66D_E601),
-            save_path: PathBuf::from(std::env::var("BACKEND_SAVE_PATH").unwrap_or_else(|_| "world".to_string())),
+            save_path: PathBuf::from(
+                std::env::var("BACKEND_SAVE_PATH").unwrap_or_else(|_| "world".to_string()),
+            ),
             view_radius: std::env::var("BACKEND_VIEW_RADIUS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -121,7 +124,11 @@ impl PlayerService {
         Some(player.clone())
     }
 
-    async fn swap_subscriptions(&self, player_id: u64, subscriptions: HashSet<ChunkPos>) -> HashSet<ChunkPos> {
+    async fn swap_subscriptions(
+        &self,
+        player_id: u64,
+        subscriptions: HashSet<ChunkPos>,
+    ) -> HashSet<ChunkPos> {
         let mut players = self.players.lock().await;
         if let Some(player) = players.get_mut(&player_id) {
             return std::mem::replace(&mut player.subscribed_chunks, subscriptions);
@@ -148,7 +155,11 @@ impl PlayerService {
             .collect()
     }
 
-    async fn players_in_chunks(&self, chunks: &HashSet<ChunkPos>, exclude_player_id: u64) -> Vec<Player> {
+    async fn players_in_chunks(
+        &self,
+        chunks: &HashSet<ChunkPos>,
+        exclude_player_id: u64,
+    ) -> Vec<Player> {
         self.players
             .lock()
             .await
@@ -255,7 +266,11 @@ impl WorldService {
         Ok(Some(saved))
     }
 
-    pub async fn apply_block_edit(&self, position: WorldPos, block: BlockId) -> Result<(BlockActionResult, Option<ChunkData>)> {
+    pub async fn apply_block_edit(
+        &self,
+        position: WorldPos,
+        block: BlockId,
+    ) -> Result<(BlockActionResult, Option<ChunkData>)> {
         if !(0..CHUNK_HEIGHT).contains(&position.y) {
             return Ok((
                 BlockActionResult {
@@ -266,7 +281,9 @@ impl WorldService {
             ));
         }
 
-        let (chunk_pos, local) = position.to_chunk_local().context("convert block edit position")?;
+        let (chunk_pos, local) = position
+            .to_chunk_local()
+            .context("convert block edit position")?;
         let mut chunk = self.chunk(chunk_pos).await?;
         chunk.set_voxel(local, Voxel { block });
         self.persistence.schedule_flush(chunk.clone())?;
@@ -298,9 +315,14 @@ impl WorldService {
         let velocity = [movement[0] * 0.2, 0.0, movement[2] * 0.2];
         let mut position = Vec3::from_array(eye_position);
 
-        self.sweep_axis(&mut position, velocity[0], MovementAxis::X, true).await?;
-        self.sweep_axis(&mut position, velocity[2], MovementAxis::Z, true).await?;
-        position.y = position.y.clamp(1.0 + PLAYER_EYE_HEIGHT, (CHUNK_HEIGHT - 1) as f32 + PLAYER_EYE_HEIGHT);
+        self.sweep_axis(&mut position, velocity[0], MovementAxis::X, true)
+            .await?;
+        self.sweep_axis(&mut position, velocity[2], MovementAxis::Z, true)
+            .await?;
+        position.y = position.y.clamp(
+            1.0 + PLAYER_EYE_HEIGHT,
+            (CHUNK_HEIGHT - 1) as f32 + PLAYER_EYE_HEIGHT,
+        );
 
         Ok((position.to_array(), velocity))
     }
@@ -392,8 +414,15 @@ impl WorldService {
             y,
             z: i64::from(z),
         };
-        let (chunk_pos, local) = world.to_chunk_local().context("convert world position for collision")?;
-        Ok(!self.chunk(chunk_pos).await?.voxel(local).block.is_transparent())
+        let (chunk_pos, local) = world
+            .to_chunk_local()
+            .context("convert world position for collision")?;
+        Ok(!self
+            .chunk(chunk_pos)
+            .await?
+            .voxel(local)
+            .block
+            .is_transparent())
     }
 }
 
@@ -411,7 +440,10 @@ pub struct ChunkStreamingService {
 
 impl ChunkStreamingService {
     pub fn new(world: WorldService, default_radius: u8) -> Self {
-        Self { world, default_radius }
+        Self {
+            world,
+            default_radius,
+        }
     }
 
     pub async fn update_subscription(
@@ -427,7 +459,9 @@ impl ChunkStreamingService {
         });
 
         let desired = desired_chunk_set(request.center, request.radius);
-        let previous = player_service.swap_subscriptions(player_id, desired.clone()).await;
+        let previous = player_service
+            .swap_subscriptions(player_id, desired.clone())
+            .await;
         let removals = previous.difference(&desired).copied().collect::<Vec<_>>();
         let additions = ordered_chunk_positions(request.center, request.radius)
             .into_iter()
@@ -472,7 +506,9 @@ impl ChunkStreamingService {
         });
 
         let desired = desired_chunk_set(request.center, request.radius);
-        let previous = player_service.swap_subscriptions(player_id, desired.clone()).await;
+        let previous = player_service
+            .swap_subscriptions(player_id, desired.clone())
+            .await;
         let removals = previous.difference(&desired).copied().collect::<Vec<_>>();
         let additions = ordered_chunk_positions(request.center, request.radius)
             .into_iter()
@@ -538,7 +574,9 @@ fn ordered_chunk_positions(center: ChunkPos, radius: u8) -> Vec<ChunkPos> {
 }
 
 fn desired_chunk_set(center: ChunkPos, radius: u8) -> HashSet<ChunkPos> {
-    ordered_chunk_positions(center, radius).into_iter().collect()
+    ordered_chunk_positions(center, radius)
+        .into_iter()
+        .collect()
 }
 
 #[derive(Clone)]
@@ -548,7 +586,9 @@ pub struct ConnectionService {
 
 impl ConnectionService {
     pub async fn bind(addr: &str) -> Result<Self> {
-        let listener = TcpListener::bind(addr).await.context("bind server socket")?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .context("bind server socket")?;
         Ok(Self {
             listener: Arc::new(listener),
         })
@@ -566,14 +606,19 @@ pub struct WebSocketConnectionService {
 
 impl WebSocketConnectionService {
     pub async fn bind(addr: &str) -> Result<Self> {
-        let listener = TcpListener::bind(addr).await.context("bind websocket server socket")?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .context("bind websocket server socket")?;
         Ok(Self {
             listener: Arc::new(listener),
         })
     }
 
     pub async fn accept(&self) -> Result<(TcpStream, SocketAddr)> {
-        self.listener.accept().await.context("accept websocket connection")
+        self.listener
+            .accept()
+            .await
+            .context("accept websocket connection")
     }
 }
 
@@ -593,11 +638,15 @@ impl VoxelServer {
         let world_service = WorldService::new(config.world_seed, persistence);
         let chunk_streaming = ChunkStreamingService::new(world_service.clone(), config.view_radius);
         let connection_service = ConnectionService::bind(&config.bind_addr).await?;
-        let websocket_connection_service = WebSocketConnectionService::bind(&config.ws_bind_addr).await?;
+        let websocket_connection_service =
+            WebSocketConnectionService::bind(&config.ws_bind_addr).await?;
         let websocket_sessions = WebSocketSessionService::new();
         let player_service = PlayerService::new();
 
-        tracing::info!(blocks = block_definitions().len(), "loaded content definitions");
+        tracing::info!(
+            blocks = block_definitions().len(),
+            "loaded content definitions"
+        );
 
         Ok(Self {
             config,
@@ -658,7 +707,9 @@ impl VoxelServer {
     async fn handle_client(&self, mut stream: TcpStream) -> Result<()> {
         let hello: ClientMessage = read_message(&mut stream).await?;
         match hello {
-            ClientMessage::ClientHello(ClientHello { protocol_version, .. }) if protocol_version == PROTOCOL_VERSION => {}
+            ClientMessage::ClientHello(ClientHello {
+                protocol_version, ..
+            }) if protocol_version == PROTOCOL_VERSION => {}
             _ => return Err(anyhow!("invalid or unsupported client hello")),
         }
 
@@ -705,10 +756,22 @@ impl VoxelServer {
             &mut stream,
             &ServerMessage::InventorySnapshot(InventorySnapshot {
                 slots: vec![
-                    InventoryStack { block: BlockId::Grass, count: 64 },
-                    InventoryStack { block: BlockId::Stone, count: 64 },
-                    InventoryStack { block: BlockId::GoldOre, count: 32 },
-                    InventoryStack { block: BlockId::Planks, count: 32 },
+                    InventoryStack {
+                        block: BlockId::Grass,
+                        count: 64,
+                    },
+                    InventoryStack {
+                        block: BlockId::Stone,
+                        count: 64,
+                    },
+                    InventoryStack {
+                        block: BlockId::GoldOre,
+                        count: 32,
+                    },
+                    InventoryStack {
+                        block: BlockId::Planks,
+                        count: 32,
+                    },
                 ],
             }),
         )
@@ -761,7 +824,9 @@ impl VoxelServer {
 
         let hello = read_ws_message::<ClientMessage, _>(&mut ws_read).await?;
         match hello {
-            ClientMessage::ClientHello(ClientHello { protocol_version, .. }) if protocol_version == PROTOCOL_VERSION => {}
+            ClientMessage::ClientHello(ClientHello {
+                protocol_version, ..
+            }) if protocol_version == PROTOCOL_VERSION => {}
             _ => return Err(anyhow!("invalid or unsupported websocket client hello")),
         }
 
@@ -798,19 +863,34 @@ impl VoxelServer {
 
         let _ = sender.send(ServerMessage::InventorySnapshot(InventorySnapshot {
             slots: vec![
-                InventoryStack { block: BlockId::Grass, count: 64 },
-                InventoryStack { block: BlockId::Stone, count: 64 },
-                InventoryStack { block: BlockId::GoldOre, count: 32 },
-                InventoryStack { block: BlockId::Planks, count: 32 },
+                InventoryStack {
+                    block: BlockId::Grass,
+                    count: 64,
+                },
+                InventoryStack {
+                    block: BlockId::Stone,
+                    count: 64,
+                },
+                InventoryStack {
+                    block: BlockId::GoldOre,
+                    count: 32,
+                },
+                InventoryStack {
+                    block: BlockId::Planks,
+                    count: 32,
+                },
             ],
         }));
 
-        self.websocket_sessions.register(player.id, sender.clone()).await;
+        self.websocket_sessions
+            .register(player.id, sender.clone())
+            .await;
 
         let subscribe = match read_ws_message::<ClientMessage, _>(&mut ws_read).await? {
             ClientMessage::SubscribeChunks(request) => Some(request),
             other => {
-                self.handle_websocket_message(player.id, &sender, other).await?;
+                self.handle_websocket_message(player.id, &sender, other)
+                    .await?;
                 None
             }
         };
@@ -831,7 +911,8 @@ impl VoxelServer {
         }));
 
         while let Ok(message) = read_ws_message::<ClientMessage, _>(&mut ws_read).await {
-            self.handle_websocket_message(player.id, &sender, message).await?;
+            self.handle_websocket_message(player.id, &sender, message)
+                .await?;
         }
 
         self.websocket_sessions.remove(player.id).await;
@@ -841,7 +922,12 @@ impl VoxelServer {
         Ok(())
     }
 
-    async fn handle_message(&self, player_id: u64, stream: &mut TcpStream, message: ClientMessage) -> Result<()> {
+    async fn handle_message(
+        &self,
+        player_id: u64,
+        stream: &mut TcpStream,
+        message: ClientMessage,
+    ) -> Result<()> {
         match message {
             ClientMessage::SubscribeChunks(request) => {
                 self.chunk_streaming
@@ -900,7 +986,10 @@ impl VoxelServer {
                     )
                     .await?;
                 } else {
-                    let (result, _) = self.world_service.apply_block_edit(request.position, request.block).await?;
+                    let (result, _) = self
+                        .world_service
+                        .apply_block_edit(request.position, request.block)
+                        .await?;
                     write_message(stream, &ServerMessage::BlockActionResult(result)).await?;
                 }
             }
@@ -919,7 +1008,10 @@ impl VoxelServer {
                     )
                     .await?;
                 } else {
-                    let (result, _) = self.world_service.apply_block_edit(request.position, BlockId::Air).await?;
+                    let (result, _) = self
+                        .world_service
+                        .apply_block_edit(request.position, BlockId::Air)
+                        .await?;
                     write_message(stream, &ServerMessage::BlockActionResult(result)).await?;
                 }
             }
@@ -965,16 +1057,17 @@ impl VoxelServer {
                         )
                         .await
                     {
-                        let _ = sender.send(ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
-                            player_id,
-                            tick: input.tick,
-                            position: player.position,
-                            velocity: player.velocity,
-                            yaw: player.yaw,
-                            idle_model_url: player.idle_model_url.clone(),
-                            run_model_url: player.run_model_url.clone(),
-                            dance_model_url: player.dance_model_url.clone(),
-                        }));
+                        let _ =
+                            sender.send(ServerMessage::PlayerStateSnapshot(PlayerStateSnapshot {
+                                player_id,
+                                tick: input.tick,
+                                position: player.position,
+                                velocity: player.velocity,
+                                yaw: player.yaw,
+                                idle_model_url: player.idle_model_url.clone(),
+                                run_model_url: player.run_model_url.clone(),
+                                dance_model_url: player.dance_model_url.clone(),
+                            }));
                         self.broadcast_player_snapshot(
                             player_id,
                             input.tick,
@@ -1000,7 +1093,10 @@ impl VoxelServer {
                         reason: "target outside placement reach".to_string(),
                     }));
                 } else {
-                    let (result, chunk) = self.world_service.apply_block_edit(request.position, request.block).await?;
+                    let (result, chunk) = self
+                        .world_service
+                        .apply_block_edit(request.position, request.block)
+                        .await?;
                     let accepted = result.accepted;
                     let _ = sender.send(ServerMessage::BlockActionResult(result));
                     if accepted {
@@ -1019,7 +1115,10 @@ impl VoxelServer {
                         reason: "target outside break reach".to_string(),
                     }));
                 } else {
-                    let (result, chunk) = self.world_service.apply_block_edit(request.position, BlockId::Air).await?;
+                    let (result, chunk) = self
+                        .world_service
+                        .apply_block_edit(request.position, BlockId::Air)
+                        .await?;
                     let accepted = result.accepted;
                     let _ = sender.send(ServerMessage::BlockActionResult(result));
                     if accepted {
@@ -1051,7 +1150,10 @@ impl VoxelServer {
         let Some(chunk) = chunk else {
             return;
         };
-        let subscribers = self.player_service.subscribers_for_chunk(chunk.position).await;
+        let subscribers = self
+            .player_service
+            .subscribers_for_chunk(chunk.position)
+            .await;
         self.websocket_sessions
             .broadcast_to(&subscribers, ServerMessage::ChunkData(chunk))
             .await;
@@ -1107,7 +1209,11 @@ impl Clone for VoxelServer {
 }
 
 fn within_reach(player_position: [f32; 3], target: WorldPos) -> bool {
-    let origin = [player_position[0], player_position[1] + 1.6, player_position[2]];
+    let origin = [
+        player_position[0],
+        player_position[1] + 1.6,
+        player_position[2],
+    ];
     let dx = target.x as f32 + 0.5 - origin[0];
     let dy = target.y as f32 + 0.5 - origin[1];
     let dz = target.z as f32 + 0.5 - origin[2];
@@ -1137,8 +1243,7 @@ where
     S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     let bytes = encode(message)?;
-    sink
-        .send(Message::Binary(bytes))
+    sink.send(Message::Binary(bytes))
         .await
         .context("write websocket frame")
 }
@@ -1154,7 +1259,14 @@ mod tests {
             .unwrap();
         let world = WorldService::new(7, persistence);
         let result = world
-            .apply_block_edit(WorldPos { x: 0, y: CHUNK_HEIGHT + 1, z: 0 }, BlockId::Stone)
+            .apply_block_edit(
+                WorldPos {
+                    x: 0,
+                    y: CHUNK_HEIGHT + 1,
+                    z: 0,
+                },
+                BlockId::Stone,
+            )
             .await
             .unwrap();
 

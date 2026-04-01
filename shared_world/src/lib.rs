@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 use shared_math::{
-    CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, SECTION_COUNT,
-    SECTION_HEIGHT, section_index, voxel_index,
+    CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, SECTION_COUNT, SECTION_HEIGHT,
+    section_index, voxel_index,
 };
 use thiserror::Error;
 
-pub const SECTION_VOLUME: usize = (CHUNK_WIDTH as usize) * (SECTION_HEIGHT as usize) * (CHUNK_DEPTH as usize);
-pub const CHUNK_VOLUME: usize = (CHUNK_WIDTH as usize) * (CHUNK_HEIGHT as usize) * (CHUNK_DEPTH as usize);
+pub const SECTION_VOLUME: usize =
+    (CHUNK_WIDTH as usize) * (SECTION_HEIGHT as usize) * (CHUNK_DEPTH as usize);
+pub const CHUNK_VOLUME: usize =
+    (CHUNK_WIDTH as usize) * (CHUNK_HEIGHT as usize) * (CHUNK_DEPTH as usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u16)]
@@ -51,7 +53,9 @@ pub struct Voxel {
 
 impl Default for Voxel {
     fn default() -> Self {
-        Self { block: BlockId::Air }
+        Self {
+            block: BlockId::Air,
+        }
     }
 }
 
@@ -142,7 +146,10 @@ impl ChunkData {
 
     pub fn voxel(&self, local: LocalVoxelPos) -> Voxel {
         let section = section_index(local.y);
-        let index = voxel_index(LocalVoxelPos { y: local.y % (SECTION_HEIGHT as u8), ..local }) % SECTION_VOLUME;
+        let index = voxel_index(LocalVoxelPos {
+            y: local.y % (SECTION_HEIGHT as u8),
+            ..local
+        }) % SECTION_VOLUME;
         self.sections[section].voxel(index)
     }
 
@@ -207,7 +214,11 @@ impl TerrainGenerator {
                 let surface = self.height_at(world_x, world_z, column_biome);
 
                 for y in 0..=surface.min(CHUNK_HEIGHT - 1) {
-                    let local = LocalVoxelPos { x: x as u8, y: y as u8, z: z as u8 };
+                    let local = LocalVoxelPos {
+                        x: x as u8,
+                        y: y as u8,
+                        z: z as u8,
+                    };
                     let block = if y == surface {
                         match column_biome {
                             BiomeId::Desert => BlockId::Sand,
@@ -226,7 +237,9 @@ impl TerrainGenerator {
                     voxels[index] = Voxel { block };
                 }
 
-                if matches!(column_biome, BiomeId::Forest) && self.hash(world_x, world_z, 99) % 23 == 0 {
+                if matches!(column_biome, BiomeId::Forest)
+                    && self.hash(world_x, world_z, 99) % 23 == 0
+                {
                     self.place_tree(&mut voxels, x as u8, (surface + 1) as u8, z as u8);
                 }
             }
@@ -306,7 +319,9 @@ impl TerrainGenerator {
         }
 
         for trunk in y..(y + 4) {
-            voxels[linear_index(LocalVoxelPos { x, y: trunk, z })] = Voxel { block: BlockId::Log };
+            voxels[linear_index(LocalVoxelPos { x, y: trunk, z })] = Voxel {
+                block: BlockId::Log,
+            };
         }
 
         for dy in 3..=5 {
@@ -326,7 +341,9 @@ impl TerrainGenerator {
                         x: leaf_x as u8,
                         y: y + dy,
                         z: leaf_z as u8,
-                    })] = Voxel { block: BlockId::Leaves };
+                    })] = Voxel {
+                        block: BlockId::Leaves,
+                    };
                 }
             }
         }
@@ -365,10 +382,18 @@ mod tests {
     #[test]
     fn palette_round_trips_voxel_data() {
         let voxels = vec![
-            Voxel { block: BlockId::Air },
-            Voxel { block: BlockId::Grass },
-            Voxel { block: BlockId::Grass },
-            Voxel { block: BlockId::Stone },
+            Voxel {
+                block: BlockId::Air,
+            },
+            Voxel {
+                block: BlockId::Grass,
+            },
+            Voxel {
+                block: BlockId::Grass,
+            },
+            Voxel {
+                block: BlockId::Stone,
+            },
         ];
 
         let palette = PaletteSection::from_voxels(&voxels);

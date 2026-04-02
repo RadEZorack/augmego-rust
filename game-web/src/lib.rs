@@ -124,7 +124,7 @@ const REMOTE_AVATAR_RUN_SPEED_THRESHOLD: f32 = 0.15;
 const REMOTE_AVATAR_IDLE_DELAY_SECS: f32 = 0.35;
 const REMOTE_AVATAR_DANCE_DELAY_SECS: f32 = 5.0;
 const AUTH_STATUS_CHECKING: &str = "Checking your sign-in session...";
-const AUTH_STATUS_SIGNED_OUT: &str = "Sign in with SSO, or continue as a guest.";
+const AUTH_STATUS_SIGNED_OUT: &str = "Sign in with Google, or continue as a guest.";
 
 #[derive(Clone, Debug)]
 struct AuthUser {
@@ -4143,7 +4143,7 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
         "margin:0 0 18px 0;color:rgba(230,237,243,0.78);font-size:15px;line-height:1.5;",
     );
     body_copy.set_text_content(Some(
-        "Sign in with the web account flow before the game client joins multiplayer.",
+        "Sign in with Google for saved pets and avatars, or continue as a guest to explore.",
     ));
     let _ = card.append_child(&body_copy);
 
@@ -4159,11 +4159,7 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
     let _ = buttons.set_attribute("style", "display:grid;gap:10px;");
 
     let mut onclicks = Vec::new();
-    for (provider, label) in [
-        ("google", "Continue With Google"),
-        ("apple", "Continue With Apple"),
-        ("linkedin", "Continue With LinkedIn"),
-    ] {
+    for (provider, label) in [("google", "Continue With Google")] {
         let button = document
             .create_element("button")
             .expect("auth provider button");

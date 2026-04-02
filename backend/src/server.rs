@@ -1,9 +1,25 @@
-use crate::net::{is_disconnect, read_message, write_message};
-use crate::pet_registry::{CapturePetOutcome, PetRegistryClient, PlayerPetCollection};
+use crate::account::{AccountConfig, AccountService, AvatarFileResponse, PlayerAvatarSlot};
+use crate::auth::{SameSitePolicy, SessionCookieConfig};
+use crate::db;
+use crate::pet_registry::{
+    CapturePetOutcome, PetModelFileResponse, PetRegistryClient, PetRegistryConfig,
+    PlayerPetCollection,
+};
 use crate::persistence::PersistenceService;
+use crate::storage::{StorageConfig, StorageProvider, StorageService};
 use anyhow::{Context, Result, anyhow};
+use axum::body::Body;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{Multipart, Path as AxumPath, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use glam::Vec3;
+use reqwest::Url;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use shared_content::block_definitions;
 use shared_math::{CHUNK_HEIGHT, ChunkPos, WorldPos};
 use shared_protocol::{
@@ -15,14 +31,16 @@ use shared_protocol::{
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::fs;
+use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::yield_now;
-use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
+use tower_http::services::ServeDir;
+use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 
 const PLAYER_RADIUS: f32 = 0.35;
 const PLAYER_HEIGHT: f32 = 1.8;
@@ -40,22 +58,63 @@ const WILD_PET_SPAWN_RADIUS: f32 = 56.0;
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind_addr: String,
-    pub ws_bind_addr: String,
+    pub public_base_url: String,
     pub world_seed: u64,
     pub save_path: PathBuf,
     pub view_radius: u8,
-    pub web_api_base_url: String,
-    pub backend_service_token: String,
+    pub database_url: String,
+    pub static_root: PathBuf,
+    pub session_cookie_name: String,
+    pub session_cookie_secure: bool,
+    pub session_cookie_same_site: SameSitePolicy,
+    pub session_cookie_ttl: Duration,
+    pub google_client_id: String,
+    pub google_client_secret: String,
+    pub google_scope: String,
     pub game_backend_auth_secret: String,
+    pub game_auth_ttl: Duration,
+    pub storage_provider: StorageProvider,
+    pub storage_root: PathBuf,
+    pub storage_namespace: String,
+    pub spaces_bucket: String,
+    pub spaces_endpoint: String,
+    pub spaces_custom_domain: String,
+    pub spaces_access_key_id: String,
+    pub spaces_secret_access_key: String,
+    pub spaces_region: String,
+    pub generated_pet_cache_control: String,
+    pub meshy_api_base_url: String,
+    pub meshy_api_key: String,
+    pub meshy_text_to_3d_model: String,
+    pub meshy_text_to_3d_enable_refine: bool,
+    pub meshy_text_to_3d_refine_model: String,
+    pub meshy_text_to_3d_enable_pbr: bool,
+    pub meshy_text_to_3d_topology: String,
+    pub meshy_text_to_3d_target_polycount: Option<i32>,
+    pub pet_pool_target: i64,
+    pub pet_generation_worker_interval: Duration,
+    pub pet_generation_poll_interval: Duration,
+    pub pet_generation_max_attempts: i32,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
+        let storage_provider = match std::env::var("ASSET_STORAGE_PROVIDER")
+            .or_else(|_| std::env::var("WORLD_STORAGE_PROVIDER"))
+            .unwrap_or_else(|_| "local".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "spaces" => StorageProvider::Spaces,
+            _ => StorageProvider::Local,
+        };
         Self {
             bind_addr: std::env::var("BACKEND_BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:4000".to_string()),
-            ws_bind_addr: std::env::var("BACKEND_WS_BIND_ADDR")
-                .unwrap_or_else(|_| "127.0.0.1:4001".to_string()),
+            public_base_url: std::env::var("PUBLIC_BASE_URL")
+                .or_else(|_| std::env::var("WEB_BASE_URL"))
+                .unwrap_or_else(|_| "http://127.0.0.1:4000".to_string()),
             world_seed: std::env::var("BACKEND_WORLD_SEED")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -67,12 +126,98 @@ impl Default for ServerConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(12),
-            web_api_base_url: std::env::var("BACKEND_WEB_API_BASE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:3000/api/v1".to_string()),
-            backend_service_token: std::env::var("BACKEND_SERVICE_TOKEN")
-                .unwrap_or_else(|_| "dev-only-backend-service-token".to_string()),
+            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgresql://postgres:postgres@127.0.0.1:5432/augmego".to_string()
+            }),
+            static_root: PathBuf::from(
+                std::env::var("BACKEND_STATIC_ROOT")
+                    .unwrap_or_else(|_| "backend/static".to_string()),
+            ),
+            session_cookie_name: std::env::var("SESSION_COOKIE_NAME")
+                .unwrap_or_else(|_| "augmego_session".to_string()),
+            session_cookie_secure: std::env::var("COOKIE_SECURE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(false),
+            session_cookie_same_site: SameSitePolicy::parse(
+                &std::env::var("COOKIE_SAMESITE").unwrap_or_else(|_| "Lax".to_string()),
+            ),
+            session_cookie_ttl: Duration::from_secs(
+                std::env::var("SESSION_COOKIE_TTL_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(60 * 60 * 24 * 7),
+            ),
+            google_client_id: std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
+            google_client_secret: std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
+            google_scope: std::env::var("GOOGLE_SCOPE")
+                .unwrap_or_else(|_| "openid email profile".to_string()),
             game_backend_auth_secret: std::env::var("GAME_BACKEND_AUTH_SECRET")
                 .unwrap_or_else(|_| "dev-only-game-backend-secret".to_string()),
+            game_auth_ttl: Duration::from_secs(
+                std::env::var("GAME_AUTH_TTL_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(60 * 15),
+            ),
+            storage_provider,
+            storage_root: PathBuf::from(
+                std::env::var("ASSET_STORAGE_ROOT")
+                    .or_else(|_| std::env::var("WORLD_STORAGE_ROOT"))
+                    .unwrap_or_else(|_| "storage/world-assets".to_string()),
+            ),
+            storage_namespace: std::env::var("ASSET_STORAGE_NAMESPACE")
+                .or_else(|_| std::env::var("WORLD_STORAGE_NAMESPACE"))
+                .unwrap_or_else(|_| "world-assets".to_string()),
+            spaces_bucket: std::env::var("SPACES_BUCKET").unwrap_or_default(),
+            spaces_endpoint: std::env::var("SPACES_ENDPOINT").unwrap_or_default(),
+            spaces_custom_domain: std::env::var("SPACES_CUSTOM_DOMAIN").unwrap_or_default(),
+            spaces_access_key_id: std::env::var("SPACES_ACCESS_KEY_ID").unwrap_or_default(),
+            spaces_secret_access_key: std::env::var("SPACES_SECRET_ACCESS_KEY")
+                .unwrap_or_default(),
+            spaces_region: std::env::var("SPACES_REGION").unwrap_or_default(),
+            generated_pet_cache_control: std::env::var("GENERATED_PET_CACHE_CONTROL")
+                .unwrap_or_else(|_| "public, max-age=31536000, immutable".to_string()),
+            meshy_api_base_url: std::env::var("MESHY_API_BASE_URL")
+                .unwrap_or_else(|_| "https://api.meshy.ai".to_string()),
+            meshy_api_key: std::env::var("MESHY_API_KEY").unwrap_or_default(),
+            meshy_text_to_3d_model: std::env::var("MESHY_TEXT_TO_3D_MODEL")
+                .unwrap_or_else(|_| "meshy-4".to_string()),
+            meshy_text_to_3d_enable_refine: std::env::var("MESHY_TEXT_TO_3D_ENABLE_REFINE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(true),
+            meshy_text_to_3d_refine_model: std::env::var("MESHY_TEXT_TO_3D_REFINE_MODEL")
+                .unwrap_or_else(|_| "meshy-4".to_string()),
+            meshy_text_to_3d_enable_pbr: std::env::var("MESHY_TEXT_TO_3D_ENABLE_PBR")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(false),
+            meshy_text_to_3d_topology: std::env::var("MESHY_TEXT_TO_3D_TOPOLOGY")
+                .unwrap_or_else(|_| "triangle".to_string()),
+            meshy_text_to_3d_target_polycount: std::env::var("MESHY_TEXT_TO_3D_TARGET_POLYCOUNT")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+            pet_pool_target: std::env::var("PET_POOL_TARGET")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30),
+            pet_generation_worker_interval: Duration::from_secs(
+                std::env::var("PET_GENERATION_WORKER_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(10),
+            ),
+            pet_generation_poll_interval: Duration::from_secs(
+                std::env::var("PET_GENERATION_POLL_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(15),
+            ),
+            pet_generation_max_attempts: std::env::var("PET_GENERATION_MAX_ATTEMPTS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(5),
         }
     }
 }
@@ -341,19 +486,6 @@ impl WildPetService {
             next_id: Arc::new(Mutex::new(1)),
             spawn_nonce: Arc::new(Mutex::new(1)),
         }
-    }
-
-    async fn visible_snapshots_for_chunks(
-        &self,
-        chunks: &HashSet<ChunkPos>,
-    ) -> Vec<WildPetSnapshot> {
-        self.pets
-            .lock()
-            .await
-            .values()
-            .filter(|pet| !pet.captured && chunks.contains(&pet.chunk()))
-            .map(WildPet::snapshot)
-            .collect()
     }
 
     async fn sync_player_visibility(&self, player: &Player) -> Vec<WildPetDispatch> {
@@ -915,53 +1047,6 @@ impl ChunkStreamingService {
         }
     }
 
-    pub async fn update_subscription(
-        &self,
-        stream: &mut TcpStream,
-        player_service: &PlayerService,
-        player_id: u64,
-        request: Option<SubscribeChunks>,
-    ) -> Result<()> {
-        let request = request.unwrap_or(SubscribeChunks {
-            center: ChunkPos { x: 0, z: 0 },
-            radius: self.default_radius,
-        });
-
-        let desired = desired_chunk_set(request.center, request.radius);
-        let previous = player_service
-            .swap_subscriptions(player_id, desired.clone())
-            .await;
-        let removals = previous.difference(&desired).copied().collect::<Vec<_>>();
-        let additions = ordered_chunk_positions(request.center, request.radius)
-            .into_iter()
-            .filter(|position| !previous.contains(position))
-            .collect::<Vec<_>>();
-
-        if !removals.is_empty() {
-            write_message(
-                stream,
-                &ServerMessage::ChunkUnload(ChunkUnload {
-                    positions: removals,
-                }),
-            )
-            .await?;
-        }
-
-        for (index, position) in additions.into_iter().enumerate() {
-            if let Some(chunk) = self.world.chunk_override(position).await? {
-                write_message(stream, &ServerMessage::ChunkData(chunk)).await?;
-            }
-
-            // Send nearby chunks first and periodically yield so the client can
-            // start rendering before the outer radius finishes streaming.
-            if index > 0 && index % 8 == 0 {
-                yield_now().await;
-            }
-        }
-
-        Ok(())
-    }
-
     pub async fn update_subscription_ws(
         &self,
         sender: &mpsc::UnboundedSender<ServerMessage>,
@@ -1070,74 +1155,85 @@ fn desired_chunk_set(center: ChunkPos, radius: u8) -> HashSet<ChunkPos> {
         .collect()
 }
 
-#[derive(Clone)]
-pub struct ConnectionService {
-    listener: Arc<TcpListener>,
-}
-
-impl ConnectionService {
-    pub async fn bind(addr: &str) -> Result<Self> {
-        let listener = TcpListener::bind(addr)
-            .await
-            .context("bind server socket")?;
-        Ok(Self {
-            listener: Arc::new(listener),
-        })
-    }
-
-    pub async fn accept(&self) -> Result<(TcpStream, SocketAddr)> {
-        self.listener.accept().await.context("accept connection")
-    }
-}
-
-#[derive(Clone)]
-pub struct WebSocketConnectionService {
-    listener: Arc<TcpListener>,
-}
-
-impl WebSocketConnectionService {
-    pub async fn bind(addr: &str) -> Result<Self> {
-        let listener = TcpListener::bind(addr)
-            .await
-            .context("bind websocket server socket")?;
-        Ok(Self {
-            listener: Arc::new(listener),
-        })
-    }
-
-    pub async fn accept(&self) -> Result<(TcpStream, SocketAddr)> {
-        self.listener
-            .accept()
-            .await
-            .context("accept websocket connection")
-    }
+#[derive(Debug, Deserialize)]
+struct GoogleCallbackQuery {
+    code: String,
+    state: String,
 }
 
 pub struct VoxelServer {
     config: ServerConfig,
+    account_service: AccountService,
     pet_registry: PetRegistryClient,
-    connection_service: ConnectionService,
-    websocket_connection_service: WebSocketConnectionService,
     websocket_sessions: WebSocketSessionService,
     chunk_streaming: ChunkStreamingService,
     player_service: PlayerService,
     wild_pet_service: WildPetService,
     world_service: WorldService,
+    static_root: PathBuf,
 }
 
 impl VoxelServer {
     pub async fn new(config: ServerConfig) -> Result<Self> {
-        let pet_registry = PetRegistryClient::new(
-            config.web_api_base_url.clone(),
-            config.backend_service_token.clone(),
-            config.game_backend_auth_secret.clone(),
+        let pool = db::connect(&config.database_url).await?;
+        db::run_migrations(&pool).await?;
+
+        let storage = StorageService::new(StorageConfig {
+            provider: config.storage_provider.clone(),
+            root: config.storage_root.clone(),
+            namespace: config.storage_namespace.clone(),
+            spaces_bucket: config.spaces_bucket.clone(),
+            spaces_endpoint: config.spaces_endpoint.clone(),
+            spaces_custom_domain: config.spaces_custom_domain.clone(),
+            spaces_access_key_id: config.spaces_access_key_id.clone(),
+            spaces_secret_access_key: config.spaces_secret_access_key.clone(),
+            spaces_region: config.spaces_region.clone(),
+        })
+        .await?;
+
+        let account_service = AccountService::new(
+            pool.clone(),
+            storage.clone(),
+            AccountConfig {
+                public_base_url: config.public_base_url.clone(),
+                session_cookie: SessionCookieConfig {
+                    name: config.session_cookie_name.clone(),
+                    secure: config.session_cookie_secure,
+                    same_site: config.session_cookie_same_site,
+                    ttl: config.session_cookie_ttl,
+                },
+                google_client_id: config.google_client_id.clone(),
+                google_client_secret: config.google_client_secret.clone(),
+                google_scope: config.google_scope.clone(),
+                game_auth_secret: config.game_backend_auth_secret.clone(),
+                game_auth_ttl: config.game_auth_ttl,
+            },
         );
+
+        let pet_registry = PetRegistryClient::new(
+            pool,
+            storage,
+            PetRegistryConfig {
+                auth_secret: config.game_backend_auth_secret.clone(),
+                generated_pet_cache_control: config.generated_pet_cache_control.clone(),
+                meshy_api_base_url: config.meshy_api_base_url.clone(),
+                meshy_api_key: config.meshy_api_key.clone(),
+                meshy_text_to_3d_model: config.meshy_text_to_3d_model.clone(),
+                meshy_text_to_3d_enable_refine: config.meshy_text_to_3d_enable_refine,
+                meshy_text_to_3d_refine_model: config.meshy_text_to_3d_refine_model.clone(),
+                meshy_text_to_3d_enable_pbr: config.meshy_text_to_3d_enable_pbr,
+                meshy_text_to_3d_topology: config.meshy_text_to_3d_topology.clone(),
+                meshy_text_to_3d_target_polycount: config.meshy_text_to_3d_target_polycount,
+                pet_pool_target: config.pet_pool_target,
+                pet_generation_worker_interval: config.pet_generation_worker_interval,
+                pet_generation_poll_interval: config.pet_generation_poll_interval,
+                pet_generation_max_attempts: config.pet_generation_max_attempts,
+            },
+        );
+
         let persistence = PersistenceService::new(&config.save_path).await?;
         let world_service = WorldService::new(config.world_seed, persistence);
         let chunk_streaming = ChunkStreamingService::new(world_service.clone(), config.view_radius);
-        let connection_service = ConnectionService::bind(&config.bind_addr).await?;
-        let websocket_connection_service =
-            WebSocketConnectionService::bind(&config.ws_bind_addr).await?;
         let websocket_sessions = WebSocketSessionService::new();
         let player_service = PlayerService::new();
         let wild_pet_service = WildPetService::new();
@@ -1148,10 +1244,10 @@ impl VoxelServer {
         );
 
         Ok(Self {
+            static_root: config.static_root.clone(),
             config,
+            account_service,
             pet_registry,
-            connection_service,
-            websocket_connection_service,
             websocket_sessions,
             chunk_streaming,
             player_service,
@@ -1161,7 +1257,8 @@ impl VoxelServer {
     }
 
     pub async fn run(self) -> Result<()> {
-        tracing::info!(tcp_addr = %self.config.bind_addr, ws_addr = %self.config.ws_bind_addr, "voxel backend listening");
+        tracing::info!(http_addr = %self.config.bind_addr, "augmego rust server listening");
+        self.pet_registry.start_generation_worker();
         match self.pet_registry.reset_spawned_pets().await {
             Ok(reset_count) => {
                 tracing::info!(reset_count, "reset spawned pets in pet registry");
@@ -1170,12 +1267,7 @@ impl VoxelServer {
                 tracing::warn!(?error, "failed to reset spawned pets in pet registry");
             }
         }
-        let websocket_server = self.clone();
-        tokio::spawn(async move {
-            if let Err(error) = websocket_server.run_websocket_loop().await {
-                tracing::error!(?error, "websocket accept loop failed");
-            }
-        });
+
         let wild_pet_server = self.clone();
         tokio::spawn(async move {
             if let Err(error) = wild_pet_server.run_wild_pet_loop().await {
@@ -1183,7 +1275,55 @@ impl VoxelServer {
             }
         });
 
-        self.run_tcp_loop().await
+        let listener = TcpListener::bind(&self.config.bind_addr)
+            .await
+            .context("bind rust app http listener")?;
+        axum::serve(listener, self.router().into_make_service())
+            .await
+            .context("serve rust app")
+    }
+
+    fn router(&self) -> Router {
+        let play_router = Router::new()
+            .route("/", get(play_index))
+            .fallback_service(ServeDir::new(self.static_root.join("play")));
+
+        Router::new()
+            .route("/", get(root_page))
+            .route("/learn", get(learn_page))
+            .route("/play", get(play_redirect))
+            .nest("/play", play_router)
+            .route("/ws", get(websocket_upgrade))
+            .route("/api/v1/health", get(api_health))
+            .route("/api/v1/auth/google", get(auth_google))
+            .route("/api/v1/auth/google/callback", get(auth_google_callback))
+            .route("/api/v1/auth/logout", post(auth_logout))
+            .route("/api/v1/auth/me", get(auth_me))
+            .route(
+                "/api/v1/auth/profile",
+                get(auth_profile_get)
+                    .post(auth_profile_update)
+                    .patch(auth_profile_update),
+            )
+            .route(
+                "/api/v1/auth/player-avatar",
+                get(player_avatar_get).patch(player_avatar_patch),
+            )
+            .route(
+                "/api/v1/auth/player-avatar/upload",
+                post(player_avatar_upload),
+            )
+            .route(
+                "/api/v1/auth/player-avatar/upload-url",
+                post(player_avatar_upload_url),
+            )
+            .route(
+                "/api/v1/users/{user_id}/player-avatar/{slot}/file",
+                get(public_player_avatar_file),
+            )
+            .route("/api/v1/pets/{pet_id}/file", get(public_pet_file))
+            .layer(TraceLayer::new_for_http())
+            .with_state(self.clone())
     }
 
     async fn run_wild_pet_loop(self) -> Result<()> {
@@ -1200,163 +1340,7 @@ impl VoxelServer {
         }
     }
 
-    async fn run_tcp_loop(self) -> Result<()> {
-        loop {
-            let (stream, address) = self.connection_service.accept().await?;
-            let server = self.clone();
-            tokio::spawn(async move {
-                if let Err(error) = server.handle_client(stream).await {
-                    if !is_disconnect(&error) {
-                        tracing::error!(?error, %address, "client session ended with error");
-                    }
-                }
-            });
-        }
-    }
-
-    async fn run_websocket_loop(self) -> Result<()> {
-        loop {
-            let (stream, address) = self.websocket_connection_service.accept().await?;
-            let server = self.clone();
-            tokio::spawn(async move {
-                match accept_async(stream).await {
-                    Ok(socket) => {
-                        if let Err(error) = server.handle_websocket_client(socket).await {
-                            tracing::error!(?error, %address, "websocket client session ended with error");
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(?error, %address, "failed websocket handshake");
-                    }
-                }
-            });
-        }
-    }
-
-    async fn handle_client(&self, mut stream: TcpStream) -> Result<()> {
-        let hello: ClientMessage = read_message(&mut stream).await?;
-        match hello {
-            ClientMessage::ClientHello(ClientHello {
-                protocol_version, ..
-            }) if protocol_version == PROTOCOL_VERSION => {}
-            _ => return Err(anyhow!("invalid or unsupported client hello")),
-        }
-
-        write_message(
-            &mut stream,
-            &ServerMessage::ServerHello(ServerHello {
-                protocol_version: PROTOCOL_VERSION,
-                motd: "Augmego voxel frontier".to_string(),
-                world_seed: self.config.world_seed,
-            }),
-        )
-        .await?;
-
-        let login = match read_message(&mut stream).await? {
-            ClientMessage::LoginRequest(login) => login,
-            _ => return Err(anyhow!("expected login request")),
-        };
-
-        let user_id = login
-            .auth_token
-            .as_deref()
-            .and_then(|token| self.pet_registry.verify_auth_token(token));
-        let pet_collection = match user_id.as_deref() {
-            Some(user_id) => match self.pet_registry.load_user_pet_collection(user_id).await {
-                Ok(collection) => Some(collection),
-                Err(error) => {
-                    tracing::warn!(?error, %user_id, "failed to load player pet collection");
-                    None
-                }
-            },
-            None => None,
-        };
-        let spawn_position = self.world_service.safe_spawn_position();
-        let player = self
-            .player_service
-            .login(
-                login.name,
-                user_id.clone(),
-                pet_collection,
-                spawn_position,
-                login.idle_model_url,
-                login.run_model_url,
-                login.dance_model_url,
-            )
-            .await;
-        tracing::info!(player_id = player.id, name = %player.name, "player joined");
-
-        write_message(
-            &mut stream,
-            &ServerMessage::LoginResponse(LoginResponse {
-                accepted: true,
-                player_id: player.id,
-                spawn_position,
-                message: format!("Welcome, {}", player.name),
-            }),
-        )
-        .await?;
-
-        write_message(
-            &mut stream,
-            &ServerMessage::InventorySnapshot(InventorySnapshot {
-                slots: vec![
-                    InventoryStack {
-                        block: BlockId::Grass,
-                        count: 64,
-                    },
-                    InventoryStack {
-                        block: BlockId::Stone,
-                        count: 64,
-                    },
-                    InventoryStack {
-                        block: BlockId::GoldOre,
-                        count: 32,
-                    },
-                    InventoryStack {
-                        block: BlockId::Planks,
-                        count: 32,
-                    },
-                ],
-            }),
-        )
-        .await?;
-        write_message(
-            &mut stream,
-            &ServerMessage::CapturedPetsSnapshot(player.captured_pets_snapshot()),
-        )
-        .await?;
-
-        let subscribe = match read_message::<ClientMessage>(&mut stream).await? {
-            ClientMessage::SubscribeChunks(request) => Some(request),
-            other => {
-                self.handle_message(player.id, &mut stream, other).await?;
-                None
-            }
-        };
-
-        self.chunk_streaming
-            .update_subscription(&mut stream, &self.player_service, player.id, subscribe)
-            .await?;
-        self.send_visible_wild_pets_to_stream(&mut stream, player.id)
-            .await?;
-
-        write_message(
-            &mut stream,
-            &ServerMessage::PlayerStateSnapshot(player.snapshot(0)),
-        )
-        .await?;
-
-        while let Ok(message) = read_message::<ClientMessage>(&mut stream).await {
-            self.handle_message(player.id, &mut stream, message).await?;
-        }
-
-        self.broadcast_player_left(player.id).await;
-        self.player_service.remove(player.id).await;
-        Ok(())
-    }
-
-    async fn handle_websocket_client(&self, socket: WebSocketStream<TcpStream>) -> Result<()> {
+    async fn handle_websocket_client(&self, socket: WebSocket) -> Result<()> {
         let (mut ws_write, mut ws_read) = socket.split();
         let (sender, mut receiver) = mpsc::unbounded_channel::<ServerMessage>();
         let writer = tokio::spawn(async move {
@@ -1404,7 +1388,7 @@ impl VoxelServer {
             .player_service
             .login(
                 login.name,
-                user_id.clone(),
+                user_id,
                 pet_collection,
                 spawn_position,
                 login.idle_model_url,
@@ -1420,27 +1404,7 @@ impl VoxelServer {
             spawn_position,
             message: format!("Welcome, {}", player.name),
         }));
-
-        let _ = sender.send(ServerMessage::InventorySnapshot(InventorySnapshot {
-            slots: vec![
-                InventoryStack {
-                    block: BlockId::Grass,
-                    count: 64,
-                },
-                InventoryStack {
-                    block: BlockId::Stone,
-                    count: 64,
-                },
-                InventoryStack {
-                    block: BlockId::GoldOre,
-                    count: 32,
-                },
-                InventoryStack {
-                    block: BlockId::Planks,
-                    count: 32,
-                },
-            ],
-        }));
+        let _ = sender.send(ServerMessage::InventorySnapshot(default_inventory_snapshot()));
         let _ = sender.send(ServerMessage::CapturedPetsSnapshot(player.captured_pets_snapshot()));
 
         self.websocket_sessions
@@ -1450,8 +1414,7 @@ impl VoxelServer {
         let subscribe = match read_ws_message::<ClientMessage, _>(&mut ws_read).await? {
             ClientMessage::SubscribeChunks(request) => Some(request),
             other => {
-                self.handle_websocket_message(player.id, &sender, other)
-                    .await?;
+                self.handle_websocket_message(player.id, &sender, other).await?;
                 None
             }
         };
@@ -1474,119 +1437,6 @@ impl VoxelServer {
         self.player_service.remove(player.id).await;
         drop(sender);
         let _ = writer.await;
-        Ok(())
-    }
-
-    async fn handle_message(
-        &self,
-        player_id: u64,
-        stream: &mut TcpStream,
-        message: ClientMessage,
-    ) -> Result<()> {
-        match message {
-            ClientMessage::SubscribeChunks(request) => {
-                self.chunk_streaming
-                    .update_subscription(stream, &self.player_service, player_id, Some(request))
-                    .await?;
-                self.send_visible_wild_pets_to_stream(stream, player_id)
-                    .await?;
-            }
-            ClientMessage::PlayerInputTick(input) => {
-                if let Some(current_player) = self.player_service.player(player_id).await {
-                    let tick = input.tick;
-                    let yaw = input.yaw.unwrap_or(current_player.yaw);
-                    let pet_states = input.pet_states;
-                    let wild_pet_states = input.wild_pet_states;
-                    let (position, velocity) = if let Some(position) = input.position {
-                        (position, input.velocity.unwrap_or([0.0; 3]))
-                    } else {
-                        self.world_service
-                            .resolve_player_motion(current_player.position, input.movement)
-                            .await?
-                    };
-
-                    if let Some(player) = self
-                        .player_service
-                        .update_motion(player_id, position, velocity, yaw, pet_states)
-                        .await
-                    {
-                        let players = self.player_service.players().await;
-                        let connected_player_ids =
-                            self.websocket_sessions.connected_player_ids().await;
-                        let dispatches = self
-                            .wild_pet_service
-                            .apply_host_motion(
-                                player_id,
-                                tick,
-                                wild_pet_states,
-                                &players,
-                                &connected_player_ids,
-                            )
-                            .await;
-                        self.dispatch_wild_pet_updates(dispatches).await;
-                        write_message(
-                            stream,
-                            &ServerMessage::PlayerStateSnapshot(player.snapshot(tick)),
-                        )
-                        .await?;
-                    }
-                }
-            }
-            ClientMessage::CaptureWildPetRequest { pet_id } => {
-                self.capture_wild_pet_for_tcp(player_id, stream, pet_id)
-                    .await?;
-            }
-            ClientMessage::PlaceBlockRequest(request) => {
-                let Some(player) = self.player_service.player(player_id).await else {
-                    return Ok(());
-                };
-
-                if !within_reach(player.position, request.position) {
-                    write_message(
-                        stream,
-                        &ServerMessage::BlockActionResult(BlockActionResult {
-                            accepted: false,
-                            reason: "target outside placement reach".to_string(),
-                        }),
-                    )
-                    .await?;
-                } else {
-                    let (result, _) = self
-                        .world_service
-                        .apply_block_edit(request.position, request.block)
-                        .await?;
-                    write_message(stream, &ServerMessage::BlockActionResult(result)).await?;
-                }
-            }
-            ClientMessage::BreakBlockRequest(request) => {
-                let Some(player) = self.player_service.player(player_id).await else {
-                    return Ok(());
-                };
-
-                if !within_reach(player.position, request.position) {
-                    write_message(
-                        stream,
-                        &ServerMessage::BlockActionResult(BlockActionResult {
-                            accepted: false,
-                            reason: "target outside break reach".to_string(),
-                        }),
-                    )
-                    .await?;
-                } else {
-                    let (result, _) = self
-                        .world_service
-                        .apply_block_edit(request.position, BlockId::Air)
-                        .await?;
-                    write_message(stream, &ServerMessage::BlockActionResult(result)).await?;
-                }
-            }
-            ClientMessage::ChatMessage(message) => {
-                write_message(stream, &ServerMessage::ChatMessage(message)).await?;
-            }
-            ClientMessage::WebRtcSignal(_) => {}
-            ClientMessage::LoginRequest(_) | ClientMessage::ClientHello(_) => {}
-        }
-
         Ok(())
     }
 
@@ -1748,183 +1598,6 @@ impl VoxelServer {
         self.dispatch_wild_pet_updates(dispatches).await;
     }
 
-    async fn send_visible_wild_pets_to_stream(
-        &self,
-        stream: &mut TcpStream,
-        player_id: u64,
-    ) -> Result<()> {
-        let Some(player) = self.player_service.player(player_id).await else {
-            return Ok(());
-        };
-        let snapshots = self
-            .wild_pet_service
-            .visible_snapshots_for_chunks(&player.subscribed_chunks)
-            .await;
-        for snapshot in snapshots {
-            write_message(stream, &ServerMessage::WildPetSnapshot(snapshot)).await?;
-        }
-        Ok(())
-    }
-
-    async fn capture_wild_pet_for_tcp(
-        &self,
-        player_id: u64,
-        stream: &mut TcpStream,
-        pet_id: u64,
-    ) -> Result<()> {
-        let Some(player) = self.player_service.player(player_id).await else {
-            return Ok(());
-        };
-        let Some(user_id) = player.user_id.clone() else {
-            write_message(
-                stream,
-                &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
-                    pet_id,
-                    status: CaptureWildPetStatus::SignInRequired,
-                    message: "Sign in to capture generated pets.".to_string(),
-                }),
-            )
-            .await?;
-            return Ok(());
-        };
-        let capture_result = self
-            .wild_pet_service
-            .capture_pet(player_id, pet_id, player.position)
-            .await;
-        let (viewer_ids, captured_pet_id, persistent_pet_id) = match capture_result {
-            WildPetCaptureResult::Captured {
-                viewer_ids,
-                captured_pet_id,
-                persistent_pet_id,
-            } => (viewer_ids, captured_pet_id, persistent_pet_id),
-            WildPetCaptureResult::NotFound => {
-                write_message(
-                    stream,
-                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
-                        pet_id,
-                        status: CaptureWildPetStatus::NotFound,
-                        message: "That pet is no longer available.".to_string(),
-                    }),
-                )
-                .await?;
-                return Ok(());
-            }
-            WildPetCaptureResult::AlreadyTaken => {
-                write_message(
-                    stream,
-                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
-                        pet_id,
-                        status: CaptureWildPetStatus::AlreadyTaken,
-                        message: "That pet was already captured.".to_string(),
-                    }),
-                )
-                .await?;
-                return Ok(());
-            }
-            WildPetCaptureResult::OutOfRange => {
-                write_message(
-                    stream,
-                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
-                        pet_id,
-                        status: CaptureWildPetStatus::OutOfRange,
-                        message: "Move closer to capture that pet.".to_string(),
-                    }),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-
-        match self.pet_registry.capture_pet(&persistent_pet_id, &user_id).await {
-            Ok(CapturePetOutcome::Captured(collection)) => {
-                if let Some(updated_player) = self
-                    .player_service
-                    .set_pet_collection(player_id, collection)
-                    .await
-                {
-                    write_message(
-                        stream,
-                        &ServerMessage::CapturedPetsSnapshot(updated_player.captured_pets_snapshot()),
-                    )
-                    .await?;
-                    write_message(
-                        stream,
-                        &ServerMessage::PlayerStateSnapshot(updated_player.snapshot(0)),
-                    )
-                    .await?;
-                    self.broadcast_player_snapshot(updated_player.snapshot(0)).await;
-                }
-                write_message(
-                    stream,
-                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
-                        pet_id,
-                        status: CaptureWildPetStatus::Captured,
-                        message: "Pet captured.".to_string(),
-                    }),
-                )
-                .await?;
-            }
-            Ok(CapturePetOutcome::AlreadyTaken) => {
-                write_message(
-                    stream,
-                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
-                        pet_id,
-                        status: CaptureWildPetStatus::AlreadyTaken,
-                        message: "That pet was already captured.".to_string(),
-                    }),
-                )
-                .await?;
-                return Ok(());
-            }
-            Ok(CapturePetOutcome::NotFound | CapturePetOutcome::NotSpawned) => {
-                write_message(
-                    stream,
-                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
-                        pet_id,
-                        status: CaptureWildPetStatus::NotFound,
-                        message: "That pet is no longer available.".to_string(),
-                    }),
-                )
-                .await?;
-                return Ok(());
-            }
-            Err(error) => {
-                tracing::warn!(?error, pet_id, "failed to capture pet in registry");
-                write_message(
-                    stream,
-                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
-                        pet_id,
-                        status: CaptureWildPetStatus::Failed,
-                        message: "We could not finalize that capture.".to_string(),
-                    }),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-
-        write_message(
-            stream,
-            &ServerMessage::WildPetUnload(WildPetUnload {
-                pet_ids: vec![captured_pet_id],
-            }),
-        )
-        .await?;
-
-        if !viewer_ids.is_empty() {
-            self.websocket_sessions
-                .broadcast_to(
-                    &viewer_ids,
-                    ServerMessage::WildPetUnload(WildPetUnload {
-                        pet_ids: vec![captured_pet_id],
-                    }),
-                )
-                .await;
-        }
-
-        Ok(())
-    }
-
     async fn capture_wild_pet_for_websocket(
         &self,
         player_id: u64,
@@ -2082,6 +1755,579 @@ impl VoxelServer {
     }
 }
 
+async fn root_page() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Augmego</title>
+    <style>
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at top, #1d3349, #091018 65%); color: #f4f8fb; font-family: Georgia, "Times New Roman", serif; }
+      main { width: min(92vw, 720px); padding: 40px; border-radius: 28px; background: rgba(7, 12, 18, 0.76); border: 1px solid rgba(255,255,255,0.10); box-shadow: 0 24px 80px rgba(0,0,0,0.45); }
+      h1 { margin: 0 0 16px 0; font-size: clamp(2.6rem, 6vw, 4.8rem); line-height: 0.95; }
+      p { margin: 0 0 18px 0; font: 500 18px/1.6 ui-sans-serif, system-ui, sans-serif; color: rgba(241,245,249,0.82); }
+      nav { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 28px; }
+      a { text-decoration: none; padding: 14px 18px; border-radius: 999px; font: 700 14px/1 ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.04em; }
+      .primary { background: #f4d58d; color: #1a2230; }
+      .secondary { border: 1px solid rgba(255,255,255,0.18); color: #f4f8fb; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div style="font: 700 12px/1 ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.18em; text-transform: uppercase; color: rgba(180, 225, 255, 0.72); margin-bottom: 14px;">Single Rust Runtime</div>
+      <h1>Augmego lives here now.</h1>
+      <p>The product shell, auth flow, world simulation, pet reservoir, and WebSocket gameplay all run from one Rust server.</p>
+      <nav>
+        <a class="primary" href="/play/">Enter The World</a>
+        <a class="secondary" href="/learn">Learn More</a>
+      </nav>
+    </main>
+  </body>
+</html>"#,
+    )
+}
+
+async fn learn_page() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Learn Augmego</title>
+    <style>
+      body { margin: 0; min-height: 100vh; background: linear-gradient(180deg, #f8efe2 0%, #f1e4d0 100%); color: #2b1f16; font-family: ui-sans-serif, system-ui, sans-serif; }
+      main { width: min(92vw, 760px); margin: 0 auto; padding: 56px 0 80px; }
+      h1 { margin: 0 0 18px 0; font: 700 clamp(2.4rem, 5vw, 4rem)/0.98 Georgia, "Times New Roman", serif; }
+      p { font-size: 18px; line-height: 1.7; color: rgba(43,31,22,0.82); }
+      a { color: #934f22; font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div style="font-size:12px;letter-spacing:0.16em;text-transform:uppercase;color:rgba(147,79,34,0.78);margin-bottom:16px;">About Augmego</div>
+      <h1>A shared voxel world with collectible creatures.</h1>
+      <p>Players can drop in as guests, sign in with Google when they want persistence, upload animated avatars, and collect procedurally generated pets that stay tied to their account.</p>
+      <p><a href="/play/">Launch the game client</a></p>
+    </main>
+  </body>
+</html>"#,
+    )
+}
+
+async fn play_redirect() -> Redirect {
+    Redirect::temporary("/play/")
+}
+
+async fn play_index(State(server): State<VoxelServer>) -> Response {
+    let index_path = server.static_root.join("play").join("index.html");
+    match fs::read_to_string(&index_path).await {
+        Ok(contents) => Html(contents).into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">The `game-web` bundle has not been built yet. Run `trunk build` for `game-web` or build the Docker image to generate `/play/`.</body></html>".to_string(),
+            ),
+        )
+            .into_response(),
+    }
+}
+
+async fn websocket_upgrade(
+    ws: WebSocketUpgrade,
+    State(server): State<VoxelServer>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        if let Err(error) = server.handle_websocket_client(socket).await {
+            tracing::error!(?error, "websocket client session ended with error");
+        }
+    })
+}
+
+async fn api_health() -> Json<Value> {
+    Json(json!({ "ok": true }))
+}
+
+async fn auth_google(State(server): State<VoxelServer>) -> Response {
+    match server.account_service.start_google_signin() {
+        Ok(result) => {
+            let mut response = Redirect::temporary(&result.redirect_url).into_response();
+            response
+                .headers_mut()
+                .append(header::SET_COOKIE, result.state_cookie.parse().unwrap());
+            response
+        }
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(format!(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Google sign-in is unavailable right now.<br/><br/>{error}</body></html>"
+            )),
+        )
+            .into_response(),
+    }
+}
+
+async fn auth_google_callback(
+    State(server): State<VoxelServer>,
+    Query(query): Query<GoogleCallbackQuery>,
+    headers: HeaderMap,
+) -> Response {
+    match server
+        .account_service
+        .handle_google_callback(
+            &query.code,
+            &query.state,
+            cookie_header(&headers),
+        )
+        .await
+    {
+        Ok(result) => {
+            let mut response = Redirect::temporary(&result.redirect_url).into_response();
+            response
+                .headers_mut()
+                .append(header::SET_COOKIE, result.session_cookie.parse().unwrap());
+            response
+                .headers_mut()
+                .append(header::SET_COOKIE, result.clear_state_cookie.parse().unwrap());
+            response
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Html(format!(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Google sign-in failed.<br/><br/>{error}</body></html>"
+            )),
+        )
+            .into_response(),
+    }
+}
+
+async fn auth_logout(State(server): State<VoxelServer>, headers: HeaderMap) -> Response {
+    if let Err(error) = server
+        .account_service
+        .revoke_session(cookie_header(&headers))
+        .await
+    {
+        tracing::warn!(?error, "failed to revoke session");
+    }
+    let mut response = Json(json!({ "ok": true })).into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        server.account_service.logout_cookie().parse().unwrap(),
+    );
+    response
+}
+
+async fn auth_me(State(server): State<VoxelServer>, headers: HeaderMap) -> Response {
+    match server
+        .account_service
+        .auth_user_from_cookie_header(cookie_header(&headers))
+        .await
+    {
+        Ok(Some(user)) => Json(json!({ "user": user })).into_response(),
+        Ok(None) => Json(json!({ "user": Value::Null })).into_response(),
+        Err(error) => {
+            tracing::warn!(?error, "failed to resolve auth session");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "AUTH_LOOKUP_FAILED" })))
+                .into_response()
+        }
+    }
+}
+
+async fn auth_profile_get(State(server): State<VoxelServer>, headers: HeaderMap) -> Response {
+    let Some(session_user) = load_session_user(&server, &headers).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED");
+    };
+
+    match server.account_service.build_auth_user(session_user).await {
+        Ok(user) => Json(json!({ "user": user })).into_response(),
+        Err(error) => {
+            tracing::warn!(?error, "failed to build auth profile");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "PROFILE_LOOKUP_FAILED")
+        }
+    }
+}
+
+async fn auth_profile_update(
+    State(server): State<VoxelServer>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(session_user) = load_session_user(&server, &headers).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED");
+    };
+    let Some(body) = body.as_object() else {
+        return api_error(StatusCode::BAD_REQUEST, "INVALID_PROFILE");
+    };
+
+    let name = match parse_optional_text_field(body, &["name"], 80) {
+        Ok(value) => value,
+        Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+    };
+    let avatar_url = match parse_optional_url_field(body, &["avatarUrl"]) {
+        Ok(value) => value,
+        Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+    };
+
+    if let Err(error) = server
+        .account_service
+        .update_profile(session_user.id, name, avatar_url)
+        .await
+    {
+        tracing::warn!(?error, user_id = %session_user.id, "failed to update profile");
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "PROFILE_UPDATE_FAILED");
+    }
+
+    match server
+        .account_service
+        .auth_user_from_cookie_header(cookie_header(&headers))
+        .await
+    {
+        Ok(Some(user)) => Json(json!({ "ok": true, "user": user })).into_response(),
+        Ok(None) => api_error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED"),
+        Err(error) => {
+            tracing::warn!(?error, "failed to load updated auth user");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "PROFILE_LOOKUP_FAILED")
+        }
+    }
+}
+
+async fn player_avatar_get(State(server): State<VoxelServer>, headers: HeaderMap) -> Response {
+    let Some(session_user) = load_session_user(&server, &headers).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED");
+    };
+
+    match server
+        .account_service
+        .load_avatar_selection(session_user.id)
+        .await
+    {
+        Ok(selection) => Json(json!({ "avatarSelection": selection })).into_response(),
+        Err(error) => {
+            tracing::warn!(?error, user_id = %session_user.id, "failed to load avatar selection");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "AVATAR_LOOKUP_FAILED")
+        }
+    }
+}
+
+async fn player_avatar_patch(
+    State(server): State<VoxelServer>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(session_user) = load_session_user(&server, &headers).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED");
+    };
+    let Some(body) = body.as_object() else {
+        return api_error(StatusCode::BAD_REQUEST, "INVALID_AVATAR_SELECTION");
+    };
+
+    let mut selection = match server
+        .account_service
+        .load_avatar_selection(session_user.id)
+        .await
+    {
+        Ok(selection) => selection,
+        Err(error) => {
+            tracing::warn!(?error, user_id = %session_user.id, "failed to load current avatar selection");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "AVATAR_LOOKUP_FAILED");
+        }
+    };
+
+    let stationary = match parse_optional_url_field(body, &["stationaryModelUrl", "idleModelUrl"]) {
+        Ok(value) => value,
+        Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+    };
+    let movement = match parse_optional_url_field(body, &["moveModelUrl", "runModelUrl"]) {
+        Ok(value) => value,
+        Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+    };
+    let special = match parse_optional_url_field(body, &["specialModelUrl", "danceModelUrl"]) {
+        Ok(value) => value,
+        Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+    };
+
+    if let Some(value) = stationary {
+        selection.stationary_model_url = value;
+    }
+    if let Some(value) = movement {
+        selection.move_model_url = value;
+    }
+    if let Some(value) = special {
+        selection.special_model_url = value;
+    }
+
+    if let Err(error) = server
+        .account_service
+        .update_avatar_selection(session_user.id, &selection)
+        .await
+    {
+        tracing::warn!(?error, user_id = %session_user.id, "failed to update avatar selection");
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "AVATAR_UPDATE_FAILED");
+    }
+
+    Json(json!({ "ok": true, "avatarSelection": selection })).into_response()
+}
+
+async fn player_avatar_upload(
+    State(server): State<VoxelServer>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    let Some(session_user) = load_session_user(&server, &headers).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED");
+    };
+
+    let mut requested_slot: Option<String> = None;
+    let mut files: Vec<(PlayerAvatarSlot, Vec<u8>, String)> = Vec::new();
+    let mut single_file: Option<(Vec<u8>, String)> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let field_name = field.name().unwrap_or_default().to_string();
+        match field_name.as_str() {
+            "slot" => {
+                requested_slot = field.text().await.ok().map(|value| value.trim().to_string());
+            }
+            "file" => {
+                let content_type = field
+                    .content_type()
+                    .unwrap_or("model/gltf-binary")
+                    .to_string();
+                if let Ok(bytes) = field.bytes().await {
+                    single_file = Some((bytes.to_vec(), content_type));
+                }
+            }
+            "idleFile" | "runFile" | "danceFile" => {
+                let slot = match field_name.as_str() {
+                    "idleFile" => PlayerAvatarSlot::Idle,
+                    "runFile" => PlayerAvatarSlot::Run,
+                    _ => PlayerAvatarSlot::Dance,
+                };
+                let content_type = field
+                    .content_type()
+                    .unwrap_or("model/gltf-binary")
+                    .to_string();
+                if let Ok(bytes) = field.bytes().await {
+                    files.push((slot, bytes.to_vec(), content_type));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(slot_value) = requested_slot {
+        let Some(slot) = PlayerAvatarSlot::parse(&slot_value) else {
+            return api_error(StatusCode::BAD_REQUEST, "INVALID_AVATAR_SLOT");
+        };
+        let Some((bytes, content_type)) = single_file else {
+            return api_error(StatusCode::BAD_REQUEST, "FILE_REQUIRED");
+        };
+        files.push((slot, bytes, content_type));
+    }
+
+    if files.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "PLAYER_AVATAR_FILES_REQUIRED");
+    }
+
+    let mut selection = None;
+    let mut uploaded_slots = Vec::new();
+    for (slot, bytes, content_type) in files {
+        if bytes.is_empty() {
+            return api_error(StatusCode::BAD_REQUEST, "INVALID_GLB_FILE");
+        }
+        match server
+            .account_service
+            .save_avatar_file(session_user.id, slot, &bytes, &content_type)
+            .await
+        {
+            Ok(next_selection) => {
+                selection = Some(next_selection);
+                uploaded_slots.push(slot.as_path_value().to_string());
+            }
+            Err(error) => {
+                tracing::warn!(?error, user_id = %session_user.id, slot = slot.as_path_value(), "failed to save avatar file");
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "AVATAR_UPLOAD_FAILED");
+            }
+        }
+    }
+
+    Json(json!({
+        "ok": true,
+        "uploadedSlots": uploaded_slots,
+        "avatarSelection": selection,
+    }))
+    .into_response()
+}
+
+async fn player_avatar_upload_url(
+    State(server): State<VoxelServer>,
+    headers: HeaderMap,
+) -> Response {
+    if load_session_user(&server, &headers).await.is_none() {
+        return api_error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED");
+    }
+    if !server.account_service.direct_avatar_upload_url_available() {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "DIRECT_UPLOAD_NOT_AVAILABLE");
+    }
+
+    api_error(StatusCode::SERVICE_UNAVAILABLE, "DIRECT_UPLOAD_NOT_AVAILABLE")
+}
+
+async fn public_player_avatar_file(
+    State(server): State<VoxelServer>,
+    AxumPath((user_id, slot)): AxumPath<(String, String)>,
+) -> Response {
+    let Ok(user_id) = Uuid::parse_str(&user_id) else {
+        return api_error(StatusCode::NOT_FOUND, "NOT_FOUND");
+    };
+    let Some(slot) = PlayerAvatarSlot::parse(&slot) else {
+        return api_error(StatusCode::NOT_FOUND, "NOT_FOUND");
+    };
+
+    match server.account_service.read_avatar_file(user_id, slot).await {
+        Ok(Some(AvatarFileResponse::Redirect { url })) => Redirect::temporary(&url).into_response(),
+        Ok(Some(AvatarFileResponse::Bytes(object))) => storage_object_response(object),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND"),
+        Err(error) => {
+            tracing::warn!(?error, %user_id, slot = slot.as_path_value(), "failed to read avatar file");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "AVATAR_FILE_READ_FAILED")
+        }
+    }
+}
+
+async fn public_pet_file(
+    State(server): State<VoxelServer>,
+    AxumPath(pet_id): AxumPath<String>,
+) -> Response {
+    match server.pet_registry.read_pet_model_file(&pet_id).await {
+        Ok(Some(PetModelFileResponse::Redirect { url })) => Redirect::temporary(&url).into_response(),
+        Ok(Some(PetModelFileResponse::Bytes(object))) => storage_object_response(object),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND"),
+        Err(error) => {
+            tracing::warn!(?error, %pet_id, "failed to read pet model file");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "PET_FILE_READ_FAILED")
+        }
+    }
+}
+
+async fn load_session_user(
+    server: &VoxelServer,
+    headers: &HeaderMap,
+) -> Option<crate::account::SessionUser> {
+    match server
+        .account_service
+        .session_user_from_cookie_header(cookie_header(headers))
+        .await
+    {
+        Ok(user) => user,
+        Err(error) => {
+            tracing::warn!(?error, "failed to load session user from cookies");
+            None
+        }
+    }
+}
+
+fn cookie_header(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::COOKIE).and_then(|value| value.to_str().ok())
+}
+
+fn api_error(status: StatusCode, code: &str) -> Response {
+    (status, Json(json!({ "error": code }))).into_response()
+}
+
+fn storage_object_response(object: crate::storage::StorageObject) -> Response {
+    let mut response = Response::new(Body::from(object.bytes));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        object.content_type.parse().unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
+    );
+    if let Some(cache_control) = object.cache_control {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
+    }
+    response
+}
+
+fn parse_optional_text_field(
+    body: &serde_json::Map<String, Value>,
+    keys: &[&str],
+    max_len: usize,
+) -> std::result::Result<Option<Option<String>>, &'static str> {
+    let Some(value) = first_present_value(body, keys) else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(Some(None)),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Ok(Some(None))
+            } else {
+                Ok(Some(Some(
+                    trimmed.chars().take(max_len).collect::<String>(),
+                )))
+            }
+        }
+        _ => Err("INVALID_PROFILE"),
+    }
+}
+
+fn parse_optional_url_field(
+    body: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> std::result::Result<Option<Option<String>>, &'static str> {
+    let Some(value) = first_present_value(body, keys) else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(Some(None)),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Ok(Some(None));
+            }
+            let parsed = Url::parse(trimmed).map_err(|_| "INVALID_AVATAR_URL")?;
+            if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                return Err("INVALID_AVATAR_URL");
+            }
+            Ok(Some(Some(parsed.to_string())))
+        }
+        _ => Err("INVALID_AVATAR_URL"),
+    }
+}
+
+fn first_present_value<'a>(
+    body: &'a serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a Value> {
+    keys.iter().find_map(|key| body.get(*key))
+}
+
+fn default_inventory_snapshot() -> InventorySnapshot {
+    InventorySnapshot {
+        slots: vec![
+            InventoryStack {
+                block: BlockId::Grass,
+                count: 64,
+            },
+            InventoryStack {
+                block: BlockId::Stone,
+                count: 64,
+            },
+            InventoryStack {
+                block: BlockId::GoldOre,
+                count: 32,
+            },
+            InventoryStack {
+                block: BlockId::Planks,
+                count: 32,
+            },
+        ],
+    }
+}
+
 fn player_input_is_stale(client_sent_at_ms: Option<u64>) -> bool {
     let Some(client_sent_at_ms) = client_sent_at_ms else {
         return false;
@@ -2097,14 +2343,14 @@ impl Clone for VoxelServer {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
+            account_service: self.account_service.clone(),
             pet_registry: self.pet_registry.clone(),
-            connection_service: self.connection_service.clone(),
-            websocket_connection_service: self.websocket_connection_service.clone(),
             websocket_sessions: self.websocket_sessions.clone(),
             chunk_streaming: self.chunk_streaming.clone(),
             player_service: self.player_service.clone(),
             wild_pet_service: self.wild_pet_service.clone(),
             world_service: self.world_service.clone(),
+            static_root: self.static_root.clone(),
         }
     }
 }
@@ -2212,13 +2458,13 @@ fn pseudo_unit(seed: u64) -> f32 {
 async fn read_ws_message<T, S>(stream: &mut S) -> Result<T>
 where
     T: for<'de> serde::Deserialize<'de>,
-    S: Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    S: Stream<Item = std::result::Result<WsMessage, axum::Error>> + Unpin,
 {
     while let Some(message) = stream.next().await {
         match message.context("read websocket frame")? {
-            Message::Binary(bytes) => return Ok(decode(&bytes)?),
-            Message::Close(_) => anyhow::bail!("websocket closed"),
-            Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_) => continue,
+            WsMessage::Binary(bytes) => return Ok(decode(bytes.as_ref())?),
+            WsMessage::Close(_) => anyhow::bail!("websocket closed"),
+            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Text(_) => continue,
         }
     }
 
@@ -2228,10 +2474,10 @@ where
 async fn write_ws_message<T, S>(sink: &mut S, message: &T) -> Result<()>
 where
     T: serde::Serialize,
-    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    S: Sink<WsMessage, Error = axum::Error> + Unpin,
 {
     let bytes = encode(message)?;
-    sink.send(Message::Binary(bytes))
+    sink.send(WsMessage::Binary(bytes.into()))
         .await
         .context("write websocket frame")
 }
@@ -2263,8 +2509,9 @@ mod tests {
 
     #[test]
     fn reach_gate_allows_nearby_positions() {
-        assert!(within_reach(WorldPos { x: 2, y: 91, z: -3 }));
-        assert!(!within_reach(WorldPos { x: 20, y: 91, z: 0 }));
+        let player_position = [0.5, 89.4, 0.5];
+        assert!(within_reach(player_position, WorldPos { x: 2, y: 91, z: -3 }));
+        assert!(!within_reach(player_position, WorldPos { x: 20, y: 91, z: 0 }));
     }
 
     #[test]

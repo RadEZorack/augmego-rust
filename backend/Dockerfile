@@ -2,16 +2,23 @@ FROM rust:1.86-bookworm AS builder
 
 WORKDIR /app
 
+RUN cargo install trunk --locked
+RUN rustup target add wasm32-unknown-unknown
+
 COPY Cargo.toml Cargo.lock ./
 COPY backend ./backend
+COPY game-web ./game-web
 COPY shared_content ./shared_content
 COPY shared_math ./shared_math
 COPY shared_protocol ./shared_protocol
 COPY shared_world ./shared_world
+COPY wgpu-lite ./wgpu-lite
+COPY assets ./assets
 
-RUN sed -i '/"game-web",/d' Cargo.toml \
-  && sed -i '/"game\.deprecated",/d' Cargo.toml \
-  && sed -i '/"wgpu-lite",/d' Cargo.toml
+WORKDIR /app/game-web
+RUN trunk build --release
+
+WORKDIR /app
 
 RUN cargo build --release -p backend
 
@@ -24,7 +31,10 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/backend /usr/local/bin/backend
+COPY --from=builder /app/backend/static /app/static
 
-EXPOSE 4000 4001
+ENV BACKEND_STATIC_ROOT=/app/static
+
+EXPOSE 4000
 
 CMD ["backend"]

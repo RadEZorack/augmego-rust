@@ -1803,14 +1803,10 @@ fn within_reach(player_position: [f32; 3], target: WorldPos) -> bool {
 }
 
 fn wild_pet_within_capture_distance(player_position: [f32; 3], pet_position: [f32; 3]) -> bool {
-    let origin = [
-        player_position[0],
-        player_position[1] + PLAYER_EYE_HEIGHT,
-        player_position[2],
-    ];
-    let dx = pet_position[0] - origin[0];
-    let dy = pet_position[1] + 0.5 - origin[1];
-    let dz = pet_position[2] - origin[2];
+    // Web clients report player eye position in motion packets, so use it directly here.
+    let dx = pet_position[0] - player_position[0];
+    let dy = pet_position[1] + 0.5 - player_position[1];
+    let dz = pet_position[2] - player_position[2];
     let distance_squared = dx * dx + dy * dy + dz * dz;
     distance_squared <= WILD_PET_CAPTURE_DISTANCE * WILD_PET_CAPTURE_DISTANCE
 }

@@ -4,10 +4,10 @@ use anyhow::Result;
 use glam::{Mat4, Quat, Vec3};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
-    BreakBlockRequest, ClientHello, ClientMessage, ClientWebRtcSignal, InventorySnapshot,
-    LoginRequest, PROTOCOL_VERSION, PeerRealtimeState, PetStateSnapshot, PlaceBlockRequest,
-    PlayerInputTick, ServerMessage, ServerWebRtcSignal, SubscribeChunks, WebRtcSignalPayload,
-    decode, encode,
+    BreakBlockRequest, CapturedPetsSnapshot, ClientHello, ClientMessage, ClientWebRtcSignal,
+    InventorySnapshot, LoginRequest, PROTOCOL_VERSION, PeerRealtimeState, PetStateSnapshot,
+    PlaceBlockRequest, PlayerInputTick, ServerMessage, ServerWebRtcSignal, SubscribeChunks,
+    WebRtcSignalPayload, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::cell::RefCell;
@@ -95,6 +95,17 @@ const PET_STUCK_DISTANCE: f32 = 1.5;
 const PET_STUCK_TIMEOUT_SECS: f32 = 1.25;
 const PET_CLIMB_BOOST_SPEED: f32 = 5.0;
 const PET_FALL_RESET_Y: f32 = -8.0;
+const WILD_PET_ROAM_SPEED: f32 = 3.4;
+const WILD_PET_ROAM_ACCELERATION: f32 = 12.0;
+const WILD_PET_AIR_ACCELERATION: f32 = 6.0;
+const WILD_PET_IDLE_MIN_SECS: f32 = 0.8;
+const WILD_PET_IDLE_MAX_SECS: f32 = 1.2;
+const WILD_PET_TARGET_REACHED_DISTANCE: f32 = 1.55;
+const WILD_PET_SLOW_RADIUS: f32 = 1.4;
+const WILD_PET_MIN_WANDER_DISTANCE: f32 = 3.0;
+const WILD_PET_MAX_WANDER_DISTANCE: f32 = 10.0;
+const WILD_PET_CAPTURE_BOX_RADIUS: f32 = 0.6;
+const WILD_PET_CAPTURE_BOX_HEIGHT: f32 = 1.15;
 const PET_SLOT_OFFSETS: [(f32, f32); PET_FOLLOWER_COUNT] = [
     (-1.0, 3.3),
     (1.0, 3.3),
@@ -462,6 +473,8 @@ struct WebApp {
     remote_player_avatar_selections: HashMap<u64, PlayerAvatarSelection>,
     remote_player_avatar_states: HashMap<u64, RemoteAvatarPlaybackState>,
     remote_pet_states: HashMap<u64, Vec<PetStateSnapshot>>,
+    wild_pets: HashMap<u64, WildPetClientState>,
+    hosted_wild_pets: HashMap<u64, HostedWildPetState>,
     remote_media: HashMap<u64, RemotePeerMedia>,
     remote_avatar_assets: HashMap<String, RemoteAvatarAsset>,
     pending_remote_avatar_urls: HashSet<String>,
@@ -469,6 +482,7 @@ struct WebApp {
     pet_asset_attempted: bool,
     pet_followers: Vec<PetFollowerState>,
     pet_followers_need_reset: bool,
+    captured_pet_ids: Vec<u64>,
     spawn_position: Option<WorldPos>,
     world_seed: u64,
     webcam_requested: bool,
@@ -498,6 +512,7 @@ struct WebApp {
     remote_avatar_rx: Receiver<RemoteAvatarEvent>,
     auth_overlay: Element,
     auth_overlay_status: Element,
+    captured_pets_panel: Element,
     player_avatar_panel: Element,
     player_avatar_modal: Element,
     player_avatar_panel_status: Element,
@@ -542,6 +557,7 @@ impl WebApp {
         let (remote_avatar_tx, remote_avatar_rx) = mpsc::channel();
         let (peer_realtime_tx, peer_realtime_rx) = mpsc::channel();
         let (auth_overlay, auth_overlay_status, auth_button_onclicks) = create_auth_overlay();
+        let captured_pets_panel = create_captured_pets_panel();
         let (
             player_avatar_panel,
             player_avatar_modal,
@@ -554,7 +570,7 @@ impl WebApp {
         let pending_generation = VecDeque::new();
         let last_reprioritize_forward = camera.forward();
 
-        Self {
+        let app = Self {
             canvas,
             camera,
             authoritative_chunks: HashMap::new(),
@@ -588,6 +604,8 @@ impl WebApp {
             remote_player_avatar_selections: HashMap::new(),
             remote_player_avatar_states: HashMap::new(),
             remote_pet_states: HashMap::new(),
+            wild_pets: HashMap::new(),
+            hosted_wild_pets: HashMap::new(),
             remote_media: HashMap::new(),
             remote_avatar_assets: HashMap::new(),
             pending_remote_avatar_urls: HashSet::new(),
@@ -595,6 +613,7 @@ impl WebApp {
             pet_asset_attempted: false,
             pet_followers: Vec::new(),
             pet_followers_need_reset: false,
+            captured_pet_ids: Vec::new(),
             spawn_position: None,
             world_seed: DEFAULT_WORLD_SEED,
             webcam_requested: false,
@@ -624,6 +643,7 @@ impl WebApp {
             remote_avatar_rx,
             auth_overlay,
             auth_overlay_status,
+            captured_pets_panel,
             player_avatar_panel,
             player_avatar_modal,
             player_avatar_panel_status,
@@ -635,7 +655,9 @@ impl WebApp {
             workers,
             next_worker_index: 0,
             _worker_onmessages: worker_onmessages,
-        }
+        };
+        app.update_captured_pets_panel();
+        app
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -738,6 +760,11 @@ impl WebApp {
                     open_url(LINK_PANEL_OPEN_URL);
                 }
             }
+            InteractionTarget::WildPet(hit) if button == MouseButton::Left => {
+                self.send_client_message(&ClientMessage::CaptureWildPetRequest {
+                    pet_id: hit.pet_id,
+                });
+            }
             InteractionTarget::Block(hit) => match button {
                 MouseButton::Left => {
                     self.apply_local_block_edit(hit.block, BlockId::Air);
@@ -760,7 +787,7 @@ impl WebApp {
                 }
                 _ => {}
             },
-            InteractionTarget::Link => {}
+            InteractionTarget::Link | InteractionTarget::WildPet(_) => {}
         }
     }
 
@@ -850,6 +877,7 @@ impl WebApp {
                         state.yaw,
                         state.pet_states,
                     );
+                    self.apply_remote_wild_pet_motion(player_id, state.tick, state.wild_pet_states);
                 }
             }
         }
@@ -879,6 +907,34 @@ impl WebApp {
                 }
             }
         }
+    }
+
+    fn update_captured_pets_panel(&self) {
+        let summary = if self.captured_pet_ids.is_empty() {
+            "No captured dogs yet".to_string()
+        } else {
+            format!(
+                "{} captured dog{}",
+                self.captured_pet_ids.len(),
+                if self.captured_pet_ids.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        };
+        let details = if self.captured_pet_ids.is_empty() {
+            "Explore and left click a wild dog to capture it.".to_string()
+        } else {
+            self.captured_pet_ids
+                .iter()
+                .map(|pet_id| format!("#{pet_id}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        self.captured_pets_panel.set_inner_html(&format!(
+            "<div style=\"font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:rgba(183,230,255,0.66);margin-bottom:8px;\">Captured Pets</div><div style=\"font-size:15px;font-weight:700;color:#f4f7fb;\">{summary}</div><div style=\"margin-top:8px;color:rgba(230,237,243,0.74);font-size:12px;line-height:1.45;\">{details}</div>"
+        ));
     }
 
     fn drain_network(&mut self) {
@@ -921,6 +977,8 @@ impl WebApp {
                             self.remote_player_avatar_selections.clear();
                             self.remote_player_avatar_states.clear();
                             self.remote_pet_states.clear();
+                            self.wild_pets.clear();
+                            self.hosted_wild_pets.clear();
                             self.remote_media.clear();
                             self.remote_avatar_assets.clear();
                             self.pending_remote_avatar_urls.clear();
@@ -934,6 +992,8 @@ impl WebApp {
                             self.last_sent_yaw = None;
                             self.last_input_broadcast_at = None;
                             self.last_peer_realtime_broadcast_at = None;
+                            self.captured_pet_ids.clear();
+                            self.update_captured_pets_panel();
                             web_sys::console::error_1(&JsValue::from_str(&format!(
                                 "multiplayer disconnected: decode websocket message: {error}"
                             )));
@@ -960,6 +1020,8 @@ impl WebApp {
                                 self.remote_player_avatar_selections.clear();
                                 self.remote_player_avatar_states.clear();
                                 self.remote_pet_states.clear();
+                                self.wild_pets.clear();
+                                self.hosted_wild_pets.clear();
                                 self.remote_media.clear();
                                 self.remote_avatar_assets.clear();
                                 self.pending_remote_avatar_urls.clear();
@@ -969,6 +1031,8 @@ impl WebApp {
                                 self.last_sent_yaw = None;
                                 self.last_input_broadcast_at = None;
                                 self.last_peer_realtime_broadcast_at = None;
+                                self.captured_pet_ids.clear();
+                                self.update_captured_pets_panel();
                                 self.camera.position = Vec3::new(
                                     response.spawn_position.x as f32 + 0.5,
                                     response.spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
@@ -1082,6 +1146,19 @@ impl WebApp {
                                 }
                             }
                         }
+                        ServerMessage::WildPetSnapshot(snapshot) => {
+                            self.apply_wild_pet_snapshot(snapshot);
+                        }
+                        ServerMessage::WildPetUnload(WildPetUnload { pet_ids }) => {
+                            for pet_id in pet_ids {
+                                self.wild_pets.remove(&pet_id);
+                                self.hosted_wild_pets.remove(&pet_id);
+                            }
+                        }
+                        ServerMessage::CapturedPetsSnapshot(CapturedPetsSnapshot { pet_ids }) => {
+                            self.captured_pet_ids = pet_ids;
+                            self.update_captured_pets_panel();
+                        }
                         ServerMessage::WebRtcSignal(signal) => self.handle_webrtc_signal(signal),
                         ServerMessage::BlockActionResult(result) => {
                             if !result.accepted {
@@ -1105,6 +1182,8 @@ impl WebApp {
                     self.remote_player_avatar_selections.clear();
                     self.remote_player_avatar_states.clear();
                     self.remote_pet_states.clear();
+                    self.wild_pets.clear();
+                    self.hosted_wild_pets.clear();
                     self.remote_media.clear();
                     self.remote_avatar_assets.clear();
                     self.pending_remote_avatar_urls.clear();
@@ -1118,6 +1197,8 @@ impl WebApp {
                     self.last_sent_yaw = None;
                     self.last_input_broadcast_at = None;
                     self.last_peer_realtime_broadcast_at = None;
+                    self.captured_pet_ids.clear();
+                    self.update_captured_pets_panel();
                     web_sys::console::error_1(&JsValue::from_str(&format!(
                         "multiplayer disconnected: {reason}"
                     )));
@@ -1304,6 +1385,22 @@ impl WebApp {
             .collect()
     }
 
+    fn current_wild_pet_motion_snapshots(&self) -> Vec<WildPetMotionSnapshot> {
+        self.hosted_wild_pets
+            .values()
+            .map(|pet| WildPetMotionSnapshot {
+                pet_id: pet.pet_id,
+                position: pet.feet_position.to_array(),
+                velocity: [
+                    pet.horizontal_velocity.x,
+                    pet.vertical_velocity,
+                    pet.horizontal_velocity.z,
+                ],
+                yaw: pet.yaw,
+            })
+            .collect()
+    }
+
     fn apply_remote_motion_state(
         &mut self,
         player_id: u64,
@@ -1331,6 +1428,73 @@ impl WebApp {
         self.remote_player_velocities.insert(player_id, velocity);
         self.remote_player_yaws.insert(player_id, yaw);
         self.remote_pet_states.insert(player_id, pet_states);
+    }
+
+    fn apply_remote_wild_pet_motion(
+        &mut self,
+        host_player_id: u64,
+        tick: u64,
+        wild_pet_states: Vec<WildPetMotionSnapshot>,
+    ) {
+        for motion in wild_pet_states {
+            if self.hosted_wild_pets.contains_key(&motion.pet_id) {
+                continue;
+            }
+            let Some(pet) = self.wild_pets.get_mut(&motion.pet_id) else {
+                continue;
+            };
+            if pet.host_player_id != Some(host_player_id) || tick < pet.latest_tick {
+                continue;
+            }
+
+            pet.position = Vec3::from_array(motion.position);
+            pet.velocity = Vec3::from_array(motion.velocity);
+            pet.yaw = motion.yaw;
+            pet.latest_tick = tick;
+        }
+    }
+
+    fn apply_wild_pet_snapshot(&mut self, snapshot: WildPetSnapshot) {
+        let host_player_id = snapshot.host_player_id;
+        if let Some(host_player_id) = host_player_id.filter(|id| Some(*id) != self.player_id) {
+            self.ensure_peer_connection(host_player_id);
+        }
+
+        let pet_id = snapshot.pet_id;
+        let mut state = self
+            .wild_pets
+            .get(&pet_id)
+            .cloned()
+            .unwrap_or_else(|| WildPetClientState::from_snapshot(&snapshot));
+        let host_changed = state.host_player_id != snapshot.host_player_id;
+        let is_local_host = snapshot.host_player_id == self.player_id;
+
+        state.spawn_position = Vec3::from_array(snapshot.spawn_position);
+        state.host_player_id = snapshot.host_player_id;
+        if (snapshot.tick >= state.latest_tick && !is_local_host)
+            || host_changed
+            || !self.hosted_wild_pets.contains_key(&pet_id)
+        {
+            state.position = Vec3::from_array(snapshot.position);
+            state.velocity = Vec3::from_array(snapshot.velocity);
+            state.yaw = snapshot.yaw;
+            state.latest_tick = snapshot.tick;
+        }
+        self.wild_pets.insert(pet_id, state.clone());
+
+        if is_local_host {
+            if let Some(hosted) = self.hosted_wild_pets.get_mut(&pet_id) {
+                hosted.spawn_position = state.spawn_position;
+            } else {
+                let wander_target = self.choose_wild_pet_wander_target(state.position);
+                self.hosted_wild_pets.insert(
+                    pet_id,
+                    HostedWildPetState::from_client_state(&state, wander_target),
+                );
+            }
+        } else {
+            self.hosted_wild_pets.remove(&pet_id);
+        }
     }
 
     fn player_is_nearby_for_peer_realtime(&self, position: [f32; 3]) -> bool {
@@ -1389,6 +1553,7 @@ impl WebApp {
         if self.logged_in {
             self.ensure_pet_followers_initialized();
             self.update_pet_followers(dt);
+            self.update_hosted_wild_pets(dt);
         }
         if !self.logged_in {
             return;
@@ -1455,6 +1620,7 @@ impl WebApp {
         if peer_send_due || websocket_send_due {
             let state_tick = self.next_state_tick();
             let pet_states = self.current_pet_snapshots();
+            let wild_pet_states = self.current_wild_pet_motion_snapshots();
 
             if peer_send_due {
                 if let Ok(bytes) = encode(&PeerRealtimeState {
@@ -1463,6 +1629,7 @@ impl WebApp {
                     velocity,
                     yaw: self.camera.yaw,
                     pet_states: pet_states.clone(),
+                    wild_pet_states: wild_pet_states.clone(),
                 }) {
                     for channel in peer_channels {
                         let _ = channel.send_with_u8_array(&bytes);
@@ -1485,6 +1652,7 @@ impl WebApp {
                     yaw: Some(self.camera.yaw),
                     jump,
                     pet_states,
+                    wild_pet_states,
                 }));
                 self.last_sent_position = Some(position);
                 self.last_sent_velocity = Some(velocity);
@@ -1534,6 +1702,192 @@ impl WebApp {
             self.update_pet_follower(&mut pet, slot_target, player_feet, dt_secs);
             self.pet_followers[index] = pet;
         }
+    }
+
+    fn update_hosted_wild_pets(&mut self, dt: Duration) {
+        let dt_secs = dt.as_secs_f32();
+        if dt_secs <= 0.0 || self.hosted_wild_pets.is_empty() {
+            return;
+        }
+
+        let pet_ids = self.hosted_wild_pets.keys().copied().collect::<Vec<_>>();
+        for pet_id in pet_ids {
+            let Some(mut pet) = self.hosted_wild_pets.get(&pet_id).copied() else {
+                continue;
+            };
+            self.update_hosted_wild_pet(&mut pet, dt_secs);
+            self.hosted_wild_pets.insert(pet_id, pet);
+            self.wild_pets
+                .entry(pet_id)
+                .and_modify(|state| {
+                    state.position = pet.feet_position;
+                    state.velocity = Vec3::new(
+                        pet.horizontal_velocity.x,
+                        pet.vertical_velocity,
+                        pet.horizontal_velocity.z,
+                    );
+                    state.yaw = pet.yaw;
+                    state.host_player_id = self.player_id;
+                })
+                .or_insert_with(|| WildPetClientState {
+                    pet_id,
+                    spawn_position: pet.spawn_position,
+                    position: pet.feet_position,
+                    velocity: Vec3::new(
+                        pet.horizontal_velocity.x,
+                        pet.vertical_velocity,
+                        pet.horizontal_velocity.z,
+                    ),
+                    yaw: pet.yaw,
+                    host_player_id: self.player_id,
+                    latest_tick: 0,
+                });
+        }
+    }
+
+    fn update_hosted_wild_pet(&mut self, pet: &mut HostedWildPetState, dt_secs: f32) {
+        if self.hosted_wild_pet_needs_reset(pet) {
+            self.reset_hosted_wild_pet(pet);
+            return;
+        }
+
+        if pet.idle_timer > 0.0 {
+            pet.idle_timer = (pet.idle_timer - dt_secs).max(0.0);
+            if pet.idle_timer <= 0.0 {
+                pet.wander_target = self.choose_wild_pet_wander_target(pet.feet_position);
+                pet.last_goal_distance = horizontal_distance(pet.feet_position, pet.wander_target);
+            }
+        } else if horizontal_distance(pet.feet_position, pet.wander_target)
+            <= WILD_PET_TARGET_REACHED_DISTANCE {
+            pet.idle_timer = wild_pet_idle_duration();
+            pet.wander_target = pet.feet_position;
+            pet.horizontal_velocity = Vec3::ZERO;
+            pet.last_goal_distance = 0.0;
+        }
+
+        let to_target = Vec3::new(
+            pet.wander_target.x - pet.feet_position.x,
+            0.0,
+            pet.wander_target.z - pet.feet_position.z,
+        );
+        let target_distance = to_target.length();
+        let desired_velocity =
+            if pet.idle_timer > 0.0 || target_distance <= WILD_PET_TARGET_REACHED_DISTANCE {
+                Vec3::ZERO
+            } else {
+                let slow_factor = if target_distance < WILD_PET_SLOW_RADIUS {
+                    ((target_distance - WILD_PET_TARGET_REACHED_DISTANCE)
+                        / (WILD_PET_SLOW_RADIUS - WILD_PET_TARGET_REACHED_DISTANCE))
+                        .clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                to_target.normalize_or_zero() * (WILD_PET_ROAM_SPEED * slow_factor)
+            };
+        let acceleration = if pet.on_ground {
+            WILD_PET_ROAM_ACCELERATION
+        } else {
+            WILD_PET_AIR_ACCELERATION
+        };
+        pet.horizontal_velocity = move_towards_vec3(
+            pet.horizontal_velocity,
+            desired_velocity,
+            acceleration * dt_secs,
+        );
+        pet.horizontal_velocity.y = 0.0;
+
+        pet.vertical_velocity -= PET_GRAVITY * dt_secs;
+        let previous_feet = pet.feet_position;
+        let horizontal_delta = pet.horizontal_velocity * dt_secs;
+        self.sweep_collider_axis(
+            &mut pet.feet_position,
+            horizontal_delta.x,
+            Axis::X,
+            pet.on_ground,
+            PET_COLLIDER,
+        );
+        self.sweep_collider_axis(
+            &mut pet.feet_position,
+            horizontal_delta.z,
+            Axis::Z,
+            pet.on_ground,
+            PET_COLLIDER,
+        );
+
+        let requested_horizontal = Vec3::new(horizontal_delta.x, 0.0, horizontal_delta.z).length();
+        let moved_horizontal = horizontal_distance(previous_feet, pet.feet_position);
+        if target_distance > PET_STUCK_DISTANCE
+            && requested_horizontal > 0.01
+            && moved_horizontal + 0.02 < requested_horizontal
+        {
+            pet.vertical_velocity = pet.vertical_velocity.max(PET_CLIMB_BOOST_SPEED);
+            pet.on_ground = false;
+        }
+
+        let moved_vertically = self.sweep_collider_axis(
+            &mut pet.feet_position,
+            pet.vertical_velocity * dt_secs,
+            Axis::Y,
+            false,
+            PET_COLLIDER,
+        );
+        if moved_vertically {
+            pet.on_ground = false;
+        } else {
+            if pet.vertical_velocity < 0.0 {
+                pet.on_ground = true;
+            }
+            pet.vertical_velocity = 0.0;
+        }
+
+        if pet.horizontal_velocity.length_squared() > 0.0025 {
+            pet.yaw = pet.horizontal_velocity.x.atan2(pet.horizontal_velocity.z);
+        }
+
+        let next_distance = horizontal_distance(pet.feet_position, pet.wander_target);
+        let progress = pet.last_goal_distance - next_distance;
+        if pet.idle_timer <= 0.0 && next_distance > PET_STUCK_DISTANCE {
+            if progress < PET_STUCK_PROGRESS_EPSILON {
+                pet.stuck_timer += dt_secs;
+            } else {
+                pet.stuck_timer = 0.0;
+            }
+        } else {
+            pet.stuck_timer = 0.0;
+        }
+        pet.last_goal_distance = next_distance;
+
+        if self.hosted_wild_pet_needs_reset(pet) {
+            self.reset_hosted_wild_pet(pet);
+        }
+    }
+
+    fn hosted_wild_pet_needs_reset(&self, pet: &HostedWildPetState) -> bool {
+        pet.feet_position.y < PET_FALL_RESET_Y || pet.stuck_timer >= PET_STUCK_TIMEOUT_SECS
+    }
+
+    fn reset_hosted_wild_pet(&mut self, pet: &mut HostedWildPetState) {
+        let safe_position = if pet.feet_position.y < PET_FALL_RESET_Y {
+            self.find_safe_pet_position(pet.spawn_position, pet.spawn_position)
+        } else {
+            pet.feet_position
+        };
+        let wander_target = self.choose_wild_pet_wander_target(safe_position);
+        *pet = HostedWildPetState::new(
+            pet.pet_id,
+            pet.spawn_position,
+            safe_position,
+            wander_target,
+            pet.yaw,
+        );
+    }
+
+    fn choose_wild_pet_wander_target(&mut self, current_position: Vec3) -> Vec3 {
+        let angle = (js_sys::Math::random() as f32) * std::f32::consts::TAU;
+        let radius = WILD_PET_MIN_WANDER_DISTANCE
+            + (js_sys::Math::random() as f32)
+                * (WILD_PET_MAX_WANDER_DISTANCE - WILD_PET_MIN_WANDER_DISTANCE);
+        current_position + Vec3::new(angle.cos() * radius, 0.0, angle.sin() * radius)
     }
 
     fn update_pet_follower(
@@ -1699,23 +2053,65 @@ impl WebApp {
     fn current_interaction_target(&mut self) -> Option<InteractionTarget> {
         let block_hit = self.current_target();
         let link_hit = self.current_link_target();
+        let wild_pet_hit = self.current_wild_pet_target();
 
-        match (block_hit, link_hit) {
-            (Some(block), Some(link)) => {
-                if link.distance < block.distance {
-                    Some(InteractionTarget::Link)
-                } else {
-                    Some(InteractionTarget::Block(block))
-                }
+        let mut best_target = block_hit.map(InteractionTarget::Block);
+        let mut best_distance = block_hit.map(|hit| hit.distance).unwrap_or(f32::INFINITY);
+
+        if let Some(link) = link_hit {
+            if link.distance < best_distance {
+                best_distance = link.distance;
+                best_target = Some(InteractionTarget::Link);
             }
-            (Some(block), None) => Some(InteractionTarget::Block(block)),
-            (None, Some(_)) => Some(InteractionTarget::Link),
-            (None, None) => None,
         }
+
+        if let Some(wild_pet) = wild_pet_hit {
+            if wild_pet.distance < best_distance {
+                best_target = Some(InteractionTarget::WildPet(wild_pet));
+            }
+        }
+
+        best_target
     }
 
     fn current_link_target(&self) -> Option<LinkHit> {
         raycast_link_panel(self.camera.position, self.camera.forward(), self.link_panel)
+    }
+
+    fn current_wild_pet_target(&self) -> Option<WildPetHit> {
+        let direction = self.camera.forward().normalize_or_zero();
+        if direction == Vec3::ZERO {
+            return None;
+        }
+
+        let mut best_hit = None;
+        for (&pet_id, pet) in &self.wild_pets {
+            let min = Vec3::new(
+                pet.position.x - WILD_PET_CAPTURE_BOX_RADIUS,
+                pet.position.y,
+                pet.position.z - WILD_PET_CAPTURE_BOX_RADIUS,
+            );
+            let max = Vec3::new(
+                pet.position.x + WILD_PET_CAPTURE_BOX_RADIUS,
+                pet.position.y + WILD_PET_CAPTURE_BOX_HEIGHT,
+                pet.position.z + WILD_PET_CAPTURE_BOX_RADIUS,
+            );
+            let Some(distance) = ray_aabb_distance(self.camera.position, direction, min, max)
+            else {
+                continue;
+            };
+            if distance > 6.0 {
+                continue;
+            }
+            if best_hit
+                .map(|hit: WildPetHit| distance < hit.distance)
+                .unwrap_or(true)
+            {
+                best_hit = Some(WildPetHit { pet_id, distance });
+            }
+        }
+
+        best_hit
     }
 
     fn build_crosshair_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
@@ -1997,7 +2393,8 @@ impl WebApp {
             .remote_pet_states
             .values()
             .any(|pet_states| !pet_states.is_empty());
-        if (self.pet_followers.is_empty() && !has_remote_pets)
+        let has_wild_pets = !self.wild_pets.is_empty();
+        if (self.pet_followers.is_empty() && !has_remote_pets && !has_wild_pets)
             || self.pet_asset.is_some()
             || self.pet_asset_attempted
         {
@@ -2023,7 +2420,9 @@ impl WebApp {
         };
 
         let mut draws = Vec::with_capacity(
-            self.pet_followers.len() + self.remote_pet_states.values().map(Vec::len).sum::<usize>(),
+            self.pet_followers.len()
+                + self.remote_pet_states.values().map(Vec::len).sum::<usize>()
+                + self.wild_pets.len(),
         );
 
         for pet in &self.pet_followers {
@@ -2037,6 +2436,11 @@ impl WebApp {
                     * Mat4::from_rotation_y(pet.yaw);
                 draws.push(renderer.create_textured_draw(pet_asset, model));
             }
+        }
+
+        for pet in self.wild_pets.values() {
+            let model = Mat4::from_translation(pet.position) * Mat4::from_rotation_y(pet.yaw);
+            draws.push(renderer.create_textured_draw(pet_asset, model));
         }
 
         draws
@@ -3227,6 +3631,86 @@ impl PetFollowerState {
     }
 }
 
+#[derive(Clone)]
+struct WildPetClientState {
+    pet_id: u64,
+    spawn_position: Vec3,
+    position: Vec3,
+    velocity: Vec3,
+    yaw: f32,
+    host_player_id: Option<u64>,
+    latest_tick: u64,
+}
+
+impl WildPetClientState {
+    fn from_snapshot(snapshot: &WildPetSnapshot) -> Self {
+        Self {
+            pet_id: snapshot.pet_id,
+            spawn_position: Vec3::from_array(snapshot.spawn_position),
+            position: Vec3::from_array(snapshot.position),
+            velocity: Vec3::from_array(snapshot.velocity),
+            yaw: snapshot.yaw,
+            host_player_id: snapshot.host_player_id,
+            latest_tick: snapshot.tick,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HostedWildPetState {
+    pet_id: u64,
+    spawn_position: Vec3,
+    feet_position: Vec3,
+    horizontal_velocity: Vec3,
+    vertical_velocity: f32,
+    yaw: f32,
+    on_ground: bool,
+    last_goal_distance: f32,
+    stuck_timer: f32,
+    wander_target: Vec3,
+    idle_timer: f32,
+}
+
+impl HostedWildPetState {
+    fn new(
+        pet_id: u64,
+        spawn_position: Vec3,
+        feet_position: Vec3,
+        wander_target: Vec3,
+        yaw: f32,
+    ) -> Self {
+        Self {
+            pet_id,
+            spawn_position,
+            feet_position,
+            horizontal_velocity: Vec3::ZERO,
+            vertical_velocity: 0.0,
+            yaw,
+            on_ground: false,
+            last_goal_distance: horizontal_distance(feet_position, wander_target),
+            stuck_timer: 0.0,
+            wander_target,
+            idle_timer: 0.0,
+        }
+    }
+
+    fn from_client_state(state: &WildPetClientState, wander_target: Vec3) -> Self {
+        Self {
+            pet_id: state.pet_id,
+            spawn_position: state.spawn_position,
+            feet_position: state.position,
+            horizontal_velocity: Vec3::new(state.velocity.x, 0.0, state.velocity.z),
+            vertical_velocity: state.velocity.y,
+            yaw: state.yaw,
+            on_ground: false,
+            last_goal_distance: horizontal_distance(state.position, wander_target),
+            stuck_timer: 0.0,
+            wander_target,
+            idle_timer: 0.0,
+        }
+    }
+}
+
 fn horizontal_basis_from_yaw(yaw: f32) -> (Vec3, Vec3) {
     let forward = Vec3::new(yaw.sin(), 0.0, yaw.cos()).normalize_or_zero();
     let right = Vec3::new(-forward.z, 0.0, forward.x);
@@ -3245,6 +3729,11 @@ fn move_towards_vec3(current: Vec3, target: Vec3, max_delta: f32) -> Vec3 {
     } else {
         current + delta / distance * max_delta
     }
+}
+
+fn wild_pet_idle_duration() -> f32 {
+    WILD_PET_IDLE_MIN_SECS
+        + (js_sys::Math::random() as f32) * (WILD_PET_IDLE_MAX_SECS - WILD_PET_IDLE_MIN_SECS)
 }
 
 fn attach_canvas(canvas: HtmlCanvasElement) {
@@ -3339,6 +3828,23 @@ fn create_webcam_prompt() -> (Element, Closure<dyn FnMut(WebEvent)>) {
     let _ = prompt.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
     let _ = body.append_child(&prompt);
     (prompt, onclick)
+}
+
+fn create_captured_pets_panel() -> Element {
+    let Some(document) = document() else {
+        return fallback_element();
+    };
+    let Some(body) = document.body() else {
+        return fallback_element();
+    };
+
+    let panel = document.create_element("div").expect("captured pets panel");
+    let _ = panel.set_attribute(
+        "style",
+        "position:fixed;left:16px;bottom:108px;width:min(260px,calc(100vw - 32px));padding:14px 16px;border-radius:16px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:30;font-family:ui-sans-serif,system-ui,sans-serif;",
+    );
+    let _ = body.append_child(&panel);
+    panel
 }
 
 fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>) {
@@ -5459,9 +5965,16 @@ struct LinkHit {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct WildPetHit {
+    pet_id: u64,
+    distance: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
 enum InteractionTarget {
     Block(RaycastHit),
     Link,
+    WildPet(WildPetHit),
 }
 
 fn block_is_solid(block: BlockId) -> bool {
@@ -5535,6 +6048,39 @@ fn raycast_link_panel(origin: Vec3, direction: Vec3, panel: LinkPanel) -> Option
     }
 
     Some(LinkHit { distance: t })
+}
+
+fn ray_aabb_distance(origin: Vec3, direction: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
+    let mut t_min = 0.0f32;
+    let mut t_max = f32::INFINITY;
+
+    for axis in 0..3 {
+        let origin_component = origin[axis];
+        let direction_component = direction[axis];
+        let min_component = min[axis];
+        let max_component = max[axis];
+
+        if direction_component.abs() <= f32::EPSILON {
+            if origin_component < min_component || origin_component > max_component {
+                return None;
+            }
+            continue;
+        }
+
+        let inv = 1.0 / direction_component;
+        let mut t0 = (min_component - origin_component) * inv;
+        let mut t1 = (max_component - origin_component) * inv;
+        if t0 > t1 {
+            std::mem::swap(&mut t0, &mut t1);
+        }
+        t_min = t_min.max(t0);
+        t_max = t_max.min(t1);
+        if t_min > t_max {
+            return None;
+        }
+    }
+
+    Some(if t_min >= 0.0 { t_min } else { t_max })
 }
 
 fn add_face_highlight(

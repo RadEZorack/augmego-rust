@@ -3,7 +3,7 @@ use shared_math::{ChunkPos, WorldPos};
 use shared_world::{BlockId, ChunkData, ChunkDelta};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -55,6 +55,7 @@ pub struct PlayerInputTick {
     pub yaw: Option<f32>,
     pub jump: bool,
     pub pet_states: Vec<PetStateSnapshot>,
+    pub wild_pet_states: Vec<WildPetMotionSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +71,36 @@ pub struct PeerRealtimeState {
     pub velocity: [f32; 3],
     pub yaw: f32,
     pub pet_states: Vec<PetStateSnapshot>,
+    pub wild_pet_states: Vec<WildPetMotionSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WildPetMotionSnapshot {
+    pub pet_id: u64,
+    pub position: [f32; 3],
+    pub velocity: [f32; 3],
+    pub yaw: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WildPetSnapshot {
+    pub pet_id: u64,
+    pub tick: u64,
+    pub spawn_position: [f32; 3],
+    pub position: [f32; 3],
+    pub velocity: [f32; 3],
+    pub yaw: f32,
+    pub host_player_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WildPetUnload {
+    pub pet_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapturedPetsSnapshot {
+    pub pet_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +183,7 @@ pub enum ClientMessage {
     LoginRequest(LoginRequest),
     SubscribeChunks(SubscribeChunks),
     PlayerInputTick(PlayerInputTick),
+    CaptureWildPetRequest { pet_id: u64 },
     PlaceBlockRequest(PlaceBlockRequest),
     BreakBlockRequest(BreakBlockRequest),
     ChatMessage(ChatMessage),
@@ -166,6 +198,9 @@ pub enum ServerMessage {
     ChunkUnload(ChunkUnload),
     ChunkDelta(ChunkDelta),
     PlayerStateSnapshot(PlayerStateSnapshot),
+    WildPetSnapshot(WildPetSnapshot),
+    WildPetUnload(WildPetUnload),
+    CapturedPetsSnapshot(CapturedPetsSnapshot),
     InventorySnapshot(InventorySnapshot),
     BlockActionResult(BlockActionResult),
     ChatMessage(ChatMessage),

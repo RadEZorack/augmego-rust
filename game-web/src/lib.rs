@@ -63,6 +63,7 @@ const PLAYER_WALK_SPEED: f32 = 7.5;
 const PLAYER_SPRINT_SPEED: f32 = 11.0;
 const PLAYER_JUMP_SPEED: f32 = 9.5;
 const PLAYER_GRAVITY: f32 = 28.0;
+const PLAYER_CLIMB_BOOST_SPEED: f32 = 5.5;
 const STEP_HEIGHT: f32 = 0.6;
 const COLLISION_STEP: f32 = 0.2;
 const CROSSHAIR_DISTANCE: f32 = 0.6;
@@ -2983,6 +2984,7 @@ impl WebApp {
 
         self.camera.vertical_velocity -= PLAYER_GRAVITY * dt_secs;
         let mut feet_position = self.player_feet_position();
+        let previous_feet = feet_position;
         self.sweep_collider_axis(
             &mut feet_position,
             horizontal_delta.x,
@@ -2997,6 +2999,17 @@ impl WebApp {
             self.camera.on_ground,
             PLAYER_COLLIDER,
         );
+
+        let requested_horizontal = Vec3::new(horizontal_delta.x, 0.0, horizontal_delta.z).length();
+        let moved_horizontal = horizontal_distance(previous_feet, feet_position);
+        if horizontal != Vec3::ZERO
+            && requested_horizontal > 0.01
+            && moved_horizontal + 0.02 < requested_horizontal
+        {
+            self.camera.vertical_velocity =
+                self.camera.vertical_velocity.max(PLAYER_CLIMB_BOOST_SPEED);
+            self.camera.on_ground = false;
+        }
 
         let moved_vertically = self.sweep_collider_axis(
             &mut feet_position,

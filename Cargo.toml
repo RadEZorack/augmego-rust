@@ -45,3 +45,6 @@ version = "0.3"
 
 [workspace.dependencies.web-time]
 version = "1.1"
+
+[patch.crates-io]
+winit = { path = "vendor/winit" }

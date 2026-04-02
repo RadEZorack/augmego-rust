@@ -1,4 +1,5 @@
 use crate::net::{is_disconnect, read_message, write_message};
+use crate::pet_registry::{CapturePetOutcome, PetRegistryClient, PlayerPetCollection};
 use crate::persistence::PersistenceService;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -6,8 +7,9 @@ use glam::Vec3;
 use shared_content::block_definitions;
 use shared_math::{CHUNK_HEIGHT, ChunkPos, WorldPos};
 use shared_protocol::{
-    BlockActionResult, CapturedPetsSnapshot, ChunkUnload, ClientHello, ClientMessage,
-    InventorySnapshot, InventoryStack, LoginResponse, PROTOCOL_VERSION, PetStateSnapshot,
+    BlockActionResult, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
+    CapturedPetsSnapshot, ChunkUnload, ClientHello, ClientMessage, InventorySnapshot,
+    InventoryStack, LoginResponse, PROTOCOL_VERSION, PetIdentity, PetStateSnapshot, PlayerLeft,
     PlayerStateSnapshot, ServerHello, ServerMessage, ServerWebRtcSignal, SubscribeChunks,
     WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, decode, encode,
 };
@@ -31,7 +33,7 @@ const MAX_ACCEPTED_INPUT_AGE_MS: u64 = 500;
 const WILD_PET_CAPTURE_DISTANCE: f32 = 2.6;
 const WILD_PET_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 const WILD_PET_TARGET_PER_PLAYER: usize = 30;
-const WILD_PET_GLOBAL_CAP: usize = 100;
+const WILD_PET_GLOBAL_CAP: usize = 30;
 const WILD_PET_MIN_SPAWN_DISTANCE: f32 = 18.0;
 const WILD_PET_SPAWN_RADIUS: f32 = 56.0;
 
@@ -42,6 +44,9 @@ pub struct ServerConfig {
     pub world_seed: u64,
     pub save_path: PathBuf,
     pub view_radius: u8,
+    pub web_api_base_url: String,
+    pub backend_service_token: String,
+    pub game_backend_auth_secret: String,
 }
 
 impl Default for ServerConfig {
@@ -62,6 +67,12 @@ impl Default for ServerConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(12),
+            web_api_base_url: std::env::var("BACKEND_WEB_API_BASE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:3000/api/v1".to_string()),
+            backend_service_token: std::env::var("BACKEND_SERVICE_TOKEN")
+                .unwrap_or_else(|_| "dev-only-backend-service-token".to_string()),
+            game_backend_auth_secret: std::env::var("GAME_BACKEND_AUTH_SECRET")
+                .unwrap_or_else(|_| "dev-only-game-backend-secret".to_string()),
         }
     }
 }
@@ -70,6 +81,7 @@ impl Default for ServerConfig {
 struct Player {
     id: u64,
     name: String,
+    user_id: Option<String>,
     position: [f32; 3],
     velocity: [f32; 3],
     yaw: f32,
@@ -77,7 +89,8 @@ struct Player {
     run_model_url: Option<String>,
     dance_model_url: Option<String>,
     pet_states: Vec<PetStateSnapshot>,
-    captured_pet_ids: Vec<u64>,
+    captured_pets: Vec<CapturedPet>,
+    active_pet_models: Vec<PetIdentity>,
     subscribed_chunks: HashSet<ChunkPos>,
 }
 
@@ -93,6 +106,13 @@ impl Player {
             run_model_url: self.run_model_url.clone(),
             dance_model_url: self.dance_model_url.clone(),
             pet_states: self.pet_states.clone(),
+            active_pet_models: self.active_pet_models.clone(),
+        }
+    }
+
+    fn captured_pets_snapshot(&self) -> CapturedPetsSnapshot {
+        CapturedPetsSnapshot {
+            pets: self.captured_pets.clone(),
         }
     }
 }
@@ -114,15 +134,22 @@ impl PlayerService {
     async fn login(
         &self,
         name: String,
+        user_id: Option<String>,
+        pet_collection: Option<PlayerPetCollection>,
         spawn: WorldPos,
         idle_model_url: Option<String>,
         run_model_url: Option<String>,
         dance_model_url: Option<String>,
     ) -> Player {
         let mut next_id = self.next_id.lock().await;
+        let (captured_pets, active_pet_models) = match pet_collection {
+            Some(collection) => (collection.pets, collection.active_pets),
+            None => (Vec::new(), Vec::new()),
+        };
         let player = Player {
             id: *next_id,
             name,
+            user_id,
             position: [spawn.x as f32 + 0.5, spawn.y as f32, spawn.z as f32 + 0.5],
             velocity: [0.0; 3],
             yaw: 0.0,
@@ -130,7 +157,8 @@ impl PlayerService {
             run_model_url,
             dance_model_url,
             pet_states: Vec::new(),
-            captured_pet_ids: Vec::new(),
+            captured_pets,
+            active_pet_models,
             subscribed_chunks: HashSet::new(),
         };
         *next_id += 1;
@@ -151,7 +179,10 @@ impl PlayerService {
         player.position = position;
         player.velocity = velocity;
         player.yaw = yaw;
-        player.pet_states = pet_states;
+        player.pet_states = pet_states
+            .into_iter()
+            .take(player.active_pet_models.len())
+            .collect();
         Some(player.clone())
     }
 
@@ -220,19 +251,26 @@ impl PlayerService {
         self.players.lock().await.values().cloned().collect()
     }
 
-    async fn add_captured_pet(&self, player_id: u64, pet_id: u64) -> Option<Vec<u64>> {
+    async fn set_pet_collection(
+        &self,
+        player_id: u64,
+        collection: PlayerPetCollection,
+    ) -> Option<Player> {
         let mut players = self.players.lock().await;
         let player = players.get_mut(&player_id)?;
-        if !player.captured_pet_ids.contains(&pet_id) {
-            player.captured_pet_ids.push(pet_id);
-        }
-        Some(player.captured_pet_ids.clone())
+        player.captured_pets = collection.pets;
+        player.active_pet_models = collection.active_pets;
+        player
+            .pet_states
+            .truncate(player.active_pet_models.len());
+        Some(player.clone())
     }
 }
 
 #[derive(Debug, Clone)]
 struct WildPet {
     id: u64,
+    pet_identity: PetIdentity,
     tick: u64,
     spawn_position: [f32; 3],
     position: [f32; 3],
@@ -253,6 +291,7 @@ impl WildPet {
             velocity: self.velocity,
             yaw: self.yaw,
             host_player_id: self.host_player_id,
+            pet_identity: self.pet_identity.clone(),
         }
     }
 
@@ -275,6 +314,17 @@ enum WildPetDispatch {
         player_ids: Vec<u64>,
         pet_ids: Vec<u64>,
     },
+}
+
+enum WildPetCaptureResult {
+    Captured {
+        viewer_ids: Vec<u64>,
+        captured_pet_id: u64,
+        persistent_pet_id: String,
+    },
+    NotFound,
+    OutOfRange,
+    AlreadyTaken,
 }
 
 #[derive(Clone)]
@@ -349,6 +399,7 @@ impl WildPetService {
     async fn maintain(
         &self,
         world_service: &WorldService,
+        pet_registry: &PetRegistryClient,
         players: &[Player],
         connected_player_ids: &HashSet<u64>,
     ) -> Result<Vec<WildPetDispatch>> {
@@ -381,7 +432,7 @@ impl WildPetService {
                         break;
                     }
                     if let Some(new_pet_id) = self
-                        .spawn_pet_for_player_locked(world_service, &mut pets, player)
+                        .spawn_pet_for_player_locked(world_service, pet_registry, &mut pets, player)
                         .await?
                     {
                         uncaptured_count += 1;
@@ -460,22 +511,32 @@ impl WildPetService {
         _player_id: u64,
         pet_id: u64,
         player_position: [f32; 3],
-    ) -> Option<(Vec<u64>, u64)> {
+    ) -> WildPetCaptureResult {
         let mut pets = self.pets.lock().await;
-        let pet = pets.get_mut(&pet_id)?;
-        if pet.captured || !wild_pet_within_capture_distance(player_position, pet.position) {
-            return None;
+        let Some(pet) = pets.get_mut(&pet_id) else {
+            return WildPetCaptureResult::NotFound;
+        };
+        if pet.captured {
+            return WildPetCaptureResult::AlreadyTaken;
+        }
+        if !wild_pet_within_capture_distance(player_position, pet.position) {
+            return WildPetCaptureResult::OutOfRange;
         }
 
         pet.captured = true;
         pet.host_player_id = None;
         let viewers = pet.visible_viewers.drain().collect::<Vec<_>>();
-        Some((viewers, pet_id))
+        WildPetCaptureResult::Captured {
+            viewer_ids: viewers,
+            captured_pet_id: pet_id,
+            persistent_pet_id: pet.pet_identity.id.clone(),
+        }
     }
 
     async fn spawn_pet_for_player_locked(
         &self,
         world_service: &WorldService,
+        pet_registry: &PetRegistryClient,
         pets: &mut HashMap<u64, WildPet>,
         player: &Player,
     ) -> Result<Option<u64>> {
@@ -516,6 +577,14 @@ impl WildPetService {
                 continue;
             }
 
+            let pet_identity = match pet_registry.reserve_pet().await {
+                Ok(Some(pet_identity)) => pet_identity,
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    tracing::warn!(?error, "failed to reserve pet from registry");
+                    return Ok(None);
+                }
+            };
             let new_id = {
                 let mut next_id = self.next_id.lock().await;
                 let value = *next_id;
@@ -524,6 +593,7 @@ impl WildPetService {
             };
             let pet = WildPet {
                 id: new_id,
+                pet_identity,
                 tick: 0,
                 spawn_position,
                 position: spawn_position,
@@ -1045,6 +1115,7 @@ impl WebSocketConnectionService {
 
 pub struct VoxelServer {
     config: ServerConfig,
+    pet_registry: PetRegistryClient,
     connection_service: ConnectionService,
     websocket_connection_service: WebSocketConnectionService,
     websocket_sessions: WebSocketSessionService,
@@ -1056,6 +1127,11 @@ pub struct VoxelServer {
 
 impl VoxelServer {
     pub async fn new(config: ServerConfig) -> Result<Self> {
+        let pet_registry = PetRegistryClient::new(
+            config.web_api_base_url.clone(),
+            config.backend_service_token.clone(),
+            config.game_backend_auth_secret.clone(),
+        );
         let persistence = PersistenceService::new(&config.save_path).await?;
         let world_service = WorldService::new(config.world_seed, persistence);
         let chunk_streaming = ChunkStreamingService::new(world_service.clone(), config.view_radius);
@@ -1073,6 +1149,7 @@ impl VoxelServer {
 
         Ok(Self {
             config,
+            pet_registry,
             connection_service,
             websocket_connection_service,
             websocket_sessions,
@@ -1085,6 +1162,14 @@ impl VoxelServer {
 
     pub async fn run(self) -> Result<()> {
         tracing::info!(tcp_addr = %self.config.bind_addr, ws_addr = %self.config.ws_bind_addr, "voxel backend listening");
+        match self.pet_registry.reset_spawned_pets().await {
+            Ok(reset_count) => {
+                tracing::info!(reset_count, "reset spawned pets in pet registry");
+            }
+            Err(error) => {
+                tracing::warn!(?error, "failed to reset spawned pets in pet registry");
+            }
+        }
         let websocket_server = self.clone();
         tokio::spawn(async move {
             if let Err(error) = websocket_server.run_websocket_loop().await {
@@ -1109,7 +1194,7 @@ impl VoxelServer {
             let connected_player_ids = self.websocket_sessions.connected_player_ids().await;
             let dispatches = self
                 .wild_pet_service
-                .maintain(&self.world_service, &players, &connected_player_ids)
+                .maintain(&self.world_service, &self.pet_registry, &players, &connected_player_ids)
                 .await?;
             self.dispatch_wild_pet_updates(dispatches).await;
         }
@@ -1172,11 +1257,27 @@ impl VoxelServer {
             _ => return Err(anyhow!("expected login request")),
         };
 
+        let user_id = login
+            .auth_token
+            .as_deref()
+            .and_then(|token| self.pet_registry.verify_auth_token(token));
+        let pet_collection = match user_id.as_deref() {
+            Some(user_id) => match self.pet_registry.load_user_pet_collection(user_id).await {
+                Ok(collection) => Some(collection),
+                Err(error) => {
+                    tracing::warn!(?error, %user_id, "failed to load player pet collection");
+                    None
+                }
+            },
+            None => None,
+        };
         let spawn_position = self.world_service.safe_spawn_position();
         let player = self
             .player_service
             .login(
                 login.name,
+                user_id.clone(),
+                pet_collection,
                 spawn_position,
                 login.idle_model_url,
                 login.run_model_url,
@@ -1222,9 +1323,7 @@ impl VoxelServer {
         .await?;
         write_message(
             &mut stream,
-            &ServerMessage::CapturedPetsSnapshot(CapturedPetsSnapshot {
-                pet_ids: player.captured_pet_ids.clone(),
-            }),
+            &ServerMessage::CapturedPetsSnapshot(player.captured_pets_snapshot()),
         )
         .await?;
 
@@ -1252,6 +1351,7 @@ impl VoxelServer {
             self.handle_message(player.id, &mut stream, message).await?;
         }
 
+        self.broadcast_player_left(player.id).await;
         self.player_service.remove(player.id).await;
         Ok(())
     }
@@ -1285,11 +1385,27 @@ impl VoxelServer {
             _ => return Err(anyhow!("expected websocket login request")),
         };
 
+        let user_id = login
+            .auth_token
+            .as_deref()
+            .and_then(|token| self.pet_registry.verify_auth_token(token));
+        let pet_collection = match user_id.as_deref() {
+            Some(user_id) => match self.pet_registry.load_user_pet_collection(user_id).await {
+                Ok(collection) => Some(collection),
+                Err(error) => {
+                    tracing::warn!(?error, %user_id, "failed to load websocket player pet collection");
+                    None
+                }
+            },
+            None => None,
+        };
         let spawn_position = self.world_service.safe_spawn_position();
         let player = self
             .player_service
             .login(
                 login.name,
+                user_id.clone(),
+                pet_collection,
                 spawn_position,
                 login.idle_model_url,
                 login.run_model_url,
@@ -1325,9 +1441,7 @@ impl VoxelServer {
                 },
             ],
         }));
-        let _ = sender.send(ServerMessage::CapturedPetsSnapshot(CapturedPetsSnapshot {
-            pet_ids: player.captured_pet_ids.clone(),
-        }));
+        let _ = sender.send(ServerMessage::CapturedPetsSnapshot(player.captured_pets_snapshot()));
 
         self.websocket_sessions
             .register(player.id, sender.clone())
@@ -1355,6 +1469,7 @@ impl VoxelServer {
         }
 
         self.websocket_sessions.remove(player.id).await;
+        self.broadcast_player_left(player.id).await;
         self.wild_pet_service.remove_player(player.id).await;
         self.player_service.remove(player.id).await;
         drop(sender);
@@ -1660,27 +1775,141 @@ impl VoxelServer {
         let Some(player) = self.player_service.player(player_id).await else {
             return Ok(());
         };
-        let Some((viewer_ids, captured_pet_id)) = self
-            .wild_pet_service
-            .capture_pet(player_id, pet_id, player.position)
-            .await
-        else {
-            return Ok(());
-        };
-
-        if let Some(captured_pet_ids) = self
-            .player_service
-            .add_captured_pet(player_id, captured_pet_id)
-            .await
-        {
+        let Some(user_id) = player.user_id.clone() else {
             write_message(
                 stream,
-                &ServerMessage::CapturedPetsSnapshot(CapturedPetsSnapshot {
-                    pet_ids: captured_pet_ids,
+                &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                    pet_id,
+                    status: CaptureWildPetStatus::SignInRequired,
+                    message: "Sign in to capture generated pets.".to_string(),
                 }),
             )
             .await?;
+            return Ok(());
+        };
+        let capture_result = self
+            .wild_pet_service
+            .capture_pet(player_id, pet_id, player.position)
+            .await;
+        let (viewer_ids, captured_pet_id, persistent_pet_id) = match capture_result {
+            WildPetCaptureResult::Captured {
+                viewer_ids,
+                captured_pet_id,
+                persistent_pet_id,
+            } => (viewer_ids, captured_pet_id, persistent_pet_id),
+            WildPetCaptureResult::NotFound => {
+                write_message(
+                    stream,
+                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                        pet_id,
+                        status: CaptureWildPetStatus::NotFound,
+                        message: "That pet is no longer available.".to_string(),
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+            WildPetCaptureResult::AlreadyTaken => {
+                write_message(
+                    stream,
+                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                        pet_id,
+                        status: CaptureWildPetStatus::AlreadyTaken,
+                        message: "That pet was already captured.".to_string(),
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+            WildPetCaptureResult::OutOfRange => {
+                write_message(
+                    stream,
+                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                        pet_id,
+                        status: CaptureWildPetStatus::OutOfRange,
+                        message: "Move closer to capture that pet.".to_string(),
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        match self.pet_registry.capture_pet(&persistent_pet_id, &user_id).await {
+            Ok(CapturePetOutcome::Captured(collection)) => {
+                if let Some(updated_player) = self
+                    .player_service
+                    .set_pet_collection(player_id, collection)
+                    .await
+                {
+                    write_message(
+                        stream,
+                        &ServerMessage::CapturedPetsSnapshot(updated_player.captured_pets_snapshot()),
+                    )
+                    .await?;
+                    write_message(
+                        stream,
+                        &ServerMessage::PlayerStateSnapshot(updated_player.snapshot(0)),
+                    )
+                    .await?;
+                    self.broadcast_player_snapshot(updated_player.snapshot(0)).await;
+                }
+                write_message(
+                    stream,
+                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                        pet_id,
+                        status: CaptureWildPetStatus::Captured,
+                        message: "Pet captured.".to_string(),
+                    }),
+                )
+                .await?;
+            }
+            Ok(CapturePetOutcome::AlreadyTaken) => {
+                write_message(
+                    stream,
+                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                        pet_id,
+                        status: CaptureWildPetStatus::AlreadyTaken,
+                        message: "That pet was already captured.".to_string(),
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+            Ok(CapturePetOutcome::NotFound | CapturePetOutcome::NotSpawned) => {
+                write_message(
+                    stream,
+                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                        pet_id,
+                        status: CaptureWildPetStatus::NotFound,
+                        message: "That pet is no longer available.".to_string(),
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(?error, pet_id, "failed to capture pet in registry");
+                write_message(
+                    stream,
+                    &ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                        pet_id,
+                        status: CaptureWildPetStatus::Failed,
+                        message: "We could not finalize that capture.".to_string(),
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
         }
+
+        write_message(
+            stream,
+            &ServerMessage::WildPetUnload(WildPetUnload {
+                pet_ids: vec![captured_pet_id],
+            }),
+        )
+        .await?;
 
         if !viewer_ids.is_empty() {
             self.websocket_sessions
@@ -1705,22 +1934,95 @@ impl VoxelServer {
         let Some(player) = self.player_service.player(player_id).await else {
             return Ok(());
         };
-        let Some((viewer_ids, captured_pet_id)) = self
-            .wild_pet_service
-            .capture_pet(player_id, pet_id, player.position)
-            .await
-        else {
+        let Some(user_id) = player.user_id.clone() else {
+            let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                pet_id,
+                status: CaptureWildPetStatus::SignInRequired,
+                message: "Sign in to capture generated pets.".to_string(),
+            }));
             return Ok(());
         };
+        let capture_result = self
+            .wild_pet_service
+            .capture_pet(player_id, pet_id, player.position)
+            .await;
+        let (viewer_ids, captured_pet_id, persistent_pet_id) = match capture_result {
+            WildPetCaptureResult::Captured {
+                viewer_ids,
+                captured_pet_id,
+                persistent_pet_id,
+            } => (viewer_ids, captured_pet_id, persistent_pet_id),
+            WildPetCaptureResult::NotFound => {
+                let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                    pet_id,
+                    status: CaptureWildPetStatus::NotFound,
+                    message: "That pet is no longer available.".to_string(),
+                }));
+                return Ok(());
+            }
+            WildPetCaptureResult::AlreadyTaken => {
+                let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                    pet_id,
+                    status: CaptureWildPetStatus::AlreadyTaken,
+                    message: "That pet was already captured.".to_string(),
+                }));
+                return Ok(());
+            }
+            WildPetCaptureResult::OutOfRange => {
+                let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                    pet_id,
+                    status: CaptureWildPetStatus::OutOfRange,
+                    message: "Move closer to capture that pet.".to_string(),
+                }));
+                return Ok(());
+            }
+        };
 
-        if let Some(captured_pet_ids) = self
-            .player_service
-            .add_captured_pet(player_id, captured_pet_id)
-            .await
-        {
-            let _ = sender.send(ServerMessage::CapturedPetsSnapshot(CapturedPetsSnapshot {
-                pet_ids: captured_pet_ids,
-            }));
+        match self.pet_registry.capture_pet(&persistent_pet_id, &user_id).await {
+            Ok(CapturePetOutcome::Captured(collection)) => {
+                if let Some(updated_player) = self
+                    .player_service
+                    .set_pet_collection(player_id, collection)
+                    .await
+                {
+                    let _ = sender.send(ServerMessage::CapturedPetsSnapshot(
+                        updated_player.captured_pets_snapshot(),
+                    ));
+                    let snapshot = updated_player.snapshot(0);
+                    let _ = sender.send(ServerMessage::PlayerStateSnapshot(snapshot.clone()));
+                    self.broadcast_player_snapshot(snapshot).await;
+                }
+                let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                    pet_id,
+                    status: CaptureWildPetStatus::Captured,
+                    message: "Pet captured.".to_string(),
+                }));
+            }
+            Ok(CapturePetOutcome::AlreadyTaken) => {
+                let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                    pet_id,
+                    status: CaptureWildPetStatus::AlreadyTaken,
+                    message: "That pet was already captured.".to_string(),
+                }));
+                return Ok(());
+            }
+            Ok(CapturePetOutcome::NotFound | CapturePetOutcome::NotSpawned) => {
+                let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                    pet_id,
+                    status: CaptureWildPetStatus::NotFound,
+                    message: "That pet is no longer available.".to_string(),
+                }));
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(?error, pet_id, "failed to capture pet in registry");
+                let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                    pet_id,
+                    status: CaptureWildPetStatus::Failed,
+                    message: "We could not finalize that capture.".to_string(),
+                }));
+                return Ok(());
+            }
         }
 
         if !viewer_ids.is_empty() {
@@ -1761,6 +2063,23 @@ impl VoxelServer {
             .broadcast_to(&subscribers, ServerMessage::PlayerStateSnapshot(snapshot))
             .await;
     }
+
+    async fn broadcast_player_left(&self, player_id: u64) {
+        let recipients = self
+            .websocket_sessions
+            .connected_player_ids()
+            .await
+            .into_iter()
+            .filter(|connected_id| *connected_id != player_id)
+            .collect::<Vec<_>>();
+        if recipients.is_empty() {
+            return;
+        }
+
+        self.websocket_sessions
+            .broadcast_to(&recipients, ServerMessage::PlayerLeft(PlayerLeft { player_id }))
+            .await;
+    }
 }
 
 fn player_input_is_stale(client_sent_at_ms: Option<u64>) -> bool {
@@ -1778,6 +2097,7 @@ impl Clone for VoxelServer {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
+            pet_registry: self.pet_registry.clone(),
             connection_service: self.connection_service.clone(),
             websocket_connection_service: self.websocket_connection_service.clone(),
             websocket_sessions: self.websocket_sessions.clone(),

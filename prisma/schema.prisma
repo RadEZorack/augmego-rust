@@ -24,6 +24,15 @@ enum WorldAssetVisibility {
   PRIVATE
 }
 
+enum PetStatus {
+  QUEUED
+  GENERATING
+  READY
+  SPAWNED
+  CAPTURED
+  FAILED
+}
+
 model Example {
   id        Int      @id @default(autoincrement())
   createdAt DateTime @default(now())
@@ -63,6 +72,7 @@ model User {
   createdWorldAssetGenerationTasks WorldAssetGenerationTask[] @relation("WorldAssetGenerationCreator")
   ownedWorldTimelineExportTasks WorldTimelineExportTask[] @relation("WorldTimelineExportOwner")
   createdWorldTimelineExportTasks WorldTimelineExportTask[] @relation("WorldTimelineExportCreator")
+  capturedPets Pet[] @relation("CapturedPets")
 }
 
 model Session {
@@ -305,4 +315,29 @@ model WorldTimelineExportTask {
   @@index([status, updatedAt])
   @@index([worldOwnerId, createdAt])
   @@index([createdById, createdAt])
+}
+
+model Pet {
+  id             String    @id @default(uuid()) @db.Uuid
+  displayName    String
+  basePrompt     String
+  effectivePrompt String
+  variationKey   String    @unique
+  status         PetStatus @default(QUEUED)
+  meshyTaskId    String?   @unique
+  meshyStatus    String?
+  modelStorageKey String?  @unique
+  modelUrl       String?
+  modelSha256    String?   @unique
+  attempts       Int       @default(0)
+  failureReason  String?
+  spawnedAt      DateTime?
+  capturedAt     DateTime?
+  capturedById   String?   @db.Uuid
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  capturedBy     User?     @relation("CapturedPets", fields: [capturedById], references: [id], onDelete: SetNull)
+
+  @@index([status, updatedAt])
+  @@index([capturedById, capturedAt])
 }

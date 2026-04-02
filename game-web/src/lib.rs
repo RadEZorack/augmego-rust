@@ -4,10 +4,12 @@ use anyhow::Result;
 use glam::{Mat4, Quat, Vec3};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
-    BreakBlockRequest, CapturedPetsSnapshot, ClientHello, ClientMessage, ClientWebRtcSignal,
-    InventorySnapshot, LoginRequest, PROTOCOL_VERSION, PeerRealtimeState, PetStateSnapshot,
-    PlaceBlockRequest, PlayerInputTick, ServerMessage, ServerWebRtcSignal, SubscribeChunks,
-    WebRtcSignalPayload, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, decode, encode,
+    BreakBlockRequest, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
+    CapturedPetsSnapshot, ClientHello, ClientMessage, ClientWebRtcSignal, InventorySnapshot,
+    LoginRequest, PROTOCOL_VERSION, PeerRealtimeState, PetIdentity, PetStateSnapshot,
+    PlaceBlockRequest, PlayerInputTick, PlayerLeft, ServerMessage, ServerWebRtcSignal,
+    SubscribeChunks, WebRtcSignalPayload, WildPetMotionSnapshot, WildPetSnapshot,
+    WildPetUnload, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::cell::RefCell;
@@ -130,6 +132,7 @@ struct AuthUser {
     name: Option<String>,
     email: Option<String>,
     avatar_selection: Option<PlayerAvatarSelection>,
+    game_auth_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -193,6 +196,7 @@ impl AuthUser {
             name: Some(format!("Guest {}", &guest_id[6..guest_id.len().min(12)])),
             email: None,
             avatar_selection: None,
+            game_auth_token: None,
         }
     }
 
@@ -217,6 +221,11 @@ enum AuthEvent {
 }
 
 enum RemoteAvatarEvent {
+    Loaded { url: String, bytes: Vec<u8> },
+    Failed { url: String, message: String },
+}
+
+enum RemotePetEvent {
     Loaded { url: String, bytes: Vec<u8> },
     Failed { url: String, message: String },
 }
@@ -371,6 +380,7 @@ async fn run() -> Result<()> {
                     app.tick();
                     app.process_webcam_events();
                     app.process_remote_avatar_events(&renderer);
+                    app.process_remote_pet_events(&renderer);
                     app.process_generation_updates(
                         &renderer,
                         &mut chunk_meshes,
@@ -397,7 +407,7 @@ async fn run() -> Result<()> {
                     if let Some(mesh) = &remote_media_placeholder_mesh {
                         visible_mesh_refs.push(mesh);
                     }
-                    app.ensure_pet_asset_loaded(&renderer);
+                    app.prepare_pet_assets(&renderer);
                     app.update_remote_media_textures(&renderer);
                     let textured_meshes = app.build_remote_media_meshes(&renderer);
                     let mut overlay_meshes = Vec::new();
@@ -407,9 +417,9 @@ async fn run() -> Result<()> {
                     if let Some(mesh) = app.build_target_highlight_mesh(&renderer) {
                         overlay_meshes.push(mesh);
                     }
-                    let remote_avatar_meshes = app.build_remote_avatar_meshes(&renderer);
                     let textured_mesh_refs = textured_meshes.iter().collect::<Vec<_>>();
                     let pet_mesh_draws = app.build_pet_mesh_draws(&renderer);
+                    let remote_avatar_meshes = app.build_remote_avatar_meshes(&renderer);
                     let overlay_refs = overlay_meshes.iter().collect::<Vec<_>>();
 
                     if let Err(error) = renderer.render(
@@ -473,17 +483,21 @@ struct WebApp {
     remote_player_yaws: HashMap<u64, f32>,
     remote_player_avatar_selections: HashMap<u64, PlayerAvatarSelection>,
     remote_player_avatar_states: HashMap<u64, RemoteAvatarPlaybackState>,
+    remote_player_pet_identities: HashMap<u64, Vec<PetIdentity>>,
     remote_pet_states: HashMap<u64, Vec<PetStateSnapshot>>,
     wild_pets: HashMap<u64, WildPetClientState>,
     hosted_wild_pets: HashMap<u64, HostedWildPetState>,
     remote_media: HashMap<u64, RemotePeerMedia>,
     remote_avatar_assets: HashMap<String, RemoteAvatarAsset>,
     pending_remote_avatar_urls: HashSet<String>,
+    remote_pet_assets: HashMap<String, TexturedMesh>,
+    pending_remote_pet_urls: HashSet<String>,
     pet_asset: Option<TexturedMesh>,
     pet_asset_attempted: bool,
     pet_followers: Vec<PetFollowerState>,
     pet_followers_need_reset: bool,
-    captured_pet_ids: Vec<u64>,
+    captured_pets: Vec<CapturedPet>,
+    pet_notice: Option<String>,
     spawn_position: Option<WorldPos>,
     world_seed: u64,
     webcam_requested: bool,
@@ -511,6 +525,8 @@ struct WebApp {
     auth_rx: Receiver<AuthEvent>,
     remote_avatar_tx: Sender<RemoteAvatarEvent>,
     remote_avatar_rx: Receiver<RemoteAvatarEvent>,
+    remote_pet_tx: Sender<RemotePetEvent>,
+    remote_pet_rx: Receiver<RemotePetEvent>,
     auth_overlay: Element,
     auth_overlay_status: Element,
     captured_pets_panel: Element,
@@ -556,6 +572,7 @@ impl WebApp {
         let (webcam_prompt, webcam_prompt_onclick) = create_webcam_prompt();
         let auth_rx = request_auth_session();
         let (remote_avatar_tx, remote_avatar_rx) = mpsc::channel();
+        let (remote_pet_tx, remote_pet_rx) = mpsc::channel();
         let (peer_realtime_tx, peer_realtime_rx) = mpsc::channel();
         let (auth_overlay, auth_overlay_status, auth_button_onclicks) = create_auth_overlay();
         let captured_pets_panel = create_captured_pets_panel();
@@ -604,17 +621,21 @@ impl WebApp {
             remote_player_yaws: HashMap::new(),
             remote_player_avatar_selections: HashMap::new(),
             remote_player_avatar_states: HashMap::new(),
+            remote_player_pet_identities: HashMap::new(),
             remote_pet_states: HashMap::new(),
             wild_pets: HashMap::new(),
             hosted_wild_pets: HashMap::new(),
             remote_media: HashMap::new(),
             remote_avatar_assets: HashMap::new(),
             pending_remote_avatar_urls: HashSet::new(),
+            remote_pet_assets: HashMap::new(),
+            pending_remote_pet_urls: HashSet::new(),
             pet_asset: None,
             pet_asset_attempted: false,
             pet_followers: Vec::new(),
             pet_followers_need_reset: false,
-            captured_pet_ids: Vec::new(),
+            captured_pets: Vec::new(),
+            pet_notice: None,
             spawn_position: None,
             world_seed: DEFAULT_WORLD_SEED,
             webcam_requested: false,
@@ -642,6 +663,8 @@ impl WebApp {
             auth_rx,
             remote_avatar_tx,
             remote_avatar_rx,
+            remote_pet_tx,
+            remote_pet_rx,
             auth_overlay,
             auth_overlay_status,
             captured_pets_panel,
@@ -762,6 +785,10 @@ impl WebApp {
                 }
             }
             InteractionTarget::WildPet(hit) if button == MouseButton::Left => {
+                if !self.can_capture_generated_pets() {
+                    self.set_pet_notice("Sign in to capture generated pets.");
+                    return;
+                }
                 self.send_client_message(&ClientMessage::CaptureWildPetRequest {
                     pet_id: hit.pet_id,
                 });
@@ -910,31 +937,128 @@ impl WebApp {
         }
     }
 
+    fn process_remote_pet_events(&mut self, renderer: &Renderer<'_>) {
+        while let Ok(event) = self.remote_pet_rx.try_recv() {
+            match event {
+                RemotePetEvent::Loaded { url, bytes } => {
+                    self.pending_remote_pet_urls.remove(&url);
+                    match build_pet_mesh(renderer, &bytes) {
+                        Ok(asset) => {
+                            self.remote_pet_assets.insert(url, asset);
+                        }
+                        Err(error) => {
+                            web_sys::console::warn_1(&JsValue::from_str(&format!(
+                                "failed to build remote pet asset: {error}"
+                            )));
+                        }
+                    }
+                }
+                RemotePetEvent::Failed { url, message } => {
+                    self.pending_remote_pet_urls.remove(&url);
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "failed to fetch remote pet {url}: {message}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn despawn_remote_player(&mut self, player_id: u64) {
+        self.remote_players.remove(&player_id);
+        self.remote_player_latest_ticks.remove(&player_id);
+        self.remote_player_velocities.remove(&player_id);
+        self.remote_player_yaws.remove(&player_id);
+        self.remote_player_avatar_selections.remove(&player_id);
+        self.remote_player_avatar_states.remove(&player_id);
+        self.remote_player_pet_identities.remove(&player_id);
+        self.remote_pet_states.remove(&player_id);
+
+        if let Some(remote) = self.remote_media.remove(&player_id) {
+            if let Some(channel) = remote.data_channel {
+                channel.close();
+            }
+            remote.connection.close();
+        }
+
+        remove_peer_connection_registry_entry(player_id);
+
+        for pet in self.wild_pets.values_mut() {
+            if pet.host_player_id == Some(player_id) {
+                pet.host_player_id = None;
+            }
+        }
+    }
+
+    fn active_captured_pet_identities(&self) -> Vec<PetIdentity> {
+        self.captured_pets
+            .iter()
+            .filter(|pet| pet.active)
+            .map(|pet| PetIdentity {
+                id: pet.id.clone(),
+                display_name: pet.display_name.clone(),
+                model_url: pet.model_url.clone(),
+            })
+            .collect()
+    }
+
+    fn can_capture_generated_pets(&self) -> bool {
+        self.auth_user
+            .as_ref()
+            .and_then(|user| user.game_auth_token.as_ref())
+            .is_some()
+    }
+
+    fn set_pet_notice(&mut self, message: impl Into<String>) {
+        self.pet_notice = Some(message.into());
+        self.update_captured_pets_panel();
+    }
+
     fn update_captured_pets_panel(&self) {
-        let summary = if self.captured_pet_ids.is_empty() {
-            "No captured dogs yet".to_string()
+        let active_count = self.captured_pets.iter().filter(|pet| pet.active).count();
+        let summary = if self.captured_pets.is_empty() {
+            if self.can_capture_generated_pets() {
+                "No captured dogs yet".to_string()
+            } else {
+                "Sign in to build your pack".to_string()
+            }
         } else {
             format!(
                 "{} captured dog{}",
-                self.captured_pet_ids.len(),
-                if self.captured_pet_ids.len() == 1 {
+                self.captured_pets.len(),
+                if self.captured_pets.len() == 1 {
                     ""
                 } else {
                     "s"
                 }
             )
         };
-        let details = if self.captured_pet_ids.is_empty() {
-            "Explore and left click a wild dog to capture it.".to_string()
+        let details = if self.captured_pets.is_empty() {
+            if self.can_capture_generated_pets() {
+                "Explore and left click a wild dog to capture it.".to_string()
+            } else {
+                "Guests can explore, but capture is saved only for signed-in players.".to_string()
+            }
         } else {
-            self.captured_pet_ids
+            self.captured_pets
                 .iter()
-                .map(|pet_id| format!("#{pet_id}"))
+                .map(|pet| {
+                    let active_label = if pet.active { " active" } else { "" };
+                    format!("{}{}", pet.display_name, active_label)
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let notice = self
+            .pet_notice
+            .as_ref()
+            .map(|message| {
+                format!(
+                    "<div style=\"margin-top:8px;color:#f7d794;font-size:12px;line-height:1.45;\">{message}</div>"
+                )
+            })
+            .unwrap_or_default();
         self.captured_pets_panel.set_inner_html(&format!(
-            "<div style=\"font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:rgba(183,230,255,0.66);margin-bottom:8px;\">Captured Pets</div><div style=\"font-size:15px;font-weight:700;color:#f4f7fb;\">{summary}</div><div style=\"margin-top:8px;color:rgba(230,237,243,0.74);font-size:12px;line-height:1.45;\">{details}</div>"
+            "<div style=\"font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:rgba(183,230,255,0.66);margin-bottom:8px;\">Captured Pets</div><div style=\"font-size:15px;font-weight:700;color:#f4f7fb;\">{summary}</div><div style=\"margin-top:8px;color:rgba(230,237,243,0.74);font-size:12px;line-height:1.45;\">{details}</div><div style=\"margin-top:8px;color:rgba(183,230,255,0.66);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;\">Active followers: {active_count}</div>{notice}"
         ));
     }
 
@@ -977,12 +1101,15 @@ impl WebApp {
                             self.remote_player_yaws.clear();
                             self.remote_player_avatar_selections.clear();
                             self.remote_player_avatar_states.clear();
+                            self.remote_player_pet_identities.clear();
                             self.remote_pet_states.clear();
                             self.wild_pets.clear();
                             self.hosted_wild_pets.clear();
                             self.remote_media.clear();
                             self.remote_avatar_assets.clear();
                             self.pending_remote_avatar_urls.clear();
+                            self.remote_pet_assets.clear();
+                            self.pending_remote_pet_urls.clear();
                             clear_peer_connection_registries();
                             self.pet_asset = None;
                             self.pet_asset_attempted = false;
@@ -993,7 +1120,8 @@ impl WebApp {
                             self.last_sent_yaw = None;
                             self.last_input_broadcast_at = None;
                             self.last_peer_realtime_broadcast_at = None;
-                            self.captured_pet_ids.clear();
+                            self.captured_pets.clear();
+                            self.pet_notice = None;
                             self.update_captured_pets_panel();
                             web_sys::console::error_1(&JsValue::from_str(&format!(
                                 "multiplayer disconnected: decode websocket message: {error}"
@@ -1020,19 +1148,23 @@ impl WebApp {
                                 self.remote_player_yaws.clear();
                                 self.remote_player_avatar_selections.clear();
                                 self.remote_player_avatar_states.clear();
+                                self.remote_player_pet_identities.clear();
                                 self.remote_pet_states.clear();
                                 self.wild_pets.clear();
                                 self.hosted_wild_pets.clear();
                                 self.remote_media.clear();
                                 self.remote_avatar_assets.clear();
                                 self.pending_remote_avatar_urls.clear();
+                                self.remote_pet_assets.clear();
+                                self.pending_remote_pet_urls.clear();
                                 clear_peer_connection_registries();
                                 self.last_sent_position = None;
                                 self.last_sent_velocity = None;
                                 self.last_sent_yaw = None;
                                 self.last_input_broadcast_at = None;
                                 self.last_peer_realtime_broadcast_at = None;
-                                self.captured_pet_ids.clear();
+                                self.captured_pets.clear();
+                                self.pet_notice = None;
                                 self.update_captured_pets_panel();
                                 self.camera.position = Vec3::new(
                                     response.spawn_position.x as f32 + 0.5,
@@ -1117,6 +1249,8 @@ impl WebApp {
                                     snapshot.yaw,
                                     snapshot.pet_states.clone(),
                                 );
+                                self.remote_player_pet_identities
+                                    .insert(snapshot.player_id, snapshot.active_pet_models.clone());
                                 let selection = PlayerAvatarSelection {
                                     idle_model_url: snapshot.idle_model_url.clone(),
                                     run_model_url: snapshot.run_model_url.clone(),
@@ -1137,6 +1271,7 @@ impl WebApp {
                                     state.active_url = None;
                                 }
                                 self.ensure_remote_avatar_selection_requested(&selection);
+                                self.ensure_pet_identities_requested(&snapshot.active_pet_models);
                                 let peer_position = self
                                     .remote_players
                                     .get(&snapshot.player_id)
@@ -1147,6 +1282,9 @@ impl WebApp {
                                 }
                             }
                         }
+                        ServerMessage::PlayerLeft(PlayerLeft { player_id }) => {
+                            self.despawn_remote_player(player_id);
+                        }
                         ServerMessage::WildPetSnapshot(snapshot) => {
                             self.apply_wild_pet_snapshot(snapshot);
                         }
@@ -1156,9 +1294,21 @@ impl WebApp {
                                 self.hosted_wild_pets.remove(&pet_id);
                             }
                         }
-                        ServerMessage::CapturedPetsSnapshot(CapturedPetsSnapshot { pet_ids }) => {
-                            self.captured_pet_ids = pet_ids;
+                        ServerMessage::CapturedPetsSnapshot(CapturedPetsSnapshot { pets }) => {
+                            self.captured_pets = pets;
+                            self.pet_notice = None;
+                            self.pet_followers_need_reset = true;
                             self.update_captured_pets_panel();
+                        }
+                        ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                            status,
+                            message,
+                            ..
+                        }) => {
+                            self.set_pet_notice(message);
+                            if matches!(status, CaptureWildPetStatus::Captured) {
+                                self.pet_followers_need_reset = true;
+                            }
                         }
                         ServerMessage::WebRtcSignal(signal) => self.handle_webrtc_signal(signal),
                         ServerMessage::BlockActionResult(result) => {
@@ -1182,12 +1332,15 @@ impl WebApp {
                     self.remote_player_yaws.clear();
                     self.remote_player_avatar_selections.clear();
                     self.remote_player_avatar_states.clear();
+                    self.remote_player_pet_identities.clear();
                     self.remote_pet_states.clear();
                     self.wild_pets.clear();
                     self.hosted_wild_pets.clear();
                     self.remote_media.clear();
                     self.remote_avatar_assets.clear();
                     self.pending_remote_avatar_urls.clear();
+                    self.remote_pet_assets.clear();
+                    self.pending_remote_pet_urls.clear();
                     clear_peer_connection_registries();
                     self.pet_asset = None;
                     self.pet_asset_attempted = false;
@@ -1198,7 +1351,8 @@ impl WebApp {
                     self.last_sent_yaw = None;
                     self.last_input_broadcast_at = None;
                     self.last_peer_realtime_broadcast_at = None;
-                    self.captured_pet_ids.clear();
+                    self.captured_pets.clear();
+                    self.pet_notice = None;
                     self.update_captured_pets_panel();
                     web_sys::console::error_1(&JsValue::from_str(&format!(
                         "multiplayer disconnected: {reason}"
@@ -1215,14 +1369,20 @@ impl WebApp {
                     Ok(Some(user)) => {
                         self.auth_user = Some(user);
                         self.auth_status = AuthStatus::SignedIn;
+                        self.pet_notice = None;
+                        self.update_captured_pets_panel();
                     }
                     Ok(None) => {
                         self.auth_user = None;
                         self.auth_status = AuthStatus::SignedOut;
+                        self.pet_notice = None;
+                        self.update_captured_pets_panel();
                     }
                     Err(message) => {
                         self.auth_user = None;
                         self.auth_status = AuthStatus::Failed(message);
+                        self.pet_notice = None;
+                        self.update_captured_pets_panel();
                     }
                 },
             }
@@ -1237,6 +1397,8 @@ impl WebApp {
         if continue_as_guest {
             self.auth_user = Some(AuthUser::guest());
             self.auth_status = AuthStatus::SignedIn;
+            self.pet_notice = None;
+            self.update_captured_pets_panel();
         }
 
         self.sync_auth_overlay();
@@ -1341,6 +1503,7 @@ impl WebApp {
                 .avatar_selection
                 .as_ref()
                 .and_then(|selection| selection.dance_model_url.clone()),
+            auth_token: user.game_auth_token.clone(),
         }));
         self.login_request_sent = true;
     }
@@ -1471,6 +1634,7 @@ impl WebApp {
         let is_local_host = snapshot.host_player_id == self.player_id;
 
         state.spawn_position = Vec3::from_array(snapshot.spawn_position);
+        state.pet_identity = snapshot.pet_identity.clone();
         state.host_player_id = snapshot.host_player_id;
         if (snapshot.tick >= state.latest_tick && !is_local_host)
             || host_changed
@@ -1668,16 +1832,25 @@ impl WebApp {
     }
 
     fn ensure_pet_followers_initialized(&mut self) {
-        if !self.spawn_settled
-            || (!self.pet_followers_need_reset && self.pet_followers.len() == PET_FOLLOWER_COUNT)
-        {
+        if !self.spawn_settled {
+            return;
+        }
+        let desired_count = self.active_captured_pet_identities().len().min(PET_FOLLOWER_COUNT);
+        if desired_count == 0 {
+            self.pet_followers.clear();
+            self.pet_followers_need_reset = false;
+            return;
+        }
+        if !self.pet_followers_need_reset && self.pet_followers.len() == desired_count {
             return;
         }
 
         let player_feet = self.player_feet_position();
         let (forward, right) = horizontal_basis_from_yaw(self.camera.yaw);
         self.pet_followers = PET_SLOT_OFFSETS
-            .into_iter()
+            .iter()
+            .copied()
+            .take(desired_count)
             .map(|(right_offset, forward_offset)| {
                 let slot_target = player_feet + right * right_offset + forward * forward_offset;
                 let feet_position = self.find_safe_pet_position(slot_target, player_feet);
@@ -1690,6 +1863,15 @@ impl WebApp {
 
     fn update_pet_followers(&mut self, dt: Duration) {
         let dt_secs = dt.as_secs_f32();
+        let desired_count = self.active_captured_pet_identities().len().min(PET_FOLLOWER_COUNT);
+        if desired_count == 0 {
+            self.pet_followers.clear();
+            return;
+        }
+        if self.pet_followers.len() != desired_count {
+            self.pet_followers_need_reset = true;
+            self.ensure_pet_followers_initialized();
+        }
         if dt_secs <= 0.0 || self.pet_followers.is_empty() {
             return;
         }
@@ -1718,6 +1900,15 @@ impl WebApp {
             };
             self.update_hosted_wild_pet(&mut pet, dt_secs);
             self.hosted_wild_pets.insert(pet_id, pet);
+            let fallback_identity = self
+                .wild_pets
+                .get(&pet_id)
+                .map(|state| state.pet_identity.clone())
+                .unwrap_or(PetIdentity {
+                    id: format!("wild-{pet_id}"),
+                    display_name: "Wild Dog".to_string(),
+                    model_url: None,
+                });
             self.wild_pets
                 .entry(pet_id)
                 .and_modify(|state| {
@@ -1732,6 +1923,7 @@ impl WebApp {
                 })
                 .or_insert_with(|| WildPetClientState {
                     pet_id,
+                    pet_identity: fallback_identity,
                     spawn_position: pet.spawn_position,
                     position: pet.feet_position,
                     velocity: Vec3::new(
@@ -2390,12 +2582,13 @@ impl WebApp {
     }
 
     fn ensure_pet_asset_loaded(&mut self, renderer: &Renderer<'_>) {
+        let has_local_pets = !self.active_captured_pet_identities().is_empty();
         let has_remote_pets = self
             .remote_pet_states
             .values()
             .any(|pet_states| !pet_states.is_empty());
         let has_wild_pets = !self.wild_pets.is_empty();
-        if (self.pet_followers.is_empty() && !has_remote_pets && !has_wild_pets)
+        if (!has_local_pets && !has_remote_pets && !has_wild_pets)
             || self.pet_asset.is_some()
             || self.pet_asset_attempted
         {
@@ -2415,10 +2608,43 @@ impl WebApp {
         }
     }
 
+    fn prepare_pet_assets(&mut self, renderer: &Renderer<'_>) {
+        self.ensure_pet_asset_loaded(renderer);
+        let local_pet_identities = self.active_captured_pet_identities();
+        let mut requested_pet_identities = local_pet_identities.clone();
+        for identities in self.remote_player_pet_identities.values() {
+            requested_pet_identities.extend(identities.iter().cloned());
+        }
+        requested_pet_identities.extend(self.wild_pets.values().map(|pet| pet.pet_identity.clone()));
+        self.ensure_pet_identities_requested(&requested_pet_identities);
+    }
+
+    fn ensure_pet_identities_requested(&mut self, pet_identities: &[PetIdentity]) {
+        for identity in pet_identities {
+            let Some(url) = identity.model_url.as_deref() else {
+                continue;
+            };
+            if self.remote_pet_assets.contains_key(url) || self.pending_remote_pet_urls.contains(url)
+            {
+                continue;
+            }
+            self.pending_remote_pet_urls.insert(url.to_string());
+            request_remote_pet_model(url.to_string(), self.remote_pet_tx.clone());
+        }
+    }
+
+    fn pet_mesh_for_identity<'a>(&'a self, identity: Option<&PetIdentity>) -> Option<&'a TexturedMesh> {
+        if let Some(url) = identity.and_then(|pet| pet.model_url.as_deref()) {
+            if let Some(mesh) = self.remote_pet_assets.get(url) {
+                return Some(mesh);
+            }
+        }
+
+        self.pet_asset.as_ref()
+    }
+
     fn build_pet_mesh_draws(&self, renderer: &Renderer<'_>) -> Vec<TexturedMeshDraw<'_>> {
-        let Some(pet_asset) = self.pet_asset.as_ref() else {
-            return Vec::new();
-        };
+        let local_pet_identities = self.active_captured_pet_identities();
 
         let mut draws = Vec::with_capacity(
             self.pet_followers.len()
@@ -2426,13 +2652,22 @@ impl WebApp {
                 + self.wild_pets.len(),
         );
 
-        for pet in &self.pet_followers {
+        for (pet, identity) in self.pet_followers.iter().zip(local_pet_identities.iter()) {
+            let Some(pet_asset) = self.pet_mesh_for_identity(Some(identity)) else {
+                continue;
+            };
             let model = Mat4::from_translation(pet.feet_position) * Mat4::from_rotation_y(pet.yaw);
             draws.push(renderer.create_textured_draw(pet_asset, model));
         }
 
-        for pet_states in self.remote_pet_states.values() {
-            for pet in pet_states {
+        for (&player_id, pet_states) in &self.remote_pet_states {
+            let identities = self.remote_player_pet_identities.get(&player_id);
+            for (index, pet) in pet_states.iter().enumerate() {
+                let Some(pet_asset) =
+                    self.pet_mesh_for_identity(identities.and_then(|items| items.get(index)))
+                else {
+                    continue;
+                };
                 let model = Mat4::from_translation(Vec3::from_array(pet.position))
                     * Mat4::from_rotation_y(pet.yaw);
                 draws.push(renderer.create_textured_draw(pet_asset, model));
@@ -2440,6 +2675,9 @@ impl WebApp {
         }
 
         for pet in self.wild_pets.values() {
+            let Some(pet_asset) = self.pet_mesh_for_identity(Some(&pet.pet_identity)) else {
+                continue;
+            };
             let model = Mat4::from_translation(pet.position) * Mat4::from_rotation_y(pet.yaw);
             draws.push(renderer.create_textured_draw(pet_asset, model));
         }
@@ -3329,7 +3567,11 @@ struct AnimatedImportedVertex {
 }
 
 fn load_pet_model_mesh(renderer: &Renderer<'_>) -> Result<TexturedMesh> {
-    let (mut vertices, indices, image) = load_glb_model(PET_MODEL_BYTES)?;
+    build_pet_mesh(renderer, PET_MODEL_BYTES)
+}
+
+fn build_pet_mesh(renderer: &Renderer<'_>, bytes: &[u8]) -> Result<TexturedMesh> {
+    let (mut vertices, indices, image) = load_glb_model(bytes)?;
     let (min, max) =
         model_bounds(&vertices).ok_or_else(|| anyhow::anyhow!("pet model has no vertices"))?;
     let scale = PET_MODEL_DESIRED_HEIGHT / (max.y - min.y).max(0.001);
@@ -3647,6 +3889,7 @@ impl PetFollowerState {
 #[derive(Clone)]
 struct WildPetClientState {
     pet_id: u64,
+    pet_identity: PetIdentity,
     spawn_position: Vec3,
     position: Vec3,
     velocity: Vec3,
@@ -3659,6 +3902,7 @@ impl WildPetClientState {
     fn from_snapshot(snapshot: &WildPetSnapshot) -> Self {
         Self {
             pet_id: snapshot.pet_id,
+            pet_identity: snapshot.pet_identity.clone(),
             spawn_position: Vec3::from_array(snapshot.spawn_position),
             position: Vec3::from_array(snapshot.position),
             velocity: Vec3::from_array(snapshot.velocity),
@@ -4140,6 +4384,7 @@ fn parse_auth_user(body: &JsValue) -> Option<AuthUser> {
         name: js_get_string(&user, "name"),
         email: js_get_string(&user, "email"),
         avatar_selection: parse_avatar_selection(&user),
+        game_auth_token: js_get_string(&user, "gameAuthToken"),
     })
 }
 
@@ -4767,6 +5012,20 @@ fn request_remote_avatar_model(url: String, sender: Sender<RemoteAvatarEvent>) {
         let event = match result {
             Ok(bytes) => RemoteAvatarEvent::Loaded { url, bytes },
             Err(error) => RemoteAvatarEvent::Failed {
+                url,
+                message: error.to_string(),
+            },
+        };
+        let _ = sender.send(event);
+    });
+}
+
+fn request_remote_pet_model(url: String, sender: Sender<RemotePetEvent>) {
+    spawn_local(async move {
+        let result = fetch_remote_avatar_bytes(&url).await;
+        let event = match result {
+            Ok(bytes) => RemotePetEvent::Loaded { url, bytes },
+            Err(error) => RemotePetEvent::Failed {
                 url,
                 message: error.to_string(),
             },
@@ -5419,6 +5678,20 @@ fn clear_peer_connection_registries() {
     REMOTE_MEDIA_REGISTRY.with(|registry| registry.borrow_mut().clear());
     REMOTE_DATA_CHANNEL_REGISTRY.with(|registry| registry.borrow_mut().clear());
     PENDING_ICE_REGISTRY.with(|registry| registry.borrow_mut().clear());
+}
+
+fn remove_peer_connection_registry_entry(player_id: u64) {
+    REMOTE_MEDIA_REGISTRY.with(|registry| {
+        registry.borrow_mut().remove(&player_id);
+    });
+    REMOTE_DATA_CHANNEL_REGISTRY.with(|registry| {
+        if let Some(registration) = registry.borrow_mut().remove(&player_id) {
+            registration.channel.close();
+        }
+    });
+    PENDING_ICE_REGISTRY.with(|registry| {
+        registry.borrow_mut().remove(&player_id);
+    });
 }
 
 fn request_webcam_capture(sender: Sender<WebcamEvent>) {

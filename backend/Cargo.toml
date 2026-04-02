@@ -10,7 +10,10 @@ anyhow.workspace = true
 bincode.workspace = true
 futures-util = "0.3"
 glam.workspace = true
+jsonwebtoken = "9.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
+serde_json = "1.0"
 shared_content = { path = "../shared_content" }
 shared_math = { path = "../shared_math" }
 shared_protocol = { path = "../shared_protocol" }

@@ -34,6 +34,10 @@ services:
       COOKIE_SECURE: "false"
       WORLD_STORAGE_PROVIDER: local
       WORLD_STORAGE_ROOT: ../../storage/world-assets
+      PET_POOL_TARGET: "30"
+      GAME_BACKEND_AUTH_SECRET: ${GAME_BACKEND_AUTH_SECRET:-dev-only-game-backend-secret}
+      BACKEND_SERVICE_TOKEN: ${BACKEND_SERVICE_TOKEN:-dev-only-backend-service-token}
+      MESHY_API_KEY: ${MESHY_API_KEY:-}
     ports:
       - "3001:3000"
     volumes:
@@ -44,10 +48,16 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
+    depends_on:
+      next-web:
+        condition: service_started
     environment:
       BACKEND_BIND_ADDR: 0.0.0.0:4000
       BACKEND_WS_BIND_ADDR: 0.0.0.0:4001
       BACKEND_SAVE_PATH: /data/world
+      BACKEND_WEB_API_BASE_URL: http://next-web:3000/api/v1
+      BACKEND_SERVICE_TOKEN: ${BACKEND_SERVICE_TOKEN:-dev-only-backend-service-token}
+      GAME_BACKEND_AUTH_SECRET: ${GAME_BACKEND_AUTH_SECRET:-dev-only-game-backend-secret}
     ports:
       - "4000:4000"
       - "4001:4001"

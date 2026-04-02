@@ -3,7 +3,7 @@ use shared_math::{ChunkPos, WorldPos};
 use shared_world::{BlockId, ChunkData, ChunkDelta};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -24,6 +24,7 @@ pub struct LoginRequest {
     pub idle_model_url: Option<String>,
     pub run_model_url: Option<String>,
     pub dance_model_url: Option<String>,
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +92,7 @@ pub struct WildPetSnapshot {
     pub velocity: [f32; 3],
     pub yaw: f32,
     pub host_player_id: Option<u64>,
+    pub pet_identity: PetIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,8 +101,43 @@ pub struct WildPetUnload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PetIdentity {
+    pub id: String,
+    pub display_name: String,
+    pub model_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapturedPet {
+    pub id: String,
+    pub display_name: String,
+    pub model_url: Option<String>,
+    pub captured_at_ms: Option<u64>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapturedPetsSnapshot {
-    pub pet_ids: Vec<u64>,
+    pub pets: Vec<CapturedPet>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CaptureWildPetStatus {
+    Captured,
+    SignInRequired,
+    AlreadyTaken,
+    OutOfRange,
+    NotFound,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureWildPetResult {
+    pub pet_id: u64,
+    pub status: CaptureWildPetStatus,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +151,12 @@ pub struct PlayerStateSnapshot {
     pub run_model_url: Option<String>,
     pub dance_model_url: Option<String>,
     pub pet_states: Vec<PetStateSnapshot>,
+    pub active_pet_models: Vec<PetIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerLeft {
+    pub player_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,9 +241,11 @@ pub enum ServerMessage {
     ChunkUnload(ChunkUnload),
     ChunkDelta(ChunkDelta),
     PlayerStateSnapshot(PlayerStateSnapshot),
+    PlayerLeft(PlayerLeft),
     WildPetSnapshot(WildPetSnapshot),
     WildPetUnload(WildPetUnload),
     CapturedPetsSnapshot(CapturedPetsSnapshot),
+    CaptureWildPetResult(CaptureWildPetResult),
     InventorySnapshot(InventorySnapshot),
     BlockActionResult(BlockActionResult),
     ChatMessage(ChatMessage),

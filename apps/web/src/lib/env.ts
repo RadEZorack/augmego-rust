@@ -89,6 +89,51 @@ export const worldStorageRoot = process.env.WORLD_STORAGE_ROOT
   : path.resolve(repoRoot, "storage", "world-assets");
 export const playerAvatarCacheControl =
   process.env.PLAYER_AVATAR_CACHE_CONTROL ?? "public, max-age=31536000, immutable";
+export const generatedPetCacheControl =
+  process.env.GENERATED_PET_CACHE_CONTROL ?? "public, max-age=31536000, immutable";
+export const meshyApiBaseUrl = normalizeBaseUrl(
+  process.env.MESHY_API_BASE_URL ?? "https://api.meshy.ai",
+);
+export const meshyApiKey = process.env.MESHY_API_KEY ?? "";
+export const meshyTextTo3dModel = process.env.MESHY_TEXT_TO_3D_MODEL ?? "";
+export const meshyTextTo3dEnableRefine =
+  (process.env.MESHY_TEXT_TO_3D_ENABLE_REFINE ?? "true").toLowerCase() !== "false";
+export const meshyTextTo3dRefineModel = process.env.MESHY_TEXT_TO_3D_REFINE_MODEL ?? "";
+export const meshyTextTo3dEnablePbr =
+  (process.env.MESHY_TEXT_TO_3D_ENABLE_PBR ?? "false").toLowerCase() === "true";
+export const meshyTextTo3dTopology = (
+  process.env.MESHY_TEXT_TO_3D_TOPOLOGY ?? "triangle"
+).toLowerCase();
+export const meshyTextTo3dTargetPolycount = (() => {
+  const value = Number(process.env.MESHY_TEXT_TO_3D_TARGET_POLYCOUNT ?? "");
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+
+  const normalized = Math.floor(value);
+  if (normalized < 100 || normalized > 300000) {
+    return null;
+  }
+
+  return normalized;
+})();
+export const petPoolTarget = toPositiveInteger(process.env.PET_POOL_TARGET, 30);
+export const petGenerationWorkerIntervalMs = toPositiveInteger(
+  process.env.PET_GENERATION_WORKER_INTERVAL_MS,
+  5000,
+);
+export const petGenerationPollIntervalMs = toPositiveInteger(
+  process.env.PET_GENERATION_POLL_INTERVAL_MS,
+  15000,
+);
+export const petGenerationMaxAttempts = toPositiveInteger(
+  process.env.PET_GENERATION_MAX_ATTEMPTS,
+  5,
+);
+export const gameBackendAuthSecret =
+  process.env.GAME_BACKEND_AUTH_SECRET ?? "dev-only-game-backend-secret";
+export const backendServiceToken =
+  process.env.BACKEND_SERVICE_TOKEN ?? "dev-only-backend-service-token";
 
 export function resolveAppleClientSecret() {
   if (appleClientSecret) {

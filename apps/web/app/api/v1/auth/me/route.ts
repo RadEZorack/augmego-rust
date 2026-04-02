@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/src/auth";
+import { signGameAuthToken } from "@/src/lib/game-auth";
 import { loadAuthUser } from "@/src/lib/auth-user";
 
 export async function GET() {
@@ -15,5 +16,10 @@ export async function GET() {
     return NextResponse.json({ user: null });
   }
 
-  return NextResponse.json({ user });
+  return NextResponse.json({
+    user: {
+      ...user,
+      gameAuthToken: signGameAuthToken(user.id),
+    },
+  });
 }

@@ -31,7 +31,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
         let sql = fs::read_to_string(&path)
             .await
             .with_context(|| format!("read migration {}", path.display()))?;
-        sqlx::query(&sql)
+        sqlx::raw_sql(&sql)
             .execute(pool)
             .await
             .with_context(|| format!("execute migration {}", path.display()))?;

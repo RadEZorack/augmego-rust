@@ -38,7 +38,6 @@ use tokio::fs;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::yield_now;
-use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -1284,15 +1283,13 @@ impl VoxelServer {
     }
 
     fn router(&self) -> Router {
-        let play_router = Router::new()
-            .route("/", get(play_index))
-            .fallback_service(ServeDir::new(self.static_root.join("play")));
-
         Router::new()
             .route("/", get(root_page))
             .route("/learn", get(learn_page))
             .route("/play", get(play_redirect))
-            .nest("/play", play_router)
+            .route("/play/", get(play_index))
+            .route("/play/{*path}", get(play_asset))
+            .route("/mesh-worker.js", get(play_mesh_worker_compat))
             .route("/ws", get(websocket_upgrade))
             .route("/api/v1/health", get(api_health))
             .route("/api/v1/auth/google", get(auth_google))
@@ -1835,6 +1832,52 @@ async fn play_index(State(server): State<VoxelServer>) -> Response {
     }
 }
 
+async fn play_asset(
+    State(server): State<VoxelServer>,
+    AxumPath(path): AxumPath<String>,
+) -> Response {
+    let normalized = path.trim_start_matches('/');
+    if normalized.is_empty() {
+        return play_index(State(server)).await;
+    }
+
+    let Some(resolved_path) = safe_static_path(&server.static_root.join("play"), normalized) else {
+        return api_error(StatusCode::NOT_FOUND, "NOT_FOUND");
+    };
+
+    static_file_response(resolved_path).await
+}
+
+async fn play_mesh_worker_compat(State(server): State<VoxelServer>) -> Response {
+    static_file_response(server.static_root.join("play").join("mesh-worker.js")).await
+}
+
+async fn static_file_response(resolved_path: PathBuf) -> Response {
+    match fs::read(&resolved_path).await {
+        Ok(bytes) => {
+            let mut response = Response::new(Body::from(bytes));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                static_content_type(&resolved_path).parse().unwrap(),
+            );
+            if is_immutable_static_asset(&resolved_path) {
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable".parse().unwrap(),
+                );
+            }
+            response
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            api_error(StatusCode::NOT_FOUND, "NOT_FOUND")
+        }
+        Err(error) => {
+            tracing::warn!(?error, path = %resolved_path.display(), "failed to read play asset");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "STATIC_ASSET_READ_FAILED")
+        }
+    }
+}
+
 async fn websocket_upgrade(
     ws: WebSocketUpgrade,
     State(server): State<VoxelServer>,
@@ -2248,6 +2291,39 @@ fn storage_object_response(object: crate::storage::StorageObject) -> Response {
             .insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
     }
     response
+}
+
+fn safe_static_path(root: &std::path::Path, request_path: &str) -> Option<PathBuf> {
+    let mut resolved = PathBuf::from(root);
+    for component in std::path::Path::new(request_path).components() {
+        match component {
+            std::path::Component::Normal(part) => resolved.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(resolved)
+}
+
+fn static_content_type(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("wasm") => "application/wasm",
+        Some("json") => "application/json; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("map") => "application/json; charset=utf-8",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
+fn is_immutable_static_asset(path: &std::path::Path) -> bool {
+    !matches!(path.file_name().and_then(|value| value.to_str()), Some("index.html"))
 }
 
 fn parse_optional_text_field(

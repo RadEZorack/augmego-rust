@@ -5875,7 +5875,7 @@ fn start_mesh_worker_pool(
     let mut onmessages = Vec::with_capacity(worker_count);
 
     for _ in 0..worker_count {
-        let worker = Worker::new("mesh-worker.js")
+        let worker = Worker::new("/play/mesh-worker.js")
             .map_err(|error| anyhow::anyhow!("create mesh worker: {error:?}"))?;
         let tx = tx.clone();
         let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {

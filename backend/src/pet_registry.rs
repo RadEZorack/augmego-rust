@@ -2,14 +2,21 @@ use crate::auth::verify_game_auth_token;
 use crate::storage::{StorageObject, StorageService};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
+use flate2::{Compression, write::GzEncoder};
+use gltf::binary::{Glb, Header as GlbHeader};
+use image::{DynamicImage, GenericImageView, ImageFormat, imageops::FilterType};
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use shared_protocol::{CapturedPet, PetIdentity};
 use sqlx::{PgPool, Row};
+use std::borrow::Cow;
+use std::io::Cursor;
+use std::io::Write;
 use std::path::Path;
 use std::sync::{
+    Mutex,
     Arc,
     atomic::{AtomicBool, Ordering},
 };
@@ -21,6 +28,7 @@ const PET_BASE_PROMPT: &str = "a cute dog";
 const PET_ACTIVE_FOLLOWER_LIMIT: usize = 6;
 const PET_GENERATION_START_BUDGET: i64 = 3;
 const PET_GENERATION_POLL_BUDGET: i64 = 4;
+const MESHY_COMPAT_MODEL: &str = "meshy-6";
 
 const SIZE_TRAITS: &[TraitOption] = &[
     TraitOption::new("tiny", "Tiny", "tiny-sized"),
@@ -68,15 +76,19 @@ pub struct PlayerPetCollection {
 pub struct PetRegistryConfig {
     pub auth_secret: String,
     pub generated_pet_cache_control: String,
+    pub generated_pet_texture_max_dimension: u32,
+    pub generated_pet_texture_jpeg_quality: u8,
     pub meshy_api_base_url: String,
     pub meshy_api_key: String,
     pub meshy_text_to_3d_model: String,
+    pub meshy_text_to_3d_model_type: String,
     pub meshy_text_to_3d_enable_refine: bool,
     pub meshy_text_to_3d_refine_model: String,
     pub meshy_text_to_3d_enable_pbr: bool,
     pub meshy_text_to_3d_topology: String,
     pub meshy_text_to_3d_target_polycount: Option<i32>,
     pub pet_pool_target: i64,
+    pub pet_generation_max_in_flight: i64,
     pub pet_generation_worker_interval: Duration,
     pub pet_generation_poll_interval: Duration,
     pub pet_generation_max_attempts: i32,
@@ -90,6 +102,7 @@ pub struct PetRegistryClient {
     config: PetRegistryConfig,
     worker_started: Arc<AtomicBool>,
     worker_busy: Arc<AtomicBool>,
+    last_progress_snapshot: Arc<Mutex<Option<PetGenerationProgress>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -110,6 +123,18 @@ struct PetVariation {
     variation_key: String,
     display_name: String,
     effective_prompt: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PetGenerationProgress {
+    queued_count: i64,
+    generating_count: i64,
+    generating_preview_count: i64,
+    generating_refine_count: i64,
+    ready_count: i64,
+    spawned_count: i64,
+    captured_count: i64,
+    failed_count: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +185,7 @@ impl PetRegistryClient {
             config,
             worker_started: Arc::new(AtomicBool::new(false)),
             worker_busy: Arc::new(AtomicBool::new(false)),
+            last_progress_snapshot: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -201,47 +227,41 @@ impl PetRegistryClient {
     }
 
     pub async fn reserve_pet(&self) -> Result<Option<PetIdentity>> {
-        for _ in 0..6 {
-            let row = sqlx::query(
-                "SELECT id, display_name, model_url, model_storage_key
+        let row = sqlx::query(
+            "WITH next_pet AS (
+                 SELECT id
                  FROM pets
                  WHERE status = 'READY' AND model_storage_key IS NOT NULL
                  ORDER BY updated_at ASC, created_at ASC
-                 LIMIT 1",
-            )
-            .fetch_optional(&self.pool)
-            .await
-            .context("select ready pet")?;
-            let Some(row) = row else {
-                return Ok(None);
-            };
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT 1
+             )
+             UPDATE pets
+             SET status = 'SPAWNED',
+                 spawned_at = NOW(),
+                 updated_at = NOW()
+             FROM next_pet
+             WHERE pets.id = next_pet.id
+             RETURNING pets.id, pets.display_name, pets.model_url, pets.model_storage_key",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("reserve ready pet")?;
 
-            let pet_id: Uuid = row.try_get("id")?;
-            let updated = sqlx::query(
-                "UPDATE pets
-                 SET status = 'SPAWNED', spawned_at = NOW(), updated_at = NOW()
-                 WHERE id = $1 AND status = 'READY'",
-            )
-            .bind(pet_id)
-            .execute(&self.pool)
-            .await
-            .context("claim ready pet")?;
-            if updated.rows_affected() == 0 {
-                continue;
-            }
+        let Some(row) = row else {
+            return Ok(None);
+        };
 
-            let display_name: String = row.try_get("display_name")?;
-            let model_url: Option<String> = row.try_get("model_url")?;
-            let model_storage_key: Option<String> = row.try_get("model_storage_key")?;
-            return Ok(Some(self.map_pet_identity(
-                pet_id,
-                display_name,
-                model_url,
-                model_storage_key,
-            )));
-        }
-
-        Ok(None)
+        let pet_id: Uuid = row.try_get("id")?;
+        let display_name: String = row.try_get("display_name")?;
+        let model_url: Option<String> = row.try_get("model_url")?;
+        let model_storage_key: Option<String> = row.try_get("model_storage_key")?;
+        Ok(Some(self.map_pet_identity(
+            pet_id,
+            display_name,
+            model_url,
+            model_storage_key,
+        )))
     }
 
     pub async fn load_user_pet_collection(&self, user_id: &str) -> Result<PlayerPetCollection> {
@@ -368,10 +388,12 @@ impl PetRegistryClient {
         let result = async {
             self.ensure_pet_reservoir().await?;
             if self.config.meshy_api_key.trim().is_empty() {
+                self.log_generation_progress_if_changed().await?;
                 return Ok(());
             }
             self.start_queued_pet_generation().await?;
-            self.poll_generating_pets().await
+            self.poll_generating_pets().await?;
+            self.log_generation_progress_if_changed().await
         }
         .await;
 
@@ -395,6 +417,69 @@ impl PetRegistryClient {
                 break;
             }
         }
+        Ok(())
+    }
+
+    async fn log_generation_progress_if_changed(&self) -> Result<()> {
+        let row = sqlx::query(
+            "SELECT
+                 COUNT(*) FILTER (WHERE status = 'QUEUED') AS queued_count,
+                 COUNT(*) FILTER (WHERE status = 'GENERATING') AS generating_count,
+                 COUNT(*) FILTER (
+                     WHERE status = 'GENERATING'
+                       AND meshy_task_id IS NOT NULL
+                       AND meshy_task_id LIKE 'refine:%'
+                 ) AS generating_refine_count,
+                 COUNT(*) FILTER (
+                     WHERE status = 'GENERATING'
+                       AND (meshy_task_id IS NULL OR meshy_task_id NOT LIKE 'refine:%')
+                 ) AS generating_preview_count,
+                 COUNT(*) FILTER (WHERE status = 'READY') AS ready_count,
+                 COUNT(*) FILTER (WHERE status = 'SPAWNED') AS spawned_count,
+                 COUNT(*) FILTER (WHERE status = 'CAPTURED') AS captured_count,
+                 COUNT(*) FILTER (WHERE status = 'FAILED') AS failed_count
+             FROM pets",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("load pet generation progress")?;
+
+        let snapshot = PetGenerationProgress {
+            queued_count: row.try_get("queued_count")?,
+            generating_count: row.try_get("generating_count")?,
+            generating_preview_count: row.try_get("generating_preview_count")?,
+            generating_refine_count: row.try_get("generating_refine_count")?,
+            ready_count: row.try_get("ready_count")?,
+            spawned_count: row.try_get("spawned_count")?,
+            captured_count: row.try_get("captured_count")?,
+            failed_count: row.try_get("failed_count")?,
+        };
+
+        let mut guard = self
+            .last_progress_snapshot
+            .lock()
+            .expect("pet generation progress mutex poisoned");
+        if guard.as_ref() == Some(&snapshot) {
+            return Ok(());
+        }
+        *guard = Some(snapshot.clone());
+        drop(guard);
+
+        let completed_count = snapshot.ready_count + snapshot.spawned_count;
+        tracing::info!(
+            progress = %render_progress_bar(completed_count, self.config.pet_pool_target, 12),
+            completed = completed_count,
+            target = self.config.pet_pool_target,
+            queued = snapshot.queued_count,
+            generating = snapshot.generating_count,
+            preview = snapshot.generating_preview_count,
+            refine = snapshot.generating_refine_count,
+            ready = snapshot.ready_count,
+            spawned = snapshot.spawned_count,
+            captured = snapshot.captured_count,
+            failed = snapshot.failed_count,
+            "pet reservoir progress"
+        );
         Ok(())
     }
 
@@ -436,6 +521,20 @@ impl PetRegistryClient {
     }
 
     async fn start_queued_pet_generation(&self) -> Result<()> {
+        let generating_row = sqlx::query(
+            "SELECT COUNT(*) AS generating_count
+             FROM pets
+             WHERE status = 'GENERATING'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("count generating pets")?;
+        let generating_count: i64 = generating_row.try_get("generating_count")?;
+        let available_slots = (self.config.pet_generation_max_in_flight - generating_count).max(0);
+        if available_slots == 0 {
+            return Ok(());
+        }
+
         let rows = sqlx::query(
             "SELECT id
              FROM pets
@@ -443,7 +542,7 @@ impl PetRegistryClient {
              ORDER BY created_at ASC
              LIMIT $1",
         )
-        .bind(PET_GENERATION_START_BUDGET)
+        .bind(available_slots.min(PET_GENERATION_START_BUDGET))
         .fetch_all(&self.pool)
         .await
         .context("load queued pets")?;
@@ -616,6 +715,14 @@ impl PetRegistryClient {
                 }
             };
 
+            let bytes = match self.optimize_generated_glb(&bytes) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(?error, %pet_id, display_name, "failed to optimize generated pet GLB; using original bytes");
+                    bytes
+                }
+            };
+
             let model_sha256 = format!("{:x}", Sha256::digest(&bytes));
             let duplicate = sqlx::query(
                 "SELECT id
@@ -646,14 +753,16 @@ impl PetRegistryClient {
                 continue;
             }
 
+            let (stored_bytes, content_encoding) = maybe_gzip_bytes(&bytes)?;
             let storage_key = self.resolve_pet_storage_key(pet_id, &display_name);
             if let Err(error) = self
                 .storage
                 .write_object(
                     &storage_key,
-                    &bytes,
+                    &stored_bytes,
                     "model/gltf-binary",
                     Some(&self.config.generated_pet_cache_control),
+                    content_encoding,
                 )
                 .await
             {
@@ -676,13 +785,26 @@ impl PetRegistryClient {
                  WHERE id = $1",
             )
             .bind(pet_id)
-            .bind(meshy_status)
-            .bind(storage_key)
-            .bind(model_url)
-            .bind(model_sha256)
+            .bind(&meshy_status)
+            .bind(&storage_key)
+            .bind(&model_url)
+            .bind(&model_sha256)
             .execute(&self.pool)
             .await
             .context("mark pet ready")?;
+
+            tracing::info!(
+                pet_id = %pet_id,
+                display_name,
+                meshy_status,
+                storage_key,
+                model_url,
+                model_sha256,
+                model_bytes = bytes.len(),
+                transfer_bytes = stored_bytes.len(),
+                content_encoding = ?content_encoding,
+                "pet transitioned to READY"
+            );
         }
 
         Ok(())
@@ -733,7 +855,12 @@ impl PetRegistryClient {
             "mode": "preview",
             "prompt": prompt,
             "should_remesh": true,
+            "target_formats": ["glb"],
         });
+        let model_type = self.config.meshy_text_to_3d_model_type.trim().to_ascii_lowercase();
+        if matches!(model_type.as_str(), "standard" | "lowpoly") {
+            body["model_type"] = json!(model_type);
+        }
         if !self.config.meshy_text_to_3d_model.trim().is_empty() {
             body["ai_model"] = json!(self.config.meshy_text_to_3d_model);
         }
@@ -746,28 +873,9 @@ impl PetRegistryClient {
             body["topology"] = json!(self.config.meshy_text_to_3d_topology);
         }
 
-        let response = self
-            .http
-            .post(format!(
-                "{}/openapi/v2/text-to-3d",
-                self.config.meshy_api_base_url.trim_end_matches('/')
-            ))
-            .bearer_auth(&self.config.meshy_api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("create meshy preview task")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Meshy create failed ({status}): {text}");
-        }
-
-        let payload = response
-            .json::<MeshyCreateTaskResponse>()
-            .await
-            .context("decode meshy preview response")?;
+        let payload = self
+            .submit_meshy_text_to_3d(body, "create meshy preview task")
+            .await?;
         payload
             .result
             .or(payload.task_id)
@@ -779,6 +887,7 @@ impl PetRegistryClient {
         let mut body = json!({
             "mode": "refine",
             "preview_task_id": preview_task_id,
+            "target_formats": ["glb"],
         });
         if !self.config.meshy_text_to_3d_refine_model.trim().is_empty() {
             body["ai_model"] = json!(self.config.meshy_text_to_3d_refine_model);
@@ -787,33 +896,54 @@ impl PetRegistryClient {
             body["enable_pbr"] = json!(true);
         }
 
-        let response = self
-            .http
-            .post(format!(
-                "{}/openapi/v2/text-to-3d",
-                self.config.meshy_api_base_url.trim_end_matches('/')
-            ))
-            .bearer_auth(&self.config.meshy_api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("create meshy refine task")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Meshy refine failed ({status}): {text}");
-        }
-
-        let payload = response
-            .json::<MeshyCreateTaskResponse>()
-            .await
-            .context("decode meshy refine response")?;
+        let payload = self
+            .submit_meshy_text_to_3d(body, "create meshy refine task")
+            .await?;
         payload
             .result
             .or(payload.task_id)
             .or(payload.id)
             .ok_or_else(|| anyhow!("Meshy refine response missing task id"))
+    }
+
+    async fn submit_meshy_text_to_3d(
+        &self,
+        mut body: serde_json::Value,
+        context_label: &'static str,
+    ) -> Result<MeshyCreateTaskResponse> {
+        let mut attempted_compat = false;
+
+        loop {
+            let response = self
+                .http
+                .post(format!(
+                    "{}/openapi/v2/text-to-3d",
+                    self.config.meshy_api_base_url.trim_end_matches('/')
+                ))
+                .bearer_auth(&self.config.meshy_api_key)
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| context_label.to_string())?;
+
+            if response.status().is_success() {
+                return response
+                    .json::<MeshyCreateTaskResponse>()
+                    .await
+                    .with_context(|| format!("decode {context_label} response"));
+            }
+
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            if !attempted_compat && should_retry_with_meshy_6(&text) {
+                body["ai_model"] = json!(MESHY_COMPAT_MODEL);
+                attempted_compat = true;
+                tracing::warn!(context_label, "retrying Meshy request with meshy-6 compatibility model");
+                continue;
+            }
+
+            anyhow::bail!("Meshy request failed ({status}): {text}");
+        }
     }
 
     async fn fetch_meshy_task(&self, task_id: &str) -> Result<MeshyTextTo3dTaskResponse> {
@@ -866,6 +996,19 @@ impl PetRegistryClient {
             .to_vec())
     }
 
+    fn optimize_generated_glb(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        let max_dimension = self.config.generated_pet_texture_max_dimension;
+        if max_dimension == 0 {
+            return Ok(bytes.to_vec());
+        }
+
+        downscale_glb_embedded_images(
+            bytes,
+            max_dimension,
+            self.config.generated_pet_texture_jpeg_quality,
+        )
+    }
+
     fn map_pet_identity(
         &self,
         pet_id: Uuid,
@@ -913,12 +1056,596 @@ fn parse_uuid(value: &str, label: &str) -> Result<Uuid> {
     Uuid::parse_str(value).with_context(|| format!("parse {label}"))
 }
 
+fn should_retry_with_meshy_6(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("meshy-4")
+        && normalized.contains("deprecated")
+        && normalized.contains("meshy-6")
+}
+
 fn build_variation_key(indices: &[usize; 5]) -> String {
     indices
         .iter()
         .map(|value| value.to_string())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+fn render_progress_bar(current: i64, target: i64, width: usize) -> String {
+    let safe_target = target.max(1);
+    let clamped_current = current.clamp(0, safe_target);
+    let filled = ((clamped_current as f64 / safe_target as f64) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    format!(
+        "[{}{}] {}/{}",
+        "#".repeat(filled),
+        "-".repeat(width.saturating_sub(filled)),
+        clamped_current,
+        safe_target
+    )
+}
+
+fn maybe_gzip_bytes(bytes: &[u8]) -> Result<(Vec<u8>, Option<&'static str>)> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    encoder
+        .write_all(bytes)
+        .context("gzip pet GLB bytes")?;
+    let compressed = encoder.finish().context("finalize gzipped pet GLB")?;
+    if compressed.len() + 32 >= bytes.len() {
+        return Ok((bytes.to_vec(), None));
+    }
+    Ok((compressed, Some("gzip")))
+}
+
+fn downscale_glb_embedded_images(
+    bytes: &[u8],
+    max_dimension: u32,
+    jpeg_quality: u8,
+) -> Result<Vec<u8>> {
+    let glb = Glb::from_slice(bytes).context("parse GLB")?;
+    let Some(bin_chunk) = glb.bin.as_ref() else {
+        return Ok(bytes.to_vec());
+    };
+    let mut root: Value =
+        serde_json::from_slice(glb.json.as_ref()).context("parse GLB JSON as value")?;
+    let mut changed = strip_material_normal_textures(&mut root);
+
+    let Some(original_buffer_views) = root
+        .get("bufferViews")
+        .and_then(Value::as_array)
+        .cloned()
+    else {
+        return Ok(bytes.to_vec());
+    };
+
+    let Some(original_images) = root.get("images").and_then(Value::as_array).cloned() else {
+        return Ok(bytes.to_vec());
+    };
+    let original_textures = root
+        .get("textures")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let used_texture_indices = collect_used_texture_indices(&root);
+    let (rebuilt_textures, texture_remap, texture_changed) =
+        rebuild_textures(&original_textures, &used_texture_indices);
+    changed |= texture_changed;
+    remap_material_texture_indices(&mut root, &texture_remap)?;
+    if let Some(textures) = root.get_mut("textures") {
+        *textures = Value::Array(rebuilt_textures.clone());
+    }
+
+    let used_image_indices = collect_used_image_indices(&rebuilt_textures);
+    let (mut rebuilt_images, image_remap, image_changed) =
+        rebuild_images(&original_images, &used_image_indices);
+    changed |= image_changed;
+    remap_texture_sources(root.get_mut("textures"), &image_remap)?;
+    if let Some(images) = root.get_mut("images") {
+        *images = Value::Array(rebuilt_images.clone());
+    }
+
+    let used_buffer_view_indices = collect_buffer_view_indices(&root);
+    let image_buffer_view_map = build_image_buffer_view_map(&rebuilt_images);
+    let (rebuilt_buffer_views, rebuilt_bin, buffer_view_remap, buffer_changed) =
+        rebuild_buffer_views_and_bin(
+            &original_buffer_views,
+            bin_chunk,
+            &used_buffer_view_indices,
+            &image_buffer_view_map,
+            max_dimension,
+            jpeg_quality,
+            &mut rebuilt_images,
+        )?;
+    changed |= buffer_changed;
+    remap_buffer_view_indices(&mut root, &buffer_view_remap)?;
+    if let Some(buffer_views) = root.get_mut("bufferViews") {
+        *buffer_views = Value::Array(rebuilt_buffer_views);
+    }
+    if let Some(images) = root.get_mut("images") {
+        *images = Value::Array(rebuilt_images);
+    }
+    if let Some(buffers) = root.get_mut("buffers").and_then(Value::as_array_mut) {
+        if let Some(buffer) = buffers.first_mut().and_then(Value::as_object_mut) {
+            buffer.insert("byteLength".to_string(), Value::from(rebuilt_bin.len() as u64));
+            buffer.remove("uri");
+        }
+    }
+
+    if !changed {
+        return Ok(bytes.to_vec());
+    }
+
+    let json = serde_json::to_vec(&root).context("serialize optimized GLB JSON")?;
+    let rebuilt = Glb {
+        header: GlbHeader {
+            magic: *b"glTF",
+            version: 2,
+            length: 0,
+        },
+        json: Cow::Owned(json),
+        bin: Some(Cow::Owned(rebuilt_bin)),
+    };
+    rebuilt.to_vec().context("serialize optimized GLB")
+}
+
+fn strip_material_normal_textures(root: &mut Value) -> bool {
+    let Some(materials) = root.get_mut("materials").and_then(Value::as_array_mut) else {
+        return false;
+    };
+
+    let mut changed = false;
+    for material in materials {
+        let Some(object) = material.as_object_mut() else {
+            continue;
+        };
+        if object.remove("normalTexture").is_some() {
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn collect_used_texture_indices(root: &Value) -> Vec<usize> {
+    let Some(materials) = root.get("materials").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut used = std::collections::BTreeSet::new();
+    for material in materials {
+        collect_texture_indices_from_material_value(material, None, &mut used);
+    }
+
+    used.into_iter().collect()
+}
+
+fn collect_texture_indices_from_material_value(
+    value: &Value,
+    parent_key: Option<&str>,
+    used: &mut std::collections::BTreeSet<usize>,
+) {
+    match value {
+        Value::Object(map) => {
+            if matches!(
+                parent_key,
+                Some(
+                    "baseColorTexture"
+                        | "metallicRoughnessTexture"
+                        | "normalTexture"
+                        | "occlusionTexture"
+                        | "emissiveTexture"
+                )
+            ) {
+                if let Some(index) = map
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    used.insert(index);
+                }
+            }
+
+            for (key, child) in map {
+                collect_texture_indices_from_material_value(child, Some(key.as_str()), used);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_texture_indices_from_material_value(child, parent_key, used);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rebuild_textures(
+    original_textures: &[Value],
+    used_texture_indices: &[usize],
+) -> (Vec<Value>, std::collections::HashMap<usize, usize>, bool) {
+    let mut remap = std::collections::HashMap::new();
+    let mut rebuilt = Vec::new();
+
+    for old_index in used_texture_indices {
+        let Some(texture) = original_textures.get(*old_index) else {
+            continue;
+        };
+        remap.insert(*old_index, rebuilt.len());
+        rebuilt.push(texture.clone());
+    }
+
+    let changed = rebuilt.len() != original_textures.len()
+        || used_texture_indices
+            .iter()
+            .enumerate()
+            .any(|(new_index, old_index)| *old_index != new_index);
+
+    (rebuilt, remap, changed)
+}
+
+fn remap_material_texture_indices(
+    root: &mut Value,
+    texture_remap: &std::collections::HashMap<usize, usize>,
+) -> Result<()> {
+    let Some(materials) = root.get_mut("materials").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+
+    for material in materials {
+        remap_material_texture_indices_in_value(material, None, texture_remap)?;
+    }
+
+    Ok(())
+}
+
+fn remap_material_texture_indices_in_value(
+    value: &mut Value,
+    parent_key: Option<&str>,
+    texture_remap: &std::collections::HashMap<usize, usize>,
+) -> Result<()> {
+    match value {
+        Value::Object(map) => {
+            if matches!(
+                parent_key,
+                Some(
+                    "baseColorTexture"
+                        | "metallicRoughnessTexture"
+                        | "normalTexture"
+                        | "occlusionTexture"
+                        | "emissiveTexture"
+                )
+            ) {
+                if let Some(index) = map
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    let new_index = texture_remap
+                        .get(&index)
+                        .copied()
+                        .ok_or_else(|| anyhow!("missing remap for texture index {index}"))?;
+                    map.insert("index".to_string(), Value::from(new_index as u64));
+                }
+            }
+
+            for (key, child) in map.iter_mut() {
+                remap_material_texture_indices_in_value(
+                    child,
+                    Some(key.as_str()),
+                    texture_remap,
+                )?;
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                remap_material_texture_indices_in_value(child, parent_key, texture_remap)?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn collect_used_image_indices(textures: &[Value]) -> Vec<usize> {
+    let mut used = std::collections::BTreeSet::new();
+
+    for texture in textures {
+        let Some(source) = texture
+            .get("source")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            continue;
+        };
+        used.insert(source);
+    }
+
+    used.into_iter().collect()
+}
+
+fn rebuild_images(
+    original_images: &[Value],
+    used_image_indices: &[usize],
+) -> (Vec<Value>, std::collections::HashMap<usize, usize>, bool) {
+    let mut remap = std::collections::HashMap::new();
+    let mut rebuilt = Vec::new();
+
+    for old_index in used_image_indices {
+        let Some(image) = original_images.get(*old_index) else {
+            continue;
+        };
+        remap.insert(*old_index, rebuilt.len());
+        rebuilt.push(image.clone());
+    }
+
+    let changed = rebuilt.len() != original_images.len()
+        || used_image_indices
+            .iter()
+            .enumerate()
+            .any(|(new_index, old_index)| *old_index != new_index);
+
+    (rebuilt, remap, changed)
+}
+
+fn remap_texture_sources(
+    textures: Option<&mut Value>,
+    image_remap: &std::collections::HashMap<usize, usize>,
+) -> Result<()> {
+    let Some(textures) = textures.and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+
+    for texture in textures {
+        let Some(object) = texture.as_object_mut() else {
+            continue;
+        };
+        let Some(source) = object
+            .get("source")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            continue;
+        };
+        let new_source = image_remap
+            .get(&source)
+            .copied()
+            .ok_or_else(|| anyhow!("missing remap for image index {source}"))?;
+        object.insert("source".to_string(), Value::from(new_source as u64));
+    }
+
+    Ok(())
+}
+
+fn collect_buffer_view_indices(root: &Value) -> Vec<usize> {
+    let mut used = std::collections::BTreeSet::new();
+    collect_buffer_view_indices_from_value(root, None, &mut used);
+    used.into_iter().collect()
+}
+
+fn collect_buffer_view_indices_from_value(
+    value: &Value,
+    parent_key: Option<&str>,
+    used: &mut std::collections::BTreeSet<usize>,
+) {
+    match value {
+        Value::Object(map) => {
+            if matches!(parent_key, Some("bufferView")) {
+                if let Some(index) = map
+                    .get("bufferView")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    used.insert(index);
+                }
+            }
+
+            for (key, child) in map {
+                if key == "bufferView" {
+                    if let Some(index) =
+                        child.as_u64().and_then(|value| usize::try_from(value).ok())
+                    {
+                        used.insert(index);
+                    }
+                }
+                collect_buffer_view_indices_from_value(child, Some(key.as_str()), used);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_buffer_view_indices_from_value(child, parent_key, used);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn build_image_buffer_view_map(images: &[Value]) -> std::collections::HashMap<usize, Vec<usize>> {
+    let mut map = std::collections::HashMap::<usize, Vec<usize>>::new();
+
+    for (image_index, image) in images.iter().enumerate() {
+        let Some(buffer_view) = image
+            .get("bufferView")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            continue;
+        };
+        map.entry(buffer_view).or_default().push(image_index);
+    }
+
+    map
+}
+
+fn rebuild_buffer_views_and_bin(
+    original_buffer_views: &[Value],
+    original_bin: &[u8],
+    used_buffer_view_indices: &[usize],
+    image_buffer_view_map: &std::collections::HashMap<usize, Vec<usize>>,
+    max_dimension: u32,
+    jpeg_quality: u8,
+    images: &mut [Value],
+) -> Result<(
+    Vec<Value>,
+    Vec<u8>,
+    std::collections::HashMap<usize, usize>,
+    bool,
+)> {
+    let mut remap = std::collections::HashMap::new();
+    let mut rebuilt_views = Vec::new();
+    let mut rebuilt_bin = Vec::new();
+    let mut changed = false;
+
+    for old_index in used_buffer_view_indices {
+        let Some(view) = original_buffer_views.get(*old_index) else {
+            continue;
+        };
+        let Some(object) = view.as_object() else {
+            continue;
+        };
+        let Some(byte_length) = object
+            .get("byteLength")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            continue;
+        };
+        let byte_offset = object
+            .get("byteOffset")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0);
+        let end = byte_offset.saturating_add(byte_length);
+        if end > original_bin.len() {
+            continue;
+        }
+
+        let mut stored_bytes = original_bin[byte_offset..end].to_vec();
+        let mut mime_override = None;
+
+        if max_dimension > 0 {
+            if let Some(image_indices) = image_buffer_view_map.get(old_index) {
+                if !image_indices.is_empty() {
+                    if let Some((optimized_image_bytes, optimized_mime)) =
+                        optimize_embedded_image(&stored_bytes, max_dimension, jpeg_quality)?
+                    {
+                        if optimized_image_bytes.len() < stored_bytes.len() {
+                            stored_bytes = optimized_image_bytes;
+                            mime_override = Some(optimized_mime);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let aligned_offset = align_bin_len(&mut rebuilt_bin);
+        rebuilt_bin.extend_from_slice(&stored_bytes);
+
+        let mut rebuilt_view = object.clone();
+        rebuilt_view.insert("byteOffset".to_string(), Value::from(aligned_offset as u64));
+        rebuilt_view.insert("byteLength".to_string(), Value::from(stored_bytes.len() as u64));
+        if aligned_offset != byte_offset || stored_bytes.len() != byte_length {
+            changed = true;
+        }
+
+        remap.insert(*old_index, rebuilt_views.len());
+        rebuilt_views.push(Value::Object(rebuilt_view));
+
+        if let Some(optimized_mime) = mime_override {
+            if let Some(image_indices) = image_buffer_view_map.get(old_index) {
+                for image_index in image_indices {
+                    if let Some(image) = images.get_mut(*image_index).and_then(Value::as_object_mut)
+                    {
+                        image.insert("mimeType".to_string(), Value::from(optimized_mime));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((rebuilt_views, rebuilt_bin, remap, changed))
+}
+
+fn remap_buffer_view_indices(
+    value: &mut Value,
+    buffer_view_remap: &std::collections::HashMap<usize, usize>,
+) -> Result<()> {
+    match value {
+        Value::Object(map) => {
+            if let Some(buffer_view) = map.get_mut("bufferView") {
+                if let Some(old_index) = buffer_view
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    let new_index = buffer_view_remap
+                        .get(&old_index)
+                        .copied()
+                        .ok_or_else(|| anyhow!("missing remap for bufferView index {old_index}"))?;
+                    *buffer_view = Value::from(new_index as u64);
+                }
+            }
+
+            for child in map.values_mut() {
+                remap_buffer_view_indices(child, buffer_view_remap)?;
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                remap_buffer_view_indices(child, buffer_view_remap)?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn optimize_embedded_image(
+    bytes: &[u8],
+    max_dimension: u32,
+    jpeg_quality: u8,
+) -> Result<Option<(Vec<u8>, &'static str)>> {
+    let image = image::load_from_memory(bytes).context("decode embedded GLB image")?;
+    let (width, height) = image.dimensions();
+    let resized = if width.max(height) > max_dimension {
+        image.resize(max_dimension, max_dimension, FilterType::Triangle)
+    } else {
+        image
+    };
+
+    let mut encoded = Vec::new();
+    let flattened = DynamicImage::ImageRgb8(resized.to_rgb8());
+    flattened
+        .write_to(
+            &mut Cursor::new(&mut encoded),
+            ImageFormat::Jpeg,
+        )
+        .context("encode resized GLB texture")?;
+
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+
+    if jpeg_quality < 100 {
+        let mut jpeg = Vec::new();
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, jpeg_quality.max(1));
+        encoder
+            .encode_image(&flattened)
+            .context("encode optimized GLB texture")?;
+        encoded = jpeg;
+    }
+
+    Ok(Some((encoded, "image/jpeg")))
+}
+
+fn align_bin_len(bin: &mut Vec<u8>) -> usize {
+    let aligned = (bin.len() + 3) & !3;
+    if aligned > bin.len() {
+        bin.resize(aligned, 0);
+    }
+    aligned
 }
 
 fn random_variation() -> PetVariation {

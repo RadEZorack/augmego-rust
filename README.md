@@ -49,7 +49,24 @@ cargo install trunk --locked
 rustup target add wasm32-unknown-unknown
 ```
 
-### 3. Build or watch the game client
+### 3. Configure environment
+
+Create a repo-root `.env` from:
+
+```text
+.env.example
+```
+
+At minimum, Google sign-in needs:
+
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `PUBLIC_BASE_URL`
+- `GAME_BACKEND_AUTH_SECRET`
+
+During migration, the Rust server will also fall back to `apps/web/.env` if it exists, so older local setups still work.
+
+### 4. Build or watch the game client
 
 For a one-off build:
 
@@ -71,7 +88,7 @@ trunk watch
 backend/static/play
 ```
 
-### 4. Run the Rust server
+### 5. Run the Rust server
 
 ```bash
 BACKEND_BIND_ADDR=0.0.0.0:4000 cargo run -p backend

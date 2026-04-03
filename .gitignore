@@ -4,6 +4,8 @@ debug/
 target/
 game-web/dist/
 game-web/.stage/
+backend/static/play/game-web-*.js
+backend/static/play/game-web-*_bg.wasm
 apps/web/.next/
 apps/web/public/play/*
 !apps/web/public/play/.gitkeep

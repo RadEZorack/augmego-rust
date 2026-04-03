@@ -17,6 +17,7 @@ pub struct StorageObject {
     pub bytes: Vec<u8>,
     pub content_type: String,
     pub cache_control: Option<String>,
+    pub content_encoding: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +43,7 @@ pub struct StorageService {
 struct StorageMetadata {
     content_type: String,
     cache_control: Option<String>,
+    content_encoding: Option<String>,
 }
 
 impl StorageService {
@@ -97,6 +99,7 @@ impl StorageService {
         bytes: &[u8],
         content_type: &str,
         cache_control: Option<&str>,
+        content_encoding: Option<&str>,
     ) -> Result<()> {
         match self.config.provider {
             StorageProvider::Local => {
@@ -112,6 +115,7 @@ impl StorageService {
                 let metadata = StorageMetadata {
                     content_type: content_type.to_string(),
                     cache_control: cache_control.map(str::to_string),
+                    content_encoding: content_encoding.map(str::to_string),
                 };
                 let metadata_path = metadata_path(&path);
                 let metadata_bytes =
@@ -147,6 +151,9 @@ impl StorageService {
                 ];
                 if let Some(cache_control) = cache_control {
                     signed_headers.push(("cache-control", cache_control.to_string()));
+                }
+                if let Some(content_encoding) = content_encoding {
+                    signed_headers.push(("content-encoding", content_encoding.to_string()));
                 }
                 signed_headers.sort_by(|left, right| left.0.cmp(right.0));
 
@@ -188,6 +195,9 @@ impl StorageService {
                 if let Some(cache_control) = cache_control {
                     request = request.header("cache-control", cache_control);
                 }
+                if let Some(content_encoding) = content_encoding {
+                    request = request.header("content-encoding", content_encoding);
+                }
 
                 let response = request.send().await.context("upload object to spaces")?;
                 if !response.status().is_success() {
@@ -214,7 +224,12 @@ impl StorageService {
                                 .as_ref()
                                 .map(|value| value.content_type.clone())
                                 .unwrap_or_else(|| infer_content_type(&path)),
-                            cache_control: metadata.and_then(|value| value.cache_control),
+                            cache_control: metadata
+                                .as_ref()
+                                .and_then(|value| value.cache_control.clone()),
+                            content_encoding: metadata
+                                .as_ref()
+                                .and_then(|value| value.content_encoding.clone()),
                         }))
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),

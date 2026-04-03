@@ -414,6 +414,7 @@ impl AccountService {
                 bytes,
                 content_type,
                 Some(PLAYER_AVATAR_CACHE_CONTROL),
+                None,
             )
             .await?;
         let model_url = self.resolve_player_avatar_file_url(user_id, slot);

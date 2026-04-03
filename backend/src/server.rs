@@ -82,15 +82,19 @@ pub struct ServerConfig {
     pub spaces_secret_access_key: String,
     pub spaces_region: String,
     pub generated_pet_cache_control: String,
+    pub generated_pet_texture_max_dimension: u32,
+    pub generated_pet_texture_jpeg_quality: u8,
     pub meshy_api_base_url: String,
     pub meshy_api_key: String,
     pub meshy_text_to_3d_model: String,
+    pub meshy_text_to_3d_model_type: String,
     pub meshy_text_to_3d_enable_refine: bool,
     pub meshy_text_to_3d_refine_model: String,
     pub meshy_text_to_3d_enable_pbr: bool,
     pub meshy_text_to_3d_topology: String,
     pub meshy_text_to_3d_target_polycount: Option<i32>,
     pub pet_pool_target: i64,
+    pub pet_generation_max_in_flight: i64,
     pub pet_generation_worker_interval: Duration,
     pub pet_generation_poll_interval: Duration,
     pub pet_generation_max_attempts: i32,
@@ -168,26 +172,51 @@ impl Default for ServerConfig {
             storage_namespace: std::env::var("ASSET_STORAGE_NAMESPACE")
                 .or_else(|_| std::env::var("WORLD_STORAGE_NAMESPACE"))
                 .unwrap_or_else(|_| "world-assets".to_string()),
-            spaces_bucket: std::env::var("SPACES_BUCKET").unwrap_or_default(),
-            spaces_endpoint: std::env::var("SPACES_ENDPOINT").unwrap_or_default(),
-            spaces_custom_domain: std::env::var("SPACES_CUSTOM_DOMAIN").unwrap_or_default(),
-            spaces_access_key_id: std::env::var("SPACES_ACCESS_KEY_ID").unwrap_or_default(),
-            spaces_secret_access_key: std::env::var("SPACES_SECRET_ACCESS_KEY")
+            spaces_bucket: std::env::var("SPACES_BUCKET")
+                .or_else(|_| std::env::var("DO_SPACES_BUCKET"))
                 .unwrap_or_default(),
-            spaces_region: std::env::var("SPACES_REGION").unwrap_or_default(),
+            spaces_endpoint: std::env::var("SPACES_ENDPOINT")
+                .or_else(|_| std::env::var("DO_SPACES_ENDPOINT"))
+                .unwrap_or_default(),
+            spaces_custom_domain: std::env::var("SPACES_CUSTOM_DOMAIN")
+                .or_else(|_| std::env::var("DO_SPACES_CUSTOM_DOMAIN"))
+                .unwrap_or_default(),
+            spaces_access_key_id: std::env::var("SPACES_ACCESS_KEY_ID")
+                .or_else(|_| std::env::var("DO_SPACES_KEY"))
+                .unwrap_or_default(),
+            spaces_secret_access_key: std::env::var("SPACES_SECRET_ACCESS_KEY")
+                .or_else(|_| std::env::var("DO_SPACES_SECRET"))
+                .unwrap_or_default(),
+            spaces_region: std::env::var("SPACES_REGION")
+                .or_else(|_| std::env::var("DO_SPACES_REGION"))
+                .unwrap_or_default(),
             generated_pet_cache_control: std::env::var("GENERATED_PET_CACHE_CONTROL")
                 .unwrap_or_else(|_| "public, max-age=31536000, immutable".to_string()),
+            generated_pet_texture_max_dimension: std::env::var(
+                "GENERATED_PET_TEXTURE_MAX_DIMENSION",
+            )
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+            generated_pet_texture_jpeg_quality: std::env::var(
+                "GENERATED_PET_TEXTURE_JPEG_QUALITY",
+            )
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(85),
             meshy_api_base_url: std::env::var("MESHY_API_BASE_URL")
                 .unwrap_or_else(|_| "https://api.meshy.ai".to_string()),
             meshy_api_key: std::env::var("MESHY_API_KEY").unwrap_or_default(),
             meshy_text_to_3d_model: std::env::var("MESHY_TEXT_TO_3D_MODEL")
-                .unwrap_or_else(|_| "meshy-4".to_string()),
+                .unwrap_or_else(|_| "meshy-6".to_string()),
+            meshy_text_to_3d_model_type: std::env::var("MESHY_TEXT_TO_3D_MODEL_TYPE")
+                .unwrap_or_else(|_| "standard".to_string()),
             meshy_text_to_3d_enable_refine: std::env::var("MESHY_TEXT_TO_3D_ENABLE_REFINE")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(true),
             meshy_text_to_3d_refine_model: std::env::var("MESHY_TEXT_TO_3D_REFINE_MODEL")
-                .unwrap_or_else(|_| "meshy-4".to_string()),
+                .unwrap_or_else(|_| "meshy-6".to_string()),
             meshy_text_to_3d_enable_pbr: std::env::var("MESHY_TEXT_TO_3D_ENABLE_PBR")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -201,17 +230,21 @@ impl Default for ServerConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(30),
+            pet_generation_max_in_flight: std::env::var("PET_GENERATION_MAX_IN_FLIGHT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(2),
             pet_generation_worker_interval: Duration::from_secs(
                 std::env::var("PET_GENERATION_WORKER_INTERVAL_SECS")
                     .ok()
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(10),
+                    .unwrap_or(5),
             ),
             pet_generation_poll_interval: Duration::from_secs(
                 std::env::var("PET_GENERATION_POLL_INTERVAL_SECS")
                     .ok()
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(15),
+                    .unwrap_or(5),
             ),
             pet_generation_max_attempts: std::env::var("PET_GENERATION_MAX_ATTEMPTS")
                 .ok()
@@ -1215,15 +1248,19 @@ impl VoxelServer {
             PetRegistryConfig {
                 auth_secret: config.game_backend_auth_secret.clone(),
                 generated_pet_cache_control: config.generated_pet_cache_control.clone(),
+                generated_pet_texture_max_dimension: config.generated_pet_texture_max_dimension,
+                generated_pet_texture_jpeg_quality: config.generated_pet_texture_jpeg_quality,
                 meshy_api_base_url: config.meshy_api_base_url.clone(),
                 meshy_api_key: config.meshy_api_key.clone(),
                 meshy_text_to_3d_model: config.meshy_text_to_3d_model.clone(),
+                meshy_text_to_3d_model_type: config.meshy_text_to_3d_model_type.clone(),
                 meshy_text_to_3d_enable_refine: config.meshy_text_to_3d_enable_refine,
                 meshy_text_to_3d_refine_model: config.meshy_text_to_3d_refine_model.clone(),
                 meshy_text_to_3d_enable_pbr: config.meshy_text_to_3d_enable_pbr,
                 meshy_text_to_3d_topology: config.meshy_text_to_3d_topology.clone(),
                 meshy_text_to_3d_target_polycount: config.meshy_text_to_3d_target_polycount,
                 pet_pool_target: config.pet_pool_target,
+                pet_generation_max_in_flight: config.pet_generation_max_in_flight,
                 pet_generation_worker_interval: config.pet_generation_worker_interval,
                 pet_generation_poll_interval: config.pet_generation_poll_interval,
                 pet_generation_max_attempts: config.pet_generation_max_attempts,
@@ -1337,7 +1374,11 @@ impl VoxelServer {
         }
     }
 
-    async fn handle_websocket_client(&self, socket: WebSocket) -> Result<()> {
+    async fn handle_websocket_client(
+        &self,
+        socket: WebSocket,
+        cookie_header_value: Option<String>,
+    ) -> Result<()> {
         let (mut ws_write, mut ws_read) = socket.split();
         let (sender, mut receiver) = mpsc::unbounded_channel::<ServerMessage>();
         let writer = tokio::spawn(async move {
@@ -1366,10 +1407,33 @@ impl VoxelServer {
             _ => return Err(anyhow!("expected websocket login request")),
         };
 
-        let user_id = login
+        let token_user_id = login
             .auth_token
             .as_deref()
             .and_then(|token| self.pet_registry.verify_auth_token(token));
+        let cookie_user_id = if token_user_id.is_none() {
+            match self
+                .account_service
+                .session_user_from_cookie_header(cookie_header_value.as_deref())
+                .await
+            {
+                Ok(Some(session_user)) => Some(session_user.id.to_string()),
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(?error, "failed to load websocket session user from cookies");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (user_id, auth_source) = if let Some(user_id) = token_user_id {
+            (Some(user_id), "game_auth_token")
+        } else if let Some(user_id) = cookie_user_id {
+            (Some(user_id), "session_cookie")
+        } else {
+            (None, "guest")
+        };
         let pet_collection = match user_id.as_deref() {
             Some(user_id) => match self.pet_registry.load_user_pet_collection(user_id).await {
                 Ok(collection) => Some(collection),
@@ -1393,7 +1457,15 @@ impl VoxelServer {
                 login.dance_model_url,
             )
             .await;
-        tracing::info!(player_id = player.id, name = %player.name, "websocket player joined");
+        tracing::info!(
+            player_id = player.id,
+            name = %player.name,
+            user_id = ?player.user_id,
+            auth_source,
+            captured_pet_count = player.captured_pets.len(),
+            active_pet_count = player.active_pet_models.len(),
+            "websocket player joined"
+        );
 
         let _ = sender.send(ServerMessage::LoginResponse(LoginResponse {
             accepted: true,
@@ -1880,10 +1952,15 @@ async fn static_file_response(resolved_path: PathBuf) -> Response {
 
 async fn websocket_upgrade(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(server): State<VoxelServer>,
 ) -> impl IntoResponse {
+    let cookie_header_value = cookie_header(&headers).map(str::to_owned);
     ws.on_upgrade(move |socket| async move {
-        if let Err(error) = server.handle_websocket_client(socket).await {
+        if let Err(error) = server
+            .handle_websocket_client(socket, cookie_header_value)
+            .await
+        {
             tracing::error!(?error, "websocket client session ended with error");
         }
     })
@@ -2289,6 +2366,12 @@ fn storage_object_response(object: crate::storage::StorageObject) -> Response {
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
+    }
+    if let Some(content_encoding) = object.content_encoding {
+        response.headers_mut().insert(
+            header::CONTENT_ENCODING,
+            content_encoding.parse().unwrap(),
+        );
     }
     response
 }

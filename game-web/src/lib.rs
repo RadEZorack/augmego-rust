@@ -1141,7 +1141,6 @@ impl WebApp {
                                 self.logged_in = true;
                                 self.login_request_sent = false;
                                 self.player_id = Some(response.player_id);
-                                self.pending_network_events.clear();
                                 self.remote_players.clear();
                                 self.remote_player_latest_ticks.clear();
                                 self.remote_player_velocities.clear();

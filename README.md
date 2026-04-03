@@ -30,16 +30,20 @@ The `game-web` crate is still the browser game client, but it is no longer deplo
 
 ## Quick Start
 
-### 1. Start Postgres
+### 1. Start Postgres and Valkey
 
 ```bash
-docker compose up -d postgres
+docker compose up -d postgres valkey
 ```
 
 The default Rust server config expects:
 
 ```text
 postgresql://postgres:postgres@127.0.0.1:5432/augmego
+```
+
+```text
+redis://127.0.0.1:6379
 ```
 
 ### 2. Install WASM build tooling
@@ -133,12 +137,14 @@ docker compose up --build
 This starts:
 
 - `postgres`
+- `valkey`
 - `rust-app`
 
 Published ports:
 
 - `4000`: Rust app server, API routes, static game client, and WebSocket endpoint
 - `5432`: Postgres
+- `6379`: Valkey
 
 Open:
 
@@ -152,8 +158,11 @@ http://localhost:4000
 
 - `BACKEND_BIND_ADDR`
 - `DATABASE_URL`
+- `VALKEY_URL` or `REDIS_URL`
+- `WORLD_CACHE_NAMESPACE`
+- `WORLD_CACHE_TTL_SECS`
+- `WORLD_CACHE_REQUIRED`
 - `PUBLIC_BASE_URL`
-- `BACKEND_SAVE_PATH`
 - `BACKEND_STATIC_ROOT`
 
 ### Auth
@@ -203,6 +212,17 @@ To use DigitalOcean Spaces instead:
 
 When Spaces is configured, the Rust server uploads avatar and pet GLBs directly to the S3-compatible endpoint and serves public URLs from there.
 
+### World Persistence
+
+Edited world chunks are persisted as sparse block overrides in Postgres and cached as gzip-compressed materialized chunks in Valkey.
+
+- Only edited chunks are persisted; untouched terrain is regenerated from the world seed.
+- `WORLD_CACHE_TTL_SECS=0` disables Valkey expiration.
+- `WORLD_CACHE_REQUIRED=false` treats Valkey as an optional cache and falls back to Postgres reconstruction on cache misses or cache outages.
+- `WORLD_CACHE_REQUIRED=true` requires Valkey at startup and turns later cache write failures into request errors.
+- `/api/v1/health` reports the current persisted edited chunk count plus whether Valkey is configured and connected.
+- Managed DigitalOcean Valkey URLs typically use `rediss://...`.
+
 ## Database
 
 Database ownership is now Rust-first.
@@ -218,6 +238,19 @@ The fresh Rust schema currently covers:
 - `sessions`
 - `avatar_slots`
 - `pets`
+- `world_chunk_overrides`
+
+## Deployment
+
+### DigitalOcean App Platform
+
+- Deploy a single web service using `backend/Dockerfile`.
+- Attach one managed PostgreSQL cluster and one managed Valkey cluster.
+- Keep the app and both databases in the same region and VPC, and prefer the managed private connection strings.
+- Use the TLS-enabled Valkey connection string from DigitalOcean for `VALKEY_URL`.
+- Keep the app at one instance because realtime player/session/world authority is still process-local.
+- Point the platform health check at `/api/v1/health` to confirm the app can still query world persistence status.
+- No persistent world volume is required. After redeploys or cache flushes, edited chunks rebuild from Postgres and repopulate Valkey on demand.
 
 ## Routes
 
@@ -229,7 +262,7 @@ Main browser routes:
 
 API routes:
 
-- `/api/v1/health`
+- `/api/v1/health` returns app status plus world persistence/cache state
 - `/api/v1/auth/google`
 - `/api/v1/auth/google/callback`
 - `/api/v1/auth/logout`
@@ -262,4 +295,4 @@ cargo check --target wasm32-unknown-unknown -p game-web
 - Guest mode still works.
 - Signed-in users receive a short-lived game auth token from `/api/v1/auth/me`.
 - The newest six captured pets become active followers automatically.
-- World/chunk persistence remains file-backed in Rust; Postgres is used for account and gameplay metadata.
+- World/chunk persistence now uses Postgres sparse overrides with a Valkey cache instead of local disk.

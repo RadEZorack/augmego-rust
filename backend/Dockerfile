@@ -1,4 +1,4 @@
-FROM rust:1.86-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /app
 
@@ -13,6 +13,7 @@ COPY shared_math ./shared_math
 COPY shared_protocol ./shared_protocol
 COPY shared_world ./shared_world
 COPY wgpu-lite ./wgpu-lite
+COPY vendor ./vendor
 COPY assets ./assets
 
 WORKDIR /app/game-web
@@ -32,6 +33,7 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/backend /usr/local/bin/backend
 COPY --from=builder /app/backend/static /app/static
+COPY --from=builder /app/backend/migrations /app/backend/migrations
 
 ENV BACKEND_STATIC_ROOT=/app/static
 

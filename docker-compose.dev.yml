@@ -16,6 +16,17 @@ services:
       timeout: 5s
       retries: 20
 
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   dev-proxy:
     image: nginx:1.27-alpine
     container_name: augmego-dev-proxy

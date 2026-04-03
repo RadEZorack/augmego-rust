@@ -16,6 +16,17 @@ services:
       timeout: 5s
       retries: 20
 
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   rust-app:
     build:
       context: .
@@ -24,8 +35,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      valkey:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/augmego
+      VALKEY_URL: redis://valkey:6379
+      WORLD_CACHE_NAMESPACE: docker
+      WORLD_CACHE_TTL_SECS: "86400"
+      WORLD_CACHE_REQUIRED: "false"
       PUBLIC_BASE_URL: http://localhost:4000
       BACKEND_BIND_ADDR: 0.0.0.0:4000
       COOKIE_SAMESITE: Lax
@@ -40,7 +57,6 @@ services:
       SPACES_SECRET_ACCESS_KEY: ${SPACES_SECRET_ACCESS_KEY:-}
       SPACES_REGION: ${SPACES_REGION:-}
       BACKEND_STATIC_ROOT: /app/static
-      BACKEND_SAVE_PATH: /data/world
       PET_POOL_TARGET: "30"
       GAME_BACKEND_AUTH_SECRET: ${GAME_BACKEND_AUTH_SECRET:-dev-only-game-backend-secret}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
@@ -49,10 +65,8 @@ services:
     ports:
       - "4000:4000"
     volumes:
-      - world-data:/data/world
       - asset-data:/data/storage
 
 volumes:
   postgres-data:
-  world-data:
   asset-data:

@@ -1,11 +1,11 @@
 use crate::account::{AccountConfig, AccountService, AvatarFileResponse, PlayerAvatarSlot};
 use crate::auth::{SameSitePolicy, SessionCookieConfig};
 use crate::db;
+use crate::persistence::{ChunkStore, ChunkStoreConfig, PostgresValkeyChunkStore};
 use crate::pet_registry::{
     CapturePetOutcome, PetModelFileResponse, PetRegistryClient, PetRegistryConfig,
     PlayerPetCollection,
 };
-use crate::persistence::PersistenceService;
 use crate::storage::{StorageConfig, StorageProvider, StorageService};
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
@@ -59,9 +59,12 @@ pub struct ServerConfig {
     pub bind_addr: String,
     pub public_base_url: String,
     pub world_seed: u64,
-    pub save_path: PathBuf,
     pub view_radius: u8,
     pub database_url: String,
+    pub valkey_url: Option<String>,
+    pub world_cache_namespace: String,
+    pub world_cache_ttl_secs: Option<u64>,
+    pub world_cache_required: bool,
     pub static_root: PathBuf,
     pub session_cookie_name: String,
     pub session_cookie_secure: bool,
@@ -122,9 +125,6 @@ impl Default for ServerConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0xA66D_E601),
-            save_path: PathBuf::from(
-                std::env::var("BACKEND_SAVE_PATH").unwrap_or_else(|_| "world".to_string()),
-            ),
             view_radius: std::env::var("BACKEND_VIEW_RADIUS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -132,6 +132,25 @@ impl Default for ServerConfig {
             database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
                 "postgresql://postgres:postgres@127.0.0.1:5432/augmego".to_string()
             }),
+            valkey_url: std::env::var("VALKEY_URL")
+                .or_else(|_| std::env::var("REDIS_URL"))
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            world_cache_namespace: std::env::var("WORLD_CACHE_NAMESPACE")
+                .unwrap_or_else(|_| "local".to_string()),
+            world_cache_ttl_secs: match std::env::var("WORLD_CACHE_TTL_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                Some(0) => None,
+                Some(value) => Some(value),
+                None => Some(60 * 60 * 24),
+            },
+            world_cache_required: std::env::var("WORLD_CACHE_REQUIRED")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(false),
             static_root: PathBuf::from(
                 std::env::var("BACKEND_STATIC_ROOT")
                     .unwrap_or_else(|_| "backend/static".to_string()),
@@ -198,12 +217,10 @@ impl Default for ServerConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
-            generated_pet_texture_jpeg_quality: std::env::var(
-                "GENERATED_PET_TEXTURE_JPEG_QUALITY",
-            )
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(85),
+            generated_pet_texture_jpeg_quality: std::env::var("GENERATED_PET_TEXTURE_JPEG_QUALITY")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(85),
             meshy_api_base_url: std::env::var("MESHY_API_BASE_URL")
                 .unwrap_or_else(|_| "https://api.meshy.ai".to_string()),
             meshy_api_key: std::env::var("MESHY_API_KEY").unwrap_or_default(),
@@ -437,9 +454,7 @@ impl PlayerService {
         let player = players.get_mut(&player_id)?;
         player.captured_pets = collection.pets;
         player.active_pet_models = collection.active_pets;
-        player
-            .pet_states
-            .truncate(player.active_pet_models.len());
+        player.pet_states.truncate(player.active_pet_models.len());
         Some(player.clone())
     }
 }
@@ -829,15 +844,15 @@ impl WebSocketSessionService {
 pub struct WorldService {
     generator: TerrainGenerator,
     chunks: Arc<RwLock<HashMap<ChunkPos, ChunkData>>>,
-    persistence: PersistenceService,
+    chunk_store: Arc<dyn ChunkStore>,
 }
 
 impl WorldService {
-    pub fn new(world_seed: u64, persistence: PersistenceService) -> Self {
+    pub fn new(world_seed: u64, chunk_store: Arc<dyn ChunkStore>) -> Self {
         Self {
             generator: TerrainGenerator::new(world_seed),
             chunks: Arc::new(RwLock::new(HashMap::new())),
-            persistence,
+            chunk_store,
         }
     }
 
@@ -846,7 +861,11 @@ impl WorldService {
             return Ok(existing);
         }
 
-        let loaded = if let Some(saved) = self.persistence.load_chunk(position).await? {
+        let loaded = if let Some(saved) = self
+            .chunk_store
+            .load_materialized_chunk(&self.generator, position)
+            .await?
+        {
             saved
         } else {
             self.generator.generate_chunk(position)
@@ -861,7 +880,11 @@ impl WorldService {
             return Ok((existing.revision > 0).then_some(existing));
         }
 
-        let Some(saved) = self.persistence.load_chunk(position).await? else {
+        let Some(saved) = self
+            .chunk_store
+            .load_materialized_chunk(&self.generator, position)
+            .await?
+        else {
             return Ok(None);
         };
         self.chunks.write().await.insert(position, saved.clone());
@@ -888,7 +911,10 @@ impl WorldService {
             .context("convert block edit position")?;
         let mut chunk = self.chunk(chunk_pos).await?;
         chunk.set_voxel(local, Voxel { block });
-        self.persistence.schedule_flush(chunk.clone())?;
+        let chunk = self
+            .chunk_store
+            .persist_materialized_chunk(&self.generator, chunk)
+            .await?;
         self.chunks.write().await.insert(chunk_pos, chunk.clone());
 
         Ok((
@@ -898,6 +924,10 @@ impl WorldService {
             },
             Some(chunk),
         ))
+    }
+
+    pub async fn persistence_status(&self) -> Result<crate::persistence::ChunkStoreRuntimeStatus> {
+        self.chunk_store.runtime_status().await
     }
 
     pub fn safe_spawn_position(&self) -> WorldPos {
@@ -1243,7 +1273,7 @@ impl VoxelServer {
         );
 
         let pet_registry = PetRegistryClient::new(
-            pool,
+            pool.clone(),
             storage,
             PetRegistryConfig {
                 auth_secret: config.game_backend_auth_secret.clone(),
@@ -1267,8 +1297,21 @@ impl VoxelServer {
             },
         );
 
-        let persistence = PersistenceService::new(&config.save_path).await?;
-        let world_service = WorldService::new(config.world_seed, persistence);
+        let chunk_store = Arc::new(
+            PostgresValkeyChunkStore::new(
+                pool.clone(),
+                ChunkStoreConfig {
+                    world_seed: config.world_seed,
+                    valkey_url: config.valkey_url.clone(),
+                    cache_namespace: config.world_cache_namespace.clone(),
+                    cache_ttl_secs: config.world_cache_ttl_secs,
+                    cache_required: config.world_cache_required,
+                },
+            )
+            .await?,
+        );
+        let world_service = WorldService::new(config.world_seed, chunk_store);
+        let persistence_status = world_service.persistence_status().await?;
         let chunk_streaming = ChunkStreamingService::new(world_service.clone(), config.view_radius);
         let websocket_sessions = WebSocketSessionService::new();
         let player_service = PlayerService::new();
@@ -1277,6 +1320,16 @@ impl VoxelServer {
         tracing::info!(
             blocks = block_definitions().len(),
             "loaded content definitions"
+        );
+        tracing::info!(
+            world_seed = persistence_status.world_seed,
+            cache_namespace = %persistence_status.cache_namespace,
+            cache_ttl_secs = ?persistence_status.cache_ttl_secs,
+            cache_required = persistence_status.cache_required,
+            cache_configured = persistence_status.cache_configured,
+            cache_connected = persistence_status.cache_connected,
+            persisted_chunk_count = persistence_status.persisted_chunk_count,
+            "initialized world persistence"
         );
 
         Ok(Self {
@@ -1368,7 +1421,12 @@ impl VoxelServer {
             let connected_player_ids = self.websocket_sessions.connected_player_ids().await;
             let dispatches = self
                 .wild_pet_service
-                .maintain(&self.world_service, &self.pet_registry, &players, &connected_player_ids)
+                .maintain(
+                    &self.world_service,
+                    &self.pet_registry,
+                    &players,
+                    &connected_player_ids,
+                )
                 .await?;
             self.dispatch_wild_pet_updates(dispatches).await;
         }
@@ -1473,8 +1531,12 @@ impl VoxelServer {
             spawn_position,
             message: format!("Welcome, {}", player.name),
         }));
-        let _ = sender.send(ServerMessage::InventorySnapshot(default_inventory_snapshot()));
-        let _ = sender.send(ServerMessage::CapturedPetsSnapshot(player.captured_pets_snapshot()));
+        let _ = sender.send(ServerMessage::InventorySnapshot(
+            default_inventory_snapshot(),
+        ));
+        let _ = sender.send(ServerMessage::CapturedPetsSnapshot(
+            player.captured_pets_snapshot(),
+        ));
 
         self.websocket_sessions
             .register(player.id, sender.clone())
@@ -1483,7 +1545,8 @@ impl VoxelServer {
         let subscribe = match read_ws_message::<ClientMessage, _>(&mut ws_read).await? {
             ClientMessage::SubscribeChunks(request) => Some(request),
             other => {
-                self.handle_websocket_message(player.id, &sender, other).await?;
+                self.handle_websocket_message(player.id, &sender, other)
+                    .await?;
                 None
             }
         };
@@ -1720,7 +1783,11 @@ impl VoxelServer {
             }
         };
 
-        match self.pet_registry.capture_pet(&persistent_pet_id, &user_id).await {
+        match self
+            .pet_registry
+            .capture_pet(&persistent_pet_id, &user_id)
+            .await
+        {
             Ok(CapturePetOutcome::Captured(collection)) => {
                 if let Some(updated_player) = self
                     .player_service
@@ -1819,7 +1886,10 @@ impl VoxelServer {
         }
 
         self.websocket_sessions
-            .broadcast_to(&recipients, ServerMessage::PlayerLeft(PlayerLeft { player_id }))
+            .broadcast_to(
+                &recipients,
+                ServerMessage::PlayerLeft(PlayerLeft { player_id }),
+            )
             .await;
     }
 }
@@ -1945,7 +2015,10 @@ async fn static_file_response(resolved_path: PathBuf) -> Response {
         }
         Err(error) => {
             tracing::warn!(?error, path = %resolved_path.display(), "failed to read play asset");
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "STATIC_ASSET_READ_FAILED")
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STATIC_ASSET_READ_FAILED",
+            )
         }
     }
 }
@@ -1966,8 +2039,33 @@ async fn websocket_upgrade(
     })
 }
 
-async fn api_health() -> Json<Value> {
-    Json(json!({ "ok": true }))
+async fn api_health(State(server): State<VoxelServer>) -> Response {
+    match server.world_service.persistence_status().await {
+        Ok(status) => Json(json!({
+            "ok": true,
+            "world_seed": status.world_seed,
+            "world_persistence": {
+                "persisted_chunk_count": status.persisted_chunk_count,
+                "cache_namespace": status.cache_namespace,
+                "cache_ttl_secs": status.cache_ttl_secs,
+                "cache_required": status.cache_required,
+                "cache_configured": status.cache_configured,
+                "cache_connected": status.cache_connected
+            }
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::warn!(?error, "failed to resolve world persistence health");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ok": false,
+                    "error": "WORLD_PERSISTENCE_STATUS_FAILED"
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn auth_google(State(server): State<VoxelServer>) -> Response {
@@ -2049,7 +2147,10 @@ async fn auth_me(State(server): State<VoxelServer>, headers: HeaderMap) -> Respo
         Ok(None) => Json(json!({ "user": Value::Null })).into_response(),
         Err(error) => {
             tracing::warn!(?error, "failed to resolve auth session");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "AUTH_LOOKUP_FAILED" })))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "AUTH_LOOKUP_FAILED" })),
+            )
                 .into_response()
         }
     }
@@ -2207,7 +2308,11 @@ async fn player_avatar_upload(
         let field_name = field.name().unwrap_or_default().to_string();
         match field_name.as_str() {
             "slot" => {
-                requested_slot = field.text().await.ok().map(|value| value.trim().to_string());
+                requested_slot = field
+                    .text()
+                    .await
+                    .ok()
+                    .map(|value| value.trim().to_string());
             }
             "file" => {
                 let content_type = field
@@ -2288,10 +2393,16 @@ async fn player_avatar_upload_url(
         return api_error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED");
     }
     if !server.account_service.direct_avatar_upload_url_available() {
-        return api_error(StatusCode::SERVICE_UNAVAILABLE, "DIRECT_UPLOAD_NOT_AVAILABLE");
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DIRECT_UPLOAD_NOT_AVAILABLE",
+        );
     }
 
-    api_error(StatusCode::SERVICE_UNAVAILABLE, "DIRECT_UPLOAD_NOT_AVAILABLE")
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "DIRECT_UPLOAD_NOT_AVAILABLE",
+    )
 }
 
 async fn public_player_avatar_file(
@@ -2321,7 +2432,9 @@ async fn public_pet_file(
     AxumPath(pet_id): AxumPath<String>,
 ) -> Response {
     match server.pet_registry.read_pet_model_file(&pet_id).await {
-        Ok(Some(PetModelFileResponse::Redirect { url })) => Redirect::temporary(&url).into_response(),
+        Ok(Some(PetModelFileResponse::Redirect { url })) => {
+            Redirect::temporary(&url).into_response()
+        }
         Ok(Some(PetModelFileResponse::Bytes(object))) => storage_object_response(object),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND"),
         Err(error) => {
@@ -2349,7 +2462,9 @@ async fn load_session_user(
 }
 
 fn cookie_header(headers: &HeaderMap) -> Option<&str> {
-    headers.get(header::COOKIE).and_then(|value| value.to_str().ok())
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
 }
 
 fn api_error(status: StatusCode, code: &str) -> Response {
@@ -2360,7 +2475,10 @@ fn storage_object_response(object: crate::storage::StorageObject) -> Response {
     let mut response = Response::new(Body::from(object.bytes));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        object.content_type.parse().unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
+        object
+            .content_type
+            .parse()
+            .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
     );
     if let Some(cache_control) = object.cache_control {
         response
@@ -2368,10 +2486,9 @@ fn storage_object_response(object: crate::storage::StorageObject) -> Response {
             .insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
     }
     if let Some(content_encoding) = object.content_encoding {
-        response.headers_mut().insert(
-            header::CONTENT_ENCODING,
-            content_encoding.parse().unwrap(),
-        );
+        response
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, content_encoding.parse().unwrap());
     }
     response
 }
@@ -2406,7 +2523,10 @@ fn static_content_type(path: &std::path::Path) -> &'static str {
 }
 
 fn is_immutable_static_asset(path: &std::path::Path) -> bool {
-    !matches!(path.file_name().and_then(|value| value.to_str()), Some("index.html"))
+    !matches!(
+        path.file_name().and_then(|value| value.to_str()),
+        Some("index.html")
+    )
 }
 
 fn parse_optional_text_field(
@@ -2644,13 +2764,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::InMemoryChunkStore;
+    use shared_math::LocalVoxelPos;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn rejects_vertical_out_of_bounds_block_edits() {
-        let persistence = PersistenceService::new(std::env::temp_dir().join("augmego-voxel-tests"))
-            .await
-            .unwrap();
-        let world = WorldService::new(7, persistence);
+        let world = WorldService::new(7, Arc::new(InMemoryChunkStore::new(7)));
         let result = world
             .apply_block_edit(
                 WorldPos {
@@ -2666,11 +2786,120 @@ mod tests {
         assert!(!(result.0).accepted);
     }
 
+    #[tokio::test]
+    async fn pristine_chunk_without_persistence_returns_generated_chunk() {
+        let store = Arc::new(InMemoryChunkStore::new(7));
+        let world = WorldService::new(7, store);
+        let position = ChunkPos { x: 2, z: -3 };
+
+        let chunk = world.chunk(position).await.unwrap();
+        let chunk_override = world.chunk_override(position).await.unwrap();
+
+        assert_eq!(chunk.revision, 0);
+        assert!(chunk_override.is_none());
+    }
+
+    #[tokio::test]
+    async fn edited_chunk_rebuilds_from_persisted_overrides_when_cache_is_empty() {
+        let store = Arc::new(InMemoryChunkStore::new(7));
+        let original_world = WorldService::new(7, store.clone());
+        let edit_position = WorldPos { x: 0, y: 80, z: 0 };
+        original_world
+            .apply_block_edit(edit_position, BlockId::Glass)
+            .await
+            .unwrap();
+        store.clear_cache().await;
+
+        let rebuilt_world = WorldService::new(7, store.clone());
+        let rebuilt = rebuilt_world.chunk(ChunkPos { x: 0, z: 0 }).await.unwrap();
+
+        assert_eq!(
+            rebuilt.voxel(LocalVoxelPos { x: 0, y: 80, z: 0 }).block,
+            BlockId::Glass
+        );
+        assert_eq!(store.stats().db_loads, 1);
+    }
+
+    #[tokio::test]
+    async fn edited_chunk_uses_cached_materialized_value_when_available() {
+        let store = Arc::new(InMemoryChunkStore::new(7));
+        let original_world = WorldService::new(7, store.clone());
+        original_world
+            .apply_block_edit(WorldPos { x: 1, y: 81, z: 1 }, BlockId::Lantern)
+            .await
+            .unwrap();
+
+        let cached_world = WorldService::new(7, store.clone());
+        let chunk = cached_world.chunk(ChunkPos { x: 0, z: 0 }).await.unwrap();
+        let stats = store.stats();
+
+        assert_eq!(
+            chunk.voxel(LocalVoxelPos { x: 1, y: 81, z: 1 }).block,
+            BlockId::Lantern
+        );
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.db_loads, 0);
+    }
+
+    #[tokio::test]
+    async fn reverting_last_override_deletes_persisted_and_cached_chunk_state() {
+        let store = Arc::new(InMemoryChunkStore::new(7));
+        let world = WorldService::new(7, store.clone());
+        let edit_position = WorldPos { x: 2, y: 82, z: 2 };
+        let chunk_pos = ChunkPos::from_world(edit_position);
+        let base_block = world
+            .chunk(chunk_pos)
+            .await
+            .unwrap()
+            .voxel(LocalVoxelPos { x: 2, y: 82, z: 2 })
+            .block;
+
+        world
+            .apply_block_edit(edit_position, BlockId::Glass)
+            .await
+            .unwrap();
+        assert!(store.has_persisted_chunk(chunk_pos).await);
+        assert!(store.has_cached_chunk(chunk_pos).await);
+
+        world
+            .apply_block_edit(edit_position, base_block)
+            .await
+            .unwrap();
+
+        assert!(!store.has_persisted_chunk(chunk_pos).await);
+        assert!(!store.has_cached_chunk(chunk_pos).await);
+        assert!(world.chunk_override(chunk_pos).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn persistence_status_reports_cache_and_override_counts() {
+        let store = Arc::new(InMemoryChunkStore::new(7));
+        let world = WorldService::new(7, store.clone());
+
+        world
+            .apply_block_edit(WorldPos { x: 3, y: 83, z: 3 }, BlockId::Glass)
+            .await
+            .unwrap();
+
+        let status = world.persistence_status().await.unwrap();
+
+        assert_eq!(status.world_seed, 7);
+        assert_eq!(status.persisted_chunk_count, 1);
+        assert_eq!(status.cache_namespace, "test");
+        assert!(status.cache_connected);
+    }
+
     #[test]
     fn reach_gate_allows_nearby_positions() {
         let player_position = [0.5, 89.4, 0.5];
-        assert!(within_reach(player_position, WorldPos { x: 2, y: 91, z: -3 }));
-        assert!(!within_reach(player_position, WorldPos { x: 20, y: 91, z: 0 }));
+        assert!(within_reach(
+            player_position,
+            WorldPos { x: 2, y: 91, z: -3 }
+        ));
+        assert!(!within_reach(
+            player_position,
+            WorldPos { x: 20, y: 91, z: 0 }
+        ));
     }
 
     #[test]

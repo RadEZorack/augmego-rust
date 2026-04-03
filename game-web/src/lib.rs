@@ -107,8 +107,10 @@ const WILD_PET_TARGET_REACHED_DISTANCE: f32 = 1.55;
 const WILD_PET_SLOW_RADIUS: f32 = 1.4;
 const WILD_PET_MIN_WANDER_DISTANCE: f32 = 3.0;
 const WILD_PET_MAX_WANDER_DISTANCE: f32 = 10.0;
-const WILD_PET_CAPTURE_BOX_RADIUS: f32 = 0.6;
-const WILD_PET_CAPTURE_BOX_HEIGHT: f32 = 1.15;
+const WILD_PET_CAPTURE_TARGET_DISTANCE: f32 = 7.5;
+const WILD_PET_CAPTURE_BOX_RADIUS: f32 = 0.95;
+const WILD_PET_CAPTURE_BOX_HEIGHT: f32 = 1.45;
+const WILD_PET_CAPTURE_BOX_FOOT_PADDING: f32 = 0.2;
 const PET_SLOT_OFFSETS: [(f32, f32); PET_FOLLOWER_COUNT] = [
     (-1.0, 3.3),
     (1.0, 3.3),
@@ -2306,7 +2308,7 @@ impl WebApp {
         for (&pet_id, pet) in &self.wild_pets {
             let min = Vec3::new(
                 pet.position.x - WILD_PET_CAPTURE_BOX_RADIUS,
-                pet.position.y,
+                pet.position.y - WILD_PET_CAPTURE_BOX_FOOT_PADDING,
                 pet.position.z - WILD_PET_CAPTURE_BOX_RADIUS,
             );
             let max = Vec3::new(
@@ -2318,7 +2320,7 @@ impl WebApp {
             else {
                 continue;
             };
-            if distance > 6.0 {
+            if distance > WILD_PET_CAPTURE_TARGET_DISTANCE {
                 continue;
             }
             if best_hit

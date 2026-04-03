@@ -124,7 +124,7 @@ const REMOTE_AVATAR_RUN_SPEED_THRESHOLD: f32 = 0.15;
 const REMOTE_AVATAR_IDLE_DELAY_SECS: f32 = 0.35;
 const REMOTE_AVATAR_DANCE_DELAY_SECS: f32 = 5.0;
 const AUTH_STATUS_CHECKING: &str = "Checking your sign-in session...";
-const AUTH_STATUS_SIGNED_OUT: &str = "Sign in with SSO, or continue as a guest.";
+const AUTH_STATUS_SIGNED_OUT: &str = "Sign in with Google, or continue as a guest.";
 
 #[derive(Clone, Debug)]
 struct AuthUser {
@@ -1017,13 +1017,13 @@ impl WebApp {
         let active_count = self.captured_pets.iter().filter(|pet| pet.active).count();
         let summary = if self.captured_pets.is_empty() {
             if self.can_capture_generated_pets() {
-                "No captured dogs yet".to_string()
+                "No captured pets yet".to_string()
             } else {
-                "Sign in to build your pack".to_string()
+                "Sign in to build your party".to_string()
             }
         } else {
             format!(
-                "{} captured dog{}",
+                "{} captured pet{}",
                 self.captured_pets.len(),
                 if self.captured_pets.len() == 1 {
                     ""
@@ -1034,7 +1034,7 @@ impl WebApp {
         };
         let details = if self.captured_pets.is_empty() {
             if self.can_capture_generated_pets() {
-                "Explore and left click a wild dog to capture it.".to_string()
+                "Explore and left click a wild animal to capture it.".to_string()
             } else {
                 "Guests can explore, but capture is saved only for signed-in players.".to_string()
             }
@@ -1141,7 +1141,6 @@ impl WebApp {
                                 self.logged_in = true;
                                 self.login_request_sent = false;
                                 self.player_id = Some(response.player_id);
-                                self.pending_network_events.clear();
                                 self.remote_players.clear();
                                 self.remote_player_latest_ticks.clear();
                                 self.remote_player_velocities.clear();
@@ -4143,7 +4142,7 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
         "margin:0 0 18px 0;color:rgba(230,237,243,0.78);font-size:15px;line-height:1.5;",
     );
     body_copy.set_text_content(Some(
-        "Sign in with the web account flow before the game client joins multiplayer.",
+        "Sign in with Google for saved pets and avatars, or continue as a guest to explore.",
     ));
     let _ = card.append_child(&body_copy);
 
@@ -4159,11 +4158,7 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
     let _ = buttons.set_attribute("style", "display:grid;gap:10px;");
 
     let mut onclicks = Vec::new();
-    for (provider, label) in [
-        ("google", "Continue With Google"),
-        ("apple", "Continue With Apple"),
-        ("linkedin", "Continue With LinkedIn"),
-    ] {
+    for (provider, label) in [("google", "Continue With Google")] {
         let button = document
             .create_element("button")
             .expect("auth provider button");
@@ -5879,7 +5874,7 @@ fn start_mesh_worker_pool(
     let mut onmessages = Vec::with_capacity(worker_count);
 
     for _ in 0..worker_count {
-        let worker = Worker::new("mesh-worker.js")
+        let worker = Worker::new("/play/mesh-worker.js")
             .map_err(|error| anyhow::anyhow!("create mesh worker: {error:?}"))?;
         let tx = tx.clone();
         let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {

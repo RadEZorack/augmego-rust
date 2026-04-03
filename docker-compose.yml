@@ -16,55 +16,43 @@ services:
       timeout: 5s
       retries: 20
 
-  next-web:
-    build:
-      context: .
-      dockerfile: apps/web/Dockerfile
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/augmego?schema=public
-      WEB_BASE_URL: http://localhost:3001
-      NEXTAUTH_URL: http://localhost:3001
-      AUTH_SECRET: replace-me-for-production
-      PORT: "3000"
-      COOKIE_SAMESITE: Lax
-      COOKIE_SECURE: "false"
-      WORLD_STORAGE_PROVIDER: local
-      WORLD_STORAGE_ROOT: ../../storage/world-assets
-      PET_POOL_TARGET: "30"
-      GAME_BACKEND_AUTH_SECRET: ${GAME_BACKEND_AUTH_SECRET:-dev-only-game-backend-secret}
-      BACKEND_SERVICE_TOKEN: ${BACKEND_SERVICE_TOKEN:-dev-only-backend-service-token}
-      MESHY_API_KEY: ${MESHY_API_KEY:-}
-    ports:
-      - "3001:3000"
-    volumes:
-      - next-storage:/app/storage
-
-  voxel-backend:
+  rust-app:
     build:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
     depends_on:
-      next-web:
-        condition: service_started
+      postgres:
+        condition: service_healthy
     environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/augmego
+      PUBLIC_BASE_URL: http://localhost:4000
       BACKEND_BIND_ADDR: 0.0.0.0:4000
-      BACKEND_WS_BIND_ADDR: 0.0.0.0:4001
+      COOKIE_SAMESITE: Lax
+      COOKIE_SECURE: "false"
+      ASSET_STORAGE_PROVIDER: local
+      ASSET_STORAGE_ROOT: /data/storage
+      ASSET_STORAGE_NAMESPACE: world-assets
+      SPACES_BUCKET: ${SPACES_BUCKET:-}
+      SPACES_ENDPOINT: ${SPACES_ENDPOINT:-}
+      SPACES_CUSTOM_DOMAIN: ${SPACES_CUSTOM_DOMAIN:-}
+      SPACES_ACCESS_KEY_ID: ${SPACES_ACCESS_KEY_ID:-}
+      SPACES_SECRET_ACCESS_KEY: ${SPACES_SECRET_ACCESS_KEY:-}
+      SPACES_REGION: ${SPACES_REGION:-}
+      BACKEND_STATIC_ROOT: /app/static
       BACKEND_SAVE_PATH: /data/world
-      BACKEND_WEB_API_BASE_URL: http://next-web:3000/api/v1
-      BACKEND_SERVICE_TOKEN: ${BACKEND_SERVICE_TOKEN:-dev-only-backend-service-token}
+      PET_POOL_TARGET: "30"
       GAME_BACKEND_AUTH_SECRET: ${GAME_BACKEND_AUTH_SECRET:-dev-only-game-backend-secret}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      MESHY_API_KEY: ${MESHY_API_KEY:-}
     ports:
       - "4000:4000"
-      - "4001:4001"
     volumes:
       - world-data:/data/world
+      - asset-data:/data/storage
 
 volumes:
   postgres-data:
-  next-storage:
   world-data:
+  asset-data:

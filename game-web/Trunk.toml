@@ -1,13 +1,13 @@
 [build]
 target = "index.html"
-dist = "../apps/web/public/play"
+dist = "../backend/static/play"
 public_url = "/play/"
 
 [[proxy]]
 rewrite = "/api/"
-backend = "http://127.0.0.1:3000/api/"
+backend = "http://127.0.0.1:4000/api/"
 
 [[proxy]]
 rewrite = "/ws"
-backend = "ws://127.0.0.1:4001"
+backend = "ws://127.0.0.1:4000/ws"
 ws = true

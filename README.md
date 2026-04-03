@@ -1,138 +1,265 @@
-# Augmego Web + Rust Voxel Stack
+# Augmego Single-Binary Rust Platform
 
-Augmego now runs as a two-runtime system:
+Augmego now runs as one Rust application server backed by Postgres.
 
-- `apps/web`: Next.js app for browser-facing pages, auth, API routes, and the `/play` shell
-- `backend`: authoritative Rust voxel server for world simulation and realtime websocket transport
+The Rust server owns:
 
-The Rust `game-web` client is still the game client, but it is no longer treated as a separate deployed frontend service. Trunk builds it into `apps/web/public/play`, and Next serves it on the same origin.
+- browser routes like `/`, `/learn`, and `/play`
+- cookie sessions and Google sign-in
+- avatar APIs
+- the pet reservoir and capture flow
+- static serving for the Rust/WASM client bundle
+- the authoritative WebSocket game runtime at `/ws`
+
+The `game-web` crate is still the browser game client, but it is no longer deployed as a separate frontend service. Trunk builds it into the backend’s static directory, and the Rust server serves it on the same origin.
 
 ## Workspace Layout
 
-- `apps/web`: Next.js App Router app, Auth.js integration, Prisma-backed web APIs
-- `backend`: Rust authoritative voxel backend and websocket server
-- `game-web`: Rust/WASM client bundle built by Trunk into `apps/web/public/play`
-- `prisma`: shared Prisma schema and migrations for the web/auth data model
-- `shared_math`: voxel/world coordinate math and helpers
-- `shared_world`: chunk storage, palette compression, world serialization, terrain generation
+- `backend`: the single product server, SQL migrations, auth, pets, storage, and world runtime
+- `backend/migrations`: Rust-managed Postgres schema
+- `backend/static/play`: Trunk output for the Rust/WASM client
+- `game-web`: Rust/WASM browser client
+- `shared_math`: world math and coordinate helpers
+- `shared_world`: chunk storage, terrain generation, and voxel data structures
 - `shared_protocol`: binary client/server protocol
-- `shared_content`: block definitions and starter crafting recipes
-- `wgpu-lite`: local rendering wrapper over `wgpu`
-- `bun-backend`: legacy Bun service kept as reference while migration finishes
+- `shared_content`: block definitions and starter content
+- `wgpu-lite`: local rendering wrapper used by the WASM client
+- `apps/web`: legacy Next.js code kept only as reference during migration
+- `prisma`: legacy schema/history kept only as reference during migration
+- `bun-backend`: legacy reference service
 
-## Local Dev
+## Quick Start
 
-Start local infrastructure:
-
-```bash
-./scripts/dev-up.sh
-```
-
-That brings up:
-
-- Postgres on `localhost:5432`
-- the local HTTPS reverse proxy for `https://dev.augmego.ca`
-
-Then run these in separate terminals:
+### 1. Start Postgres
 
 ```bash
-cd apps/web
-npm install
-npm run dev
+docker compose up -d postgres
 ```
 
-```bash
-BACKEND_BIND_ADDR=0.0.0.0:4000 BACKEND_WS_BIND_ADDR=0.0.0.0:4001 cargo run -p backend
-```
-
-```bash
-cd apps/web
-npm run game:watch
-```
-
-Then open:
+The default Rust server config expects:
 
 ```text
-https://dev.augmego.ca
+postgresql://postgres:postgres@127.0.0.1:5432/augmego
 ```
 
-The local flow now works like this:
-
-- nginx in Docker terminates HTTPS for `dev.augmego.ca`
-- `/` proxies to local Next.js on `http://127.0.0.1:3000`
-- `/api/*` proxies to local Next.js on `http://127.0.0.1:3000`
-- `/ws` proxies to the Rust voxel websocket on `ws://127.0.0.1:4001`
-
-The Rust/WASM bundle is served by Next from `apps/web/public/play`. `npm run game:watch` keeps that bundle fresh while `next dev` serves it on `/play`.
-
-Before local HTTPS works, you still need:
-
-1. A hosts entry:
-   `127.0.0.1 dev.augmego.ca`
-2. Local TLS certs as described in `dev-proxy/README.md`
-3. Web env values in `apps/web/.env.example`
-
-You can sanity-check the setup with:
+### 2. Install WASM build tooling
 
 ```bash
-./scripts/dev-check.sh
+cargo install trunk --locked
+rustup target add wasm32-unknown-unknown
 ```
 
-## Prisma
+### 3. Configure environment
 
-Prisma ownership now lives at the repo root:
-
-- schema: `prisma/schema.prisma`
-- migrations: `prisma/migrations/*`
-
-The Next app generates its client from that shared schema:
-
-```bash
-cd apps/web
-npm run prisma:generate
-```
-
-The legacy Bun service can still be pointed at the same schema with its updated scripts, but it is no longer part of the default runtime path.
-
-## Game Route
-
-The canonical browser entrypoint for the Rust/WASM client is now:
+Create a repo-root `.env` from:
 
 ```text
-/play
+.env.example
 ```
 
-Next redirects `/play` to the generated Trunk bundle at `/play/index.html`, and Trunk emits all related assets under `/play/*`.
+At minimum, Google sign-in needs:
 
-## Docker Compose
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `PUBLIC_BASE_URL`
+- `GAME_BACKEND_AUTH_SECRET`
 
-The production-oriented compose stack is now:
+During migration, the Rust server will also fall back to `apps/web/.env` if it exists, so older local setups still work.
 
-- `postgres`
-- `next-web`
-- `voxel-backend`
+### 4. Build or watch the game client
 
-Bring it up with:
+For a one-off build:
+
+```bash
+cd game-web
+trunk build --release
+```
+
+For active frontend work:
+
+```bash
+cd game-web
+trunk watch
+```
+
+`game-web/Trunk.toml` writes the bundle to:
+
+```text
+backend/static/play
+```
+
+### 5. Run the Rust server
+
+```bash
+BACKEND_BIND_ADDR=0.0.0.0:4000 cargo run -p backend
+```
+
+Open:
+
+```text
+http://localhost:4000
+```
+
+The game client lives at:
+
+```text
+http://localhost:4000/play
+```
+
+## Important Runtime Change
+
+There is no separate websocket port anymore.
+
+Do not use:
+
+```bash
+BACKEND_WS_BIND_ADDR=0.0.0.0:4001
+```
+
+The WebSocket endpoint now shares the same Rust server:
+
+```text
+ws://localhost:4000/ws
+```
+
+## Full Docker Stack
+
+To run the production-style local stack:
 
 ```bash
 docker compose up --build
 ```
 
-Then open:
+This starts:
 
-```text
-http://localhost:3001
-```
+- `postgres`
+- `rust-app`
 
 Published ports:
 
-- `3001`: Next.js app
-- `4000`: Rust TCP backend
-- `4001`: Rust websocket backend
+- `4000`: Rust app server, API routes, static game client, and WebSocket endpoint
 - `5432`: Postgres
 
-## Compatibility Notes
+Open:
 
-- The Rust client still talks to `/api/v1/auth/*`, so the multiplayer login flow does not need a client-side API rewrite.
-- `/ws` remains the authoritative realtime websocket endpoint owned by the Rust backend.
-- `bun-backend` is intentionally left in the repo as a legacy reference, but it is deprecated for normal dev and deploy flows.
+```text
+http://localhost:4000
+```
+
+## Environment
+
+### Core
+
+- `BACKEND_BIND_ADDR`
+- `DATABASE_URL`
+- `PUBLIC_BASE_URL`
+- `BACKEND_SAVE_PATH`
+- `BACKEND_STATIC_ROOT`
+
+### Auth
+
+- `COOKIE_SAMESITE`
+- `COOKIE_SECURE`
+- `SESSION_COOKIE_NAME`
+- `SESSION_COOKIE_TTL_SECS`
+- `GAME_BACKEND_AUTH_SECRET`
+- `GAME_AUTH_TTL_SECS`
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_SCOPE`
+
+### Pets / Meshy
+
+- `PET_POOL_TARGET`
+- `PET_GENERATION_WORKER_INTERVAL_SECS`
+- `PET_GENERATION_POLL_INTERVAL_SECS`
+- `PET_GENERATION_MAX_ATTEMPTS`
+- `MESHY_API_KEY`
+- `MESHY_API_BASE_URL`
+- `MESHY_TEXT_TO_3D_MODEL`
+- `MESHY_TEXT_TO_3D_ENABLE_REFINE`
+- `MESHY_TEXT_TO_3D_REFINE_MODEL`
+- `MESHY_TEXT_TO_3D_ENABLE_PBR`
+- `MESHY_TEXT_TO_3D_TOPOLOGY`
+- `MESHY_TEXT_TO_3D_TARGET_POLYCOUNT`
+
+### Storage
+
+Local storage is the default.
+
+- `ASSET_STORAGE_PROVIDER=local`
+- `ASSET_STORAGE_ROOT`
+- `ASSET_STORAGE_NAMESPACE`
+
+To use DigitalOcean Spaces instead:
+
+- `ASSET_STORAGE_PROVIDER=spaces`
+- `SPACES_BUCKET`
+- `SPACES_ENDPOINT`
+- `SPACES_CUSTOM_DOMAIN`
+- `SPACES_ACCESS_KEY_ID`
+- `SPACES_SECRET_ACCESS_KEY`
+- `SPACES_REGION`
+
+When Spaces is configured, the Rust server uploads avatar and pet GLBs directly to the S3-compatible endpoint and serves public URLs from there.
+
+## Database
+
+Database ownership is now Rust-first.
+
+- schema and bootstrap live in `backend/migrations`
+- migrations are applied by `backend/src/db.rs` at server startup
+- Prisma is no longer part of the active runtime path
+
+The fresh Rust schema currently covers:
+
+- `users`
+- `auth_identities`
+- `sessions`
+- `avatar_slots`
+- `pets`
+
+## Routes
+
+Main browser routes:
+
+- `/`
+- `/learn`
+- `/play`
+
+API routes:
+
+- `/api/v1/health`
+- `/api/v1/auth/google`
+- `/api/v1/auth/google/callback`
+- `/api/v1/auth/logout`
+- `/api/v1/auth/me`
+- `/api/v1/auth/profile`
+- `/api/v1/auth/player-avatar`
+- `/api/v1/auth/player-avatar/upload`
+- `/api/v1/auth/player-avatar/upload-url`
+- `/api/v1/users/{userId}/player-avatar/{slot}/file`
+- `/api/v1/pets/{petId}/file`
+
+Realtime:
+
+- `/ws`
+
+## Verification
+
+Useful checks:
+
+```bash
+cargo check -p backend
+```
+
+```bash
+cargo check --target wasm32-unknown-unknown -p game-web
+```
+
+## Notes
+
+- Guest mode still works.
+- Signed-in users receive a short-lived game auth token from `/api/v1/auth/me`.
+- The newest six captured pets become active followers automatically.
+- World/chunk persistence remains file-backed in Rust; Postgres is used for account and gameplay metadata.

@@ -24,7 +24,6 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-const PET_BASE_PROMPT: &str = "a cute dog";
 const PET_ACTIVE_FOLLOWER_LIMIT: usize = 6;
 const PET_GENERATION_START_BUDGET: i64 = 3;
 const PET_GENERATION_POLL_BUDGET: i64 = 4;
@@ -37,33 +36,122 @@ const SIZE_TRAITS: &[TraitOption] = &[
     TraitOption::new("lean", "Lean", "lean athletic build"),
     TraitOption::new("puffy", "Puffy", "slightly puffy proportions"),
 ];
-const COAT_TRAITS: &[TraitOption] = &[
+const COLOR_TRAITS: &[TraitOption] = &[
+    TraitOption::new("golden", "Golden", "golden coloring"),
+    TraitOption::new("cream", "Cream", "cream coloring"),
+    TraitOption::new("cocoa", "Cocoa", "warm cocoa-brown coloring"),
+    TraitOption::new("snow", "Snowy", "snow-white coloring"),
+    TraitOption::new("speckled", "Speckled", "speckled markings"),
+];
+const ACCESSORY_TRAITS: &[TraitOption] = &[
+    TraitOption::new("bandana", "Bandana", "wearing a tiny bandana"),
+    TraitOption::new("bowtie", "Bowtie", "wearing a neat little bow tie"),
+    TraitOption::new("scarf", "Scarf", "wearing a cozy scarf"),
+    TraitOption::new("charm", "Charm", "wearing a shiny charm accessory"),
+    TraitOption::new("none", "Classic", "simple accessory-free look"),
+];
+
+const DOG_SURFACE_TRAITS: &[TraitOption] = &[
     TraitOption::new("fluffy", "Fluffy", "fluffy fur"),
     TraitOption::new("curly", "Curly", "soft curly fur"),
     TraitOption::new("smooth", "Smooth", "smooth short fur"),
     TraitOption::new("shaggy", "Shaggy", "shaggy layered fur"),
     TraitOption::new("silky", "Silky", "silky fur"),
 ];
-const COLOR_TRAITS: &[TraitOption] = &[
-    TraitOption::new("golden", "Golden", "golden fur accents"),
-    TraitOption::new("cream", "Cream", "cream fur"),
-    TraitOption::new("cocoa", "Cocoa", "warm cocoa-brown fur"),
-    TraitOption::new("snow", "Snowy", "snow-white fur"),
-    TraitOption::new("speckled", "Speckled", "speckled fur markings"),
-];
-const BREED_TRAITS: &[TraitOption] = &[
+const DOG_STYLE_TRAITS: &[TraitOption] = &[
     TraitOption::new("beagle", "Beagle", "beagle-inspired face"),
     TraitOption::new("corgi", "Corgi", "corgi-inspired proportions"),
     TraitOption::new("pomeranian", "Pomeranian", "pomeranian-inspired fluff"),
     TraitOption::new("spaniel", "Spaniel", "spaniel-inspired ears"),
     TraitOption::new("terrier", "Terrier", "terrier-inspired muzzle"),
 ];
-const ACCESSORY_TRAITS: &[TraitOption] = &[
-    TraitOption::new("bandana", "Bandana", "wearing a tiny bandana"),
-    TraitOption::new("bow", "Bow", "wearing a small bow collar"),
-    TraitOption::new("scarf", "Scarf", "wearing a cozy scarf"),
-    TraitOption::new("tag", "Tag", "wearing a round name tag collar"),
-    TraitOption::new("none", "Classic", "simple collar-free look"),
+
+const CAT_SURFACE_TRAITS: &[TraitOption] = &[
+    TraitOption::new("plush", "Plush", "plush soft fur"),
+    TraitOption::new("sleek", "Sleek", "sleek short fur"),
+    TraitOption::new("wispy", "Wispy", "wispy long fur"),
+    TraitOption::new("velvet", "Velvet", "velvety smooth coat"),
+    TraitOption::new("tufted", "Tufted", "tufted cheek and ear fur"),
+];
+const CAT_STYLE_TRAITS: &[TraitOption] = &[
+    TraitOption::new("tabby", "Tabby", "tabby-inspired face and markings"),
+    TraitOption::new("siamese", "Siamese", "siamese-inspired face"),
+    TraitOption::new("persian", "Persian", "persian-inspired fluffy cheeks"),
+    TraitOption::new("mainecoon", "Maine Coon", "maine coon-inspired mane"),
+    TraitOption::new("bengal", "Bengal", "bengal-inspired markings"),
+];
+
+const BIRD_SURFACE_TRAITS: &[TraitOption] = &[
+    TraitOption::new("downy", "Downy", "soft downy feathers"),
+    TraitOption::new("sleek", "Sleek", "sleek glossy feathers"),
+    TraitOption::new("layered", "Layered", "layered wing feathers"),
+    TraitOption::new("puffy", "Puffy", "puffy chest feathers"),
+    TraitOption::new("tailfan", "Fan-Tail", "distinctive fan tail feathers"),
+];
+const BIRD_STYLE_TRAITS: &[TraitOption] = &[
+    TraitOption::new("parakeet", "Parakeet", "parakeet-inspired proportions"),
+    TraitOption::new("finch", "Finch", "finch-inspired silhouette"),
+    TraitOption::new("cockatiel", "Cockatiel", "cockatiel-inspired crest"),
+    TraitOption::new("owlet", "Owlet", "owlet-inspired round face"),
+    TraitOption::new("toucan", "Toucan", "toucan-inspired beak"),
+];
+
+const ALLIGATOR_SURFACE_TRAITS: &[TraitOption] = &[
+    TraitOption::new("smoothscale", "Smoothscale", "smooth rounded scales"),
+    TraitOption::new("pebbled", "Pebbled", "tiny pebbled scales"),
+    TraitOption::new("ridged", "Ridged", "gentle ridged scales"),
+    TraitOption::new("mossy", "Mossy", "mossy textured scales"),
+    TraitOption::new("glossy", "Glossy", "glossy polished scales"),
+];
+const ALLIGATOR_STYLE_TRAITS: &[TraitOption] = &[
+    TraitOption::new("hatchling", "Hatchling", "playful baby alligator proportions"),
+    TraitOption::new("river", "River", "river alligator-inspired snout"),
+    TraitOption::new("swamp", "Swamp", "swamp alligator-inspired body"),
+    TraitOption::new("chunky", "Chunky", "chunky cartoon alligator proportions"),
+    TraitOption::new("snubsnout", "Snub-Snout", "cute shorter alligator snout"),
+];
+
+const PET_SPECIES: &[SpeciesOption] = &[
+    SpeciesOption::new(
+        "dog",
+        "Dog",
+        "a cute dog",
+        "cute stylized puppy character",
+        "cute expressive dog face",
+        "unique from other generated dogs",
+        DOG_SURFACE_TRAITS,
+        DOG_STYLE_TRAITS,
+    ),
+    SpeciesOption::new(
+        "cat",
+        "Cat",
+        "a cute cat",
+        "cute stylized kitten character",
+        "cute expressive cat face",
+        "unique from other generated cats",
+        CAT_SURFACE_TRAITS,
+        CAT_STYLE_TRAITS,
+    ),
+    SpeciesOption::new(
+        "bird",
+        "Bird",
+        "a cute bird",
+        "cute stylized little bird character",
+        "cute expressive bird face",
+        "unique from other generated birds",
+        BIRD_SURFACE_TRAITS,
+        BIRD_STYLE_TRAITS,
+    ),
+    SpeciesOption::new(
+        "alligator",
+        "Alligator",
+        "a cute alligator",
+        "cute stylized baby alligator character",
+        "cute expressive alligator face",
+        "unique from other generated alligators",
+        ALLIGATOR_SURFACE_TRAITS,
+        ALLIGATOR_STYLE_TRAITS,
+    ),
 ];
 
 #[derive(Clone, Debug)]
@@ -118,8 +206,45 @@ impl TraitOption {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SpeciesOption {
+    key: &'static str,
+    label: &'static str,
+    base_prompt: &'static str,
+    body_prompt: &'static str,
+    face_prompt: &'static str,
+    uniqueness_prompt: &'static str,
+    surface_traits: &'static [TraitOption],
+    style_traits: &'static [TraitOption],
+}
+
+impl SpeciesOption {
+    const fn new(
+        key: &'static str,
+        label: &'static str,
+        base_prompt: &'static str,
+        body_prompt: &'static str,
+        face_prompt: &'static str,
+        uniqueness_prompt: &'static str,
+        surface_traits: &'static [TraitOption],
+        style_traits: &'static [TraitOption],
+    ) -> Self {
+        Self {
+            key,
+            label,
+            base_prompt,
+            body_prompt,
+            face_prompt,
+            uniqueness_prompt,
+            surface_traits,
+            style_traits,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PetVariation {
+    base_prompt: String,
     variation_key: String,
     display_name: String,
     effective_prompt: String,
@@ -500,7 +625,7 @@ impl PetRegistryClient {
             )
             .bind(Uuid::new_v4())
             .bind(variation.display_name)
-            .bind(PET_BASE_PROMPT)
+            .bind(variation.base_prompt)
             .bind(variation.effective_prompt)
             .bind(variation.variation_key)
             .execute(&self.pool)
@@ -1063,7 +1188,7 @@ fn should_retry_with_meshy_6(message: &str) -> bool {
         && normalized.contains("meshy-6")
 }
 
-fn build_variation_key(indices: &[usize; 5]) -> String {
+fn build_variation_key(indices: &[usize]) -> String {
     indices
         .iter()
         .map(|value| value.to_string())
@@ -1650,45 +1775,51 @@ fn align_bin_len(bin: &mut Vec<u8>) -> usize {
 
 fn random_variation() -> PetVariation {
     let seed = Uuid::new_v4().as_u128();
+    let species_index = (seed % PET_SPECIES.len() as u128) as usize;
+    let species = PET_SPECIES[species_index];
     let indices = [
-        (seed % SIZE_TRAITS.len() as u128) as usize,
-        ((seed / 11) % COAT_TRAITS.len() as u128) as usize,
-        ((seed / 23) % COLOR_TRAITS.len() as u128) as usize,
-        ((seed / 37) % BREED_TRAITS.len() as u128) as usize,
-        ((seed / 53) % ACCESSORY_TRAITS.len() as u128) as usize,
+        species_index,
+        ((seed / 11) % SIZE_TRAITS.len() as u128) as usize,
+        ((seed / 23) % species.surface_traits.len() as u128) as usize,
+        ((seed / 37) % COLOR_TRAITS.len() as u128) as usize,
+        ((seed / 53) % species.style_traits.len() as u128) as usize,
+        ((seed / 71) % ACCESSORY_TRAITS.len() as u128) as usize,
     ];
-    let variation_key = build_variation_key(&indices);
-    let size = SIZE_TRAITS[indices[0]];
-    let coat = COAT_TRAITS[indices[1]];
-    let color = COLOR_TRAITS[indices[2]];
-    let breed = BREED_TRAITS[indices[3]];
-    let accessory = ACCESSORY_TRAITS[indices[4]];
-    let display_name = [size.label, coat.label, color.label, breed.label].join(" ");
+    let variation_key = format!("{}-{}", species.key, build_variation_key(&indices[1..]));
+    let size = SIZE_TRAITS[indices[1]];
+    let surface = species.surface_traits[indices[2]];
+    let color = COLOR_TRAITS[indices[3]];
+    let style = species.style_traits[indices[4]];
+    let accessory = ACCESSORY_TRAITS[indices[5]];
+    let display_name = [size.label, color.label, style.label, species.label].join(" ");
     let effective_prompt = [
-        PET_BASE_PROMPT,
+        species.base_prompt,
         "adorable stylized 3d game-ready animal",
+        species.body_prompt,
         size.prompt,
-        coat.prompt,
+        surface.prompt,
         color.prompt,
-        breed.prompt,
+        style.prompt,
         accessory.prompt,
         "single centered character",
         "full body",
         "clean silhouette",
-        "cute expressive face",
-        "unique from other generated dogs",
+        species.face_prompt,
+        species.uniqueness_prompt,
     ]
     .join(", ");
     let _variation_slug = [
+        species.key,
         size.key,
-        coat.key,
+        surface.key,
         color.key,
-        breed.key,
+        style.key,
         accessory.key,
     ]
     .join("-");
 
     PetVariation {
+        base_prompt: species.base_prompt.to_string(),
         variation_key,
         display_name,
         effective_prompt,

@@ -1017,13 +1017,13 @@ impl WebApp {
         let active_count = self.captured_pets.iter().filter(|pet| pet.active).count();
         let summary = if self.captured_pets.is_empty() {
             if self.can_capture_generated_pets() {
-                "No captured dogs yet".to_string()
+                "No captured pets yet".to_string()
             } else {
-                "Sign in to build your pack".to_string()
+                "Sign in to build your party".to_string()
             }
         } else {
             format!(
-                "{} captured dog{}",
+                "{} captured pet{}",
                 self.captured_pets.len(),
                 if self.captured_pets.len() == 1 {
                     ""
@@ -1034,7 +1034,7 @@ impl WebApp {
         };
         let details = if self.captured_pets.is_empty() {
             if self.can_capture_generated_pets() {
-                "Explore and left click a wild dog to capture it.".to_string()
+                "Explore and left click a wild animal to capture it.".to_string()
             } else {
                 "Guests can explore, but capture is saved only for signed-in players.".to_string()
             }

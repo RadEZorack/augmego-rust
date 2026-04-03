@@ -533,10 +533,12 @@ struct WebApp {
     player_avatar_panel: Element,
     player_avatar_modal: Element,
     player_avatar_panel_status: Element,
+    logout_button: Element,
     server_ready_for_login: bool,
     login_request_sent: bool,
     _auth_button_onclicks: Vec<Closure<dyn FnMut(WebEvent)>>,
     _player_avatar_panel_onclick: Closure<dyn FnMut(WebEvent)>,
+    _logout_button_onclick: Closure<dyn FnMut(WebEvent)>,
     mesh_result_rx: Receiver<MeshBuildResult>,
     workers: Vec<Worker>,
     next_worker_index: usize,
@@ -582,6 +584,7 @@ impl WebApp {
             player_avatar_panel_status,
             player_avatar_panel_onclick,
         ) = create_player_avatar_panel();
+        let (logout_button, logout_button_onclick) = create_logout_button();
         update_hotbar_ui(&hotbar_slots, &hotbar_blocks, 0);
         let current_chunk = chunk_from_world_position(camera.position);
         let desired_chunks = HashSet::new();
@@ -671,10 +674,12 @@ impl WebApp {
             player_avatar_panel,
             player_avatar_modal,
             player_avatar_panel_status,
+            logout_button,
             server_ready_for_login: false,
             login_request_sent: false,
             _auth_button_onclicks: auth_button_onclicks,
             _player_avatar_panel_onclick: player_avatar_panel_onclick,
+            _logout_button_onclick: logout_button_onclick,
             mesh_result_rx,
             workers,
             next_worker_index: 0,
@@ -1402,6 +1407,7 @@ impl WebApp {
 
         self.sync_auth_overlay();
         self.sync_player_avatar_panel();
+        self.sync_logout_button();
         self.maybe_send_login_request();
     }
 
@@ -1471,6 +1477,26 @@ impl WebApp {
                 let _ = self
                     .player_avatar_modal
                     .set_attribute("style", "display:none;");
+            }
+        }
+    }
+
+    fn sync_logout_button(&self) {
+        match &self.auth_status {
+            AuthStatus::SignedIn => {
+                let label = self
+                    .auth_user
+                    .as_ref()
+                    .filter(|user| auth_user_is_guest(user))
+                    .map(|_| "Exit Guest Session")
+                    .unwrap_or("Log Out");
+                self.logout_button.set_text_content(Some(label));
+                let _ = self
+                    .logout_button
+                    .set_attribute("style", logout_button_style());
+            }
+            _ => {
+                let _ = self.logout_button.set_attribute("style", "display:none;");
             }
         }
     }
@@ -4221,6 +4247,10 @@ fn player_avatar_launcher_style() -> &'static str {
     "position:fixed;left:16px;top:16px;padding:12px 16px;border-radius:16px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:45;cursor:pointer;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;"
 }
 
+fn logout_button_style() -> &'static str {
+    "position:fixed;right:16px;top:16px;padding:12px 16px;border-radius:16px;border:1px solid rgba(247,215,148,0.28);background:linear-gradient(180deg,rgba(77,27,19,0.94),rgba(45,15,11,0.94));color:#f9d9b6;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:45;cursor:pointer;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;"
+}
+
 fn player_avatar_modal_style() -> &'static str {
     "position:fixed;inset:0;display:none;align-items:center;justify-content:center;padding:20px;background:rgba(5,8,12,0.72);backdrop-filter:blur(10px);z-index:65;"
 }
@@ -4249,6 +4279,47 @@ fn request_auth_session() -> Receiver<AuthEvent> {
         let _ = tx.send(AuthEvent::Resolved(result));
     });
     rx
+}
+
+fn create_logout_button() -> (Element, Closure<dyn FnMut(WebEvent)>) {
+    let Some(document) = document() else {
+        let closure =
+            Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        return (fallback_element(), closure);
+    };
+    let Some(body) = document.body() else {
+        let closure =
+            Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        return (fallback_element(), closure);
+    };
+
+    let button = document.create_element("button").expect("logout button");
+    button.set_text_content(Some("Log Out"));
+    let _ = button.set_attribute("style", "display:none;");
+    let _ = button.set_attribute("type", "button");
+
+    let button_for_click = button.clone();
+    let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let button = button_for_click.clone();
+        spawn_local(async move {
+            let _ = button.set_attribute("disabled", "true");
+            button.set_text_content(Some("Logging out..."));
+            match logout_auth_session().await {
+                Ok(()) => reload_current_tab(),
+                Err(error) => {
+                    button.set_text_content(Some("Log Out"));
+                    let _ = button.remove_attribute("disabled");
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.alert_with_message(&format!("Unable to log out: {error}"));
+                    }
+                }
+            }
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = button.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+
+    let _ = body.append_child(&button);
+    (button, onclick)
 }
 
 fn update_hotbar_ui(slots: &[Element], blocks: &[BlockId], selected: usize) {
@@ -4321,6 +4392,12 @@ fn navigate_current_tab(url: &str) {
     }
 }
 
+fn reload_current_tab() {
+    if let Some(window) = web_sys::window() {
+        let _ = window.location().reload();
+    }
+}
+
 fn api_base_url() -> Result<String> {
     let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
     let location = window.location();
@@ -4370,6 +4447,38 @@ async fn fetch_auth_user() -> Result<Option<AuthUser>> {
     .map_err(|error| anyhow::anyhow!("parse auth response body: {error:?}"))?;
 
     Ok(parse_auth_user(&body))
+}
+
+async fn logout_auth_session() -> Result<()> {
+    let init = RequestInit::new();
+    init.set_method("POST");
+    init.set_mode(RequestMode::Cors);
+    init.set_credentials(RequestCredentials::Include);
+
+    let request =
+        Request::new_with_str_and_init(&format!("{}/auth/logout", api_base_url()?), &init)
+            .map_err(|error| anyhow::anyhow!("build logout request: {error:?}"))?;
+    request
+        .headers()
+        .set("Accept", "application/json")
+        .map_err(|error| anyhow::anyhow!("set logout headers: {error:?}"))?;
+
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
+    let response_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| anyhow::anyhow!("fetch logout session: {error:?}"))?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("convert logout response"))?;
+
+    if !response.ok() {
+        return Err(anyhow::anyhow!(
+            "logout endpoint returned HTTP {}",
+            response.status()
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_auth_user(body: &JsValue) -> Option<AuthUser> {

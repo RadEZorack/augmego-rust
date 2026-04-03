@@ -4,8 +4,8 @@ debug/
 target/
 game-web/dist/
 game-web/.stage/
-backend/static/play/game-web-*.js
-backend/static/play/game-web-*_bg.wasm
+# Trunk writes the browser bundle into backend/static/play
+backend/static/play/*
 apps/web/.next/
 apps/web/public/play/*
 !apps/web/public/play/.gitkeep

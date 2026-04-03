@@ -244,7 +244,8 @@ The fresh Rust schema currently covers:
 
 ### DigitalOcean App Platform
 
-- Deploy a single web service using `backend/Dockerfile`.
+- Deploy from the repository root using the root `Dockerfile`.
+- Leave the app source directory blank, or set it to the repository root, so the Docker build can see `Cargo.lock`, the shared crates, `vendor/`, and `assets/`.
 - Attach one managed PostgreSQL cluster and one managed Valkey cluster.
 - Keep the app and both databases in the same region and VPC, and prefer the managed private connection strings.
 - Use the TLS-enabled Valkey connection string from DigitalOcean for `VALKEY_URL`.

@@ -67,6 +67,7 @@ const RENDER_SCALE_WARMUP: Duration = Duration::from_secs(2);
 const RENDER_SCALE_ADJUST_COOLDOWN: Duration = Duration::from_millis(900);
 const PERF_PANEL_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const REMOTE_MEDIA_UPLOAD_INTERVAL: Duration = Duration::from_millis(66);
+const PET_IMPOSTOR_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 const PLAYER_RADIUS: f32 = 0.35;
 const PLAYER_HEIGHT: f32 = 1.8;
 const PLAYER_EYE_HEIGHT: f32 = 1.62;
@@ -94,6 +95,13 @@ const REMOTE_PLAYER_HALF_HEIGHT: f32 = 0.9;
 const WEBCAM_PANEL_HALF_WIDTH: f32 = 0.55;
 const WEBCAM_PANEL_HALF_HEIGHT: f32 = 0.40;
 const PET_MODEL_DESIRED_HEIGHT: f32 = 1.2;
+const PET_MODEL_RENDER_DISTANCE: f32 = CHUNK_WIDTH as f32 * 2.75;
+const PET_IMPOSTOR_RENDER_DISTANCE: f32 = CHUNK_WIDTH as f32 * 6.0;
+const HOSTED_WILD_PET_FULL_SIM_DISTANCE: f32 = CHUNK_WIDTH as f32 * 2.5;
+const HOSTED_WILD_PET_REDUCED_UPDATE_STRIDE: u64 = 4;
+const PET_IMPOSTOR_HALF_WIDTH: f32 = 0.24;
+const PET_IMPOSTOR_HALF_HEIGHT: f32 = 0.5;
+const PET_IMPOSTOR_TILE: (u32, u32) = (2, 0);
 const PET_FOLLOWER_COUNT: usize = 6;
 const PET_FOLLOW_SPEED: f32 = 5.8;
 const PET_FOLLOW_ACCELERATION: f32 = 18.0;
@@ -428,6 +436,7 @@ async fn run() -> Result<()> {
                         visible_mesh_refs.push(mesh);
                     }
                     app.prepare_pet_assets(&renderer);
+                    app.refresh_pet_impostor_mesh(&renderer);
                     app.update_remote_media_textures(&renderer);
                     let textured_meshes = app.build_remote_media_meshes(&renderer);
                     let mut overlay_meshes = Vec::new();
@@ -441,6 +450,9 @@ async fn run() -> Result<()> {
                     let pet_mesh_draws = app.build_pet_mesh_draws(&renderer);
                     let remote_avatar_meshes = app.build_remote_avatar_meshes(&renderer);
                     let overlay_refs = overlay_meshes.iter().collect::<Vec<_>>();
+                    if let Some(mesh) = app.pet_impostor_mesh.as_ref() {
+                        visible_mesh_refs.push(mesh);
+                    }
 
                     if let Err(error) = renderer.render(
                         &visible_mesh_refs,
@@ -518,6 +530,8 @@ struct WebApp {
     pending_remote_pet_urls: HashSet<String>,
     pet_asset: Option<TexturedMesh>,
     pet_asset_attempted: bool,
+    pet_impostor_mesh: Option<Mesh>,
+    last_pet_impostor_update: Instant,
     pet_followers: Vec<PetFollowerState>,
     pet_followers_need_reset: bool,
     captured_pets: Vec<CapturedPet>,
@@ -536,6 +550,7 @@ struct WebApp {
     last_input_broadcast_at: Option<Instant>,
     last_peer_realtime_broadcast_at: Option<Instant>,
     tick_counter: u64,
+    simulation_frame_index: u64,
     transport_open: bool,
     logged_in: bool,
     network_rx: Receiver<NetworkEvent>,
@@ -667,6 +682,8 @@ impl WebApp {
             pending_remote_pet_urls: HashSet::new(),
             pet_asset: None,
             pet_asset_attempted: false,
+            pet_impostor_mesh: None,
+            last_pet_impostor_update: now,
             pet_followers: Vec::new(),
             pet_followers_need_reset: false,
             captured_pets: Vec::new(),
@@ -685,6 +702,7 @@ impl WebApp {
             last_input_broadcast_at: None,
             last_peer_realtime_broadcast_at: None,
             tick_counter: 0,
+            simulation_frame_index: 0,
             transport_open: false,
             logged_in: false,
             network_rx,
@@ -792,11 +810,13 @@ impl WebApp {
             .count();
 
         self.perf_panel.set_text_content(Some(&format!(
-            "Perf\n{fps:.0} fps | {frame_ms:.1} ms\nrender scale {render_scale:.2}\nchunks {visible_chunks}/{loaded_chunks}\nmesh {pending}/{inflight}/{completed}\nremote players {remote_players}\nvideo peers {remote_video_peers}\nnet queue {net_queue}",
+            "Perf\n{fps:.0} fps | {frame_ms:.1} ms\nrender scale {render_scale:.2}\nchunks {visible_chunks}/{loaded_chunks}\nmesh {pending}/{inflight}/{completed}\npets wild {wild_pets} hosted {hosted_pets}\nremote players {remote_players}\nvideo peers {remote_video_peers}\nnet queue {net_queue}",
             render_scale = self.render_scale,
             pending = self.pending_generation.len(),
             inflight = self.inflight_generation.len(),
             completed = self.completed_meshes.len(),
+            wild_pets = self.wild_pets.len(),
+            hosted_pets = self.hosted_wild_pets.len(),
             remote_players = self.remote_players.len(),
             net_queue = self.pending_network_events.len(),
         )));
@@ -1811,6 +1831,7 @@ impl WebApp {
         self.last_tick = now;
         let dt_secs = dt.as_secs_f32();
         self.record_frame_time(dt_secs);
+        self.simulation_frame_index = self.simulation_frame_index.wrapping_add(1);
         self.update_remote_avatar_playback(dt_secs);
 
         let mut movement = Vec3::ZERO;
@@ -2034,12 +2055,21 @@ impl WebApp {
             return;
         }
 
+        let reduced_dt_secs = dt_secs * HOSTED_WILD_PET_REDUCED_UPDATE_STRIDE as f32;
+        let simulation_frame_index = self.simulation_frame_index;
         let pet_ids = self.hosted_wild_pets.keys().copied().collect::<Vec<_>>();
         for pet_id in pet_ids {
             let Some(mut pet) = self.hosted_wild_pets.get(&pet_id).copied() else {
                 continue;
             };
-            self.update_hosted_wild_pet(&mut pet, dt_secs);
+            if self.hosted_wild_pet_uses_full_simulation(pet.feet_position) {
+                self.update_hosted_wild_pet(&mut pet, dt_secs);
+            } else if simulation_frame_index.wrapping_add(pet_id)
+                % HOSTED_WILD_PET_REDUCED_UPDATE_STRIDE
+                == 0
+            {
+                self.update_hosted_wild_pet_reduced(&mut pet, reduced_dt_secs);
+            }
             self.hosted_wild_pets.insert(pet_id, pet);
             let fallback_identity = self
                 .wild_pets
@@ -2077,6 +2107,12 @@ impl WebApp {
                     latest_tick: 0,
                 });
         }
+    }
+
+    fn hosted_wild_pet_uses_full_simulation(&self, position: Vec3) -> bool {
+        let delta = position - self.camera.position;
+        delta.length_squared()
+            <= HOSTED_WILD_PET_FULL_SIM_DISTANCE * HOSTED_WILD_PET_FULL_SIM_DISTANCE
     }
 
     fn update_hosted_wild_pet(&mut self, pet: &mut HostedWildPetState, dt_secs: f32) {
@@ -2195,6 +2231,65 @@ impl WebApp {
         if self.hosted_wild_pet_needs_reset(pet) {
             self.reset_hosted_wild_pet(pet);
         }
+    }
+
+    fn update_hosted_wild_pet_reduced(&mut self, pet: &mut HostedWildPetState, dt_secs: f32) {
+        if self.hosted_wild_pet_needs_reset(pet) {
+            self.reset_hosted_wild_pet(pet);
+            return;
+        }
+
+        if pet.idle_timer > 0.0 {
+            pet.idle_timer = (pet.idle_timer - dt_secs).max(0.0);
+            if pet.idle_timer <= 0.0 {
+                pet.wander_target = self.choose_wild_pet_wander_target(pet.feet_position);
+                pet.last_goal_distance = horizontal_distance(pet.feet_position, pet.wander_target);
+            }
+        } else if horizontal_distance(pet.feet_position, pet.wander_target)
+            <= WILD_PET_TARGET_REACHED_DISTANCE
+        {
+            pet.idle_timer = wild_pet_idle_duration();
+            pet.wander_target = pet.feet_position;
+            pet.horizontal_velocity = Vec3::ZERO;
+            pet.last_goal_distance = 0.0;
+        }
+
+        let to_target = Vec3::new(
+            pet.wander_target.x - pet.feet_position.x,
+            0.0,
+            pet.wander_target.z - pet.feet_position.z,
+        );
+        let target_distance = to_target.length();
+        let desired_velocity =
+            if pet.idle_timer > 0.0 || target_distance <= WILD_PET_TARGET_REACHED_DISTANCE {
+                Vec3::ZERO
+            } else {
+                let slow_factor = if target_distance < WILD_PET_SLOW_RADIUS {
+                    ((target_distance - WILD_PET_TARGET_REACHED_DISTANCE)
+                        / (WILD_PET_SLOW_RADIUS - WILD_PET_TARGET_REACHED_DISTANCE))
+                        .clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                to_target.normalize_or_zero() * (WILD_PET_ROAM_SPEED * slow_factor)
+            };
+
+        pet.horizontal_velocity = move_towards_vec3(
+            pet.horizontal_velocity,
+            desired_velocity,
+            WILD_PET_ROAM_ACCELERATION * dt_secs,
+        );
+        pet.horizontal_velocity.y = 0.0;
+        pet.feet_position += pet.horizontal_velocity * dt_secs;
+        pet.vertical_velocity = 0.0;
+        pet.on_ground = true;
+        pet.stuck_timer = 0.0;
+
+        if pet.horizontal_velocity.length_squared() > 0.0025 {
+            pet.yaw = pet.horizontal_velocity.x.atan2(pet.horizontal_velocity.z);
+        }
+
+        pet.last_goal_distance = horizontal_distance(pet.feet_position, pet.wander_target);
     }
 
     fn hosted_wild_pet_needs_reset(&self, pet: &HostedWildPetState) -> bool {
@@ -2421,6 +2516,12 @@ impl WebApp {
 
         let mut best_hit = None;
         for (&pet_id, pet) in &self.wild_pets {
+            let to_pet = pet.position - self.camera.position;
+            if to_pet.length_squared()
+                > WILD_PET_CAPTURE_TARGET_DISTANCE * WILD_PET_CAPTURE_TARGET_DISTANCE
+            {
+                continue;
+            }
             let min = Vec3::new(
                 pet.position.x - WILD_PET_CAPTURE_BOX_RADIUS,
                 pet.position.y - WILD_PET_CAPTURE_BOX_FOOT_PADDING,
@@ -2810,18 +2911,24 @@ impl WebApp {
         for (&player_id, pet_states) in &self.remote_pet_states {
             let identities = self.remote_player_pet_identities.get(&player_id);
             for (index, pet) in pet_states.iter().enumerate() {
+                let pet_position = Vec3::from_array(pet.position);
+                if !self.pet_should_render_model(pet_position) {
+                    continue;
+                }
                 let Some(pet_asset) =
                     self.pet_mesh_for_identity(identities.and_then(|items| items.get(index)))
                 else {
                     continue;
                 };
-                let model = Mat4::from_translation(Vec3::from_array(pet.position))
-                    * Mat4::from_rotation_y(pet.yaw);
+                let model = Mat4::from_translation(pet_position) * Mat4::from_rotation_y(pet.yaw);
                 draws.push(renderer.create_textured_draw(pet_asset, model));
             }
         }
 
         for pet in self.wild_pets.values() {
+            if !self.pet_should_render_model(pet.position) {
+                continue;
+            }
             let Some(pet_asset) = self.pet_mesh_for_identity(Some(&pet.pet_identity)) else {
                 continue;
             };
@@ -2830,6 +2937,51 @@ impl WebApp {
         }
 
         draws
+    }
+
+    fn refresh_pet_impostor_mesh(&mut self, renderer: &Renderer<'_>) {
+        let now = Instant::now();
+        if self.pet_impostor_mesh.is_some()
+            && now.duration_since(self.last_pet_impostor_update) < PET_IMPOSTOR_REFRESH_INTERVAL
+        {
+            return;
+        }
+
+        self.last_pet_impostor_update = now;
+        self.pet_impostor_mesh = self.rebuild_pet_impostor_mesh(renderer);
+    }
+
+    fn rebuild_pet_impostor_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+
+        for pet_states in self.remote_pet_states.values() {
+            for pet in pet_states {
+                let position = Vec3::from_array(pet.position);
+                if !self.pet_should_render_impostor(position)
+                    || self.pet_should_render_model(position)
+                {
+                    continue;
+                }
+                add_pet_impostor(&mut vertices, &mut indices, position, [0.82, 0.78, 0.68]);
+            }
+        }
+
+        for pet in self.wild_pets.values() {
+            if !self.pet_should_render_impostor(pet.position)
+                || self.pet_should_render_model(pet.position)
+            {
+                continue;
+            }
+            add_pet_impostor(
+                &mut vertices,
+                &mut indices,
+                pet.position,
+                pet_impostor_color(&pet.pet_identity.id),
+            );
+        }
+
+        (!vertices.is_empty()).then(|| renderer.create_mesh(&vertices, &indices))
     }
 
     fn chunk_is_visible(&self, position: ChunkPos) -> bool {
@@ -2853,6 +3005,30 @@ impl WebApp {
         let direction = to_chunk / distance.max(0.001);
         let threshold = 0.1 - (24.0 / distance).min(0.25);
         self.camera.forward().dot(direction) >= threshold
+    }
+
+    fn world_position_is_visible(&self, position: Vec3, max_distance: f32) -> bool {
+        let to_target = position - self.camera.position;
+        let distance = to_target.length();
+        if distance > max_distance {
+            return false;
+        }
+
+        if distance <= CHUNK_WIDTH as f32 {
+            return true;
+        }
+
+        let direction = to_target / distance.max(0.001);
+        let threshold = 0.05 - (16.0 / distance).min(0.2);
+        self.camera.forward().dot(direction) >= threshold
+    }
+
+    fn pet_should_render_model(&self, position: Vec3) -> bool {
+        self.world_position_is_visible(position, PET_MODEL_RENDER_DISTANCE)
+    }
+
+    fn pet_should_render_impostor(&self, position: Vec3) -> bool {
+        self.world_position_is_visible(position, PET_IMPOSTOR_RENDER_DISTANCE)
     }
 
     fn process_generation_updates(
@@ -6855,6 +7031,25 @@ fn add_box_oriented(
     );
 }
 
+fn add_pet_impostor(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    position: Vec3,
+    color: [f32; 3],
+) {
+    let center = position + Vec3::Y * PET_IMPOSTOR_HALF_HEIGHT;
+    add_box_oriented(
+        vertices,
+        indices,
+        center,
+        Vec3::new(PET_IMPOSTOR_HALF_WIDTH, 0.0, 0.0),
+        Vec3::new(0.0, PET_IMPOSTOR_HALF_HEIGHT, 0.0),
+        Vec3::new(0.0, 0.0, PET_IMPOSTOR_HALF_WIDTH),
+        color,
+        PET_IMPOSTOR_TILE,
+    );
+}
+
 fn add_face_indices(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
@@ -6913,6 +7108,17 @@ fn remote_player_color(player_id: u64) -> [f32; 3] {
     let r = 0.45 + 0.4 * (hue * std::f32::consts::TAU).sin().abs();
     let g = 0.45 + 0.4 * ((hue + 0.33) * std::f32::consts::TAU).sin().abs();
     let b = 0.45 + 0.4 * ((hue + 0.66) * std::f32::consts::TAU).sin().abs();
+    [r, g, b]
+}
+
+fn pet_impostor_color(id: &str) -> [f32; 3] {
+    let hash = id.bytes().fold(0_u32, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(u32::from(byte))
+    });
+    let hue = ((hash % 360) as f32) / 360.0;
+    let r = 0.56 + 0.2 * (hue * std::f32::consts::TAU).sin().abs();
+    let g = 0.48 + 0.16 * ((hue + 0.2) * std::f32::consts::TAU).sin().abs();
+    let b = 0.38 + 0.14 * ((hue + 0.47) * std::f32::consts::TAU).sin().abs();
     [r, g, b]
 }
 

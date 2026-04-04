@@ -65,6 +65,8 @@ const RENDER_SCALE_SLOW_FRAME_SECS: f32 = 1.0 / 45.0;
 const RENDER_SCALE_FAST_FRAME_SECS: f32 = 1.0 / 65.0;
 const RENDER_SCALE_WARMUP: Duration = Duration::from_secs(2);
 const RENDER_SCALE_ADJUST_COOLDOWN: Duration = Duration::from_millis(900);
+const PERF_PANEL_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
+const REMOTE_MEDIA_UPLOAD_INTERVAL: Duration = Duration::from_millis(66);
 const PLAYER_RADIUS: f32 = 0.35;
 const PLAYER_HEIGHT: f32 = 1.8;
 const PLAYER_EYE_HEIGHT: f32 = 1.62;
@@ -410,6 +412,7 @@ async fn run() -> Result<()> {
                             app.chunk_is_visible(*position).then_some(mesh)
                         })
                         .collect::<Vec<_>>();
+                    app.update_perf_panel(visible_meshes.len(), chunk_meshes.len());
                     let link_panel_mesh = app.build_link_panel_mesh(&renderer);
                     let mut visible_mesh_refs = visible_meshes;
                     if let Some(mesh) = &link_panel_mesh {
@@ -550,6 +553,7 @@ struct WebApp {
     remote_pet_rx: Receiver<RemotePetEvent>,
     auth_overlay: Element,
     auth_overlay_status: Element,
+    perf_panel: Element,
     captured_pets_panel: Element,
     player_avatar_panel: Element,
     player_avatar_modal: Element,
@@ -563,6 +567,7 @@ struct WebApp {
     mesh_result_rx: Receiver<MeshBuildResult>,
     workers: Vec<Worker>,
     next_worker_index: usize,
+    last_perf_panel_update: Instant,
     _worker_onmessages: Vec<Closure<dyn FnMut(MessageEvent)>>,
 }
 
@@ -599,6 +604,7 @@ impl WebApp {
         let (remote_pet_tx, remote_pet_rx) = mpsc::channel();
         let (peer_realtime_tx, peer_realtime_rx) = mpsc::channel();
         let (auth_overlay, auth_overlay_status, auth_button_onclicks) = create_auth_overlay();
+        let perf_panel = create_perf_panel();
         let captured_pets_panel = create_captured_pets_panel();
         let (
             player_avatar_panel,
@@ -613,7 +619,7 @@ impl WebApp {
         let pending_generation = VecDeque::new();
         let last_reprioritize_forward = camera.forward();
 
-        let app = Self {
+        let mut app = Self {
             canvas,
             camera,
             authoritative_chunks: HashMap::new(),
@@ -696,6 +702,7 @@ impl WebApp {
             remote_pet_rx,
             auth_overlay,
             auth_overlay_status,
+            perf_panel,
             captured_pets_panel,
             player_avatar_panel,
             player_avatar_modal,
@@ -709,9 +716,11 @@ impl WebApp {
             mesh_result_rx,
             workers,
             next_worker_index: 0,
+            last_perf_panel_update: now,
             _worker_onmessages: worker_onmessages,
         };
         app.update_captured_pets_panel();
+        app.update_perf_panel(0, 0);
         app
     }
 
@@ -761,6 +770,36 @@ impl WebApp {
         let dt_secs = dt_secs.clamp(1.0 / 240.0, 0.25);
         self.smoothed_frame_time_secs +=
             (dt_secs - self.smoothed_frame_time_secs) * RENDER_SCALE_SMOOTHING;
+    }
+
+    fn update_perf_panel(&mut self, visible_chunks: usize, loaded_chunks: usize) {
+        let now = Instant::now();
+        if now.duration_since(self.last_perf_panel_update) < PERF_PANEL_UPDATE_INTERVAL {
+            return;
+        }
+        self.last_perf_panel_update = now;
+
+        let frame_ms = self.smoothed_frame_time_secs * 1000.0;
+        let fps = if self.smoothed_frame_time_secs > 0.0 {
+            1.0 / self.smoothed_frame_time_secs
+        } else {
+            0.0
+        };
+        let remote_video_peers = self
+            .remote_media
+            .values()
+            .filter(|media| media.video.is_some())
+            .count();
+
+        self.perf_panel.set_text_content(Some(&format!(
+            "Perf\n{fps:.0} fps | {frame_ms:.1} ms\nrender scale {render_scale:.2}\nchunks {visible_chunks}/{loaded_chunks}\nmesh {pending}/{inflight}/{completed}\nremote players {remote_players}\nvideo peers {remote_video_peers}\nnet queue {net_queue}",
+            render_scale = self.render_scale,
+            pending = self.pending_generation.len(),
+            inflight = self.inflight_generation.len(),
+            completed = self.completed_meshes.len(),
+            remote_players = self.remote_players.len(),
+            net_queue = self.pending_network_events.len(),
+        )));
     }
 
     fn sync_pointer_lock_state(&mut self) {
@@ -2885,6 +2924,7 @@ impl WebApp {
     }
 
     fn update_remote_media_textures(&mut self, renderer: &Renderer<'_>) {
+        let now = Instant::now();
         for media in self.remote_media.values_mut() {
             let (Some(video), Some(canvas), Some(context)) = (
                 media.video.as_ref(),
@@ -2893,6 +2933,13 @@ impl WebApp {
             ) else {
                 continue;
             };
+            if media
+                .last_texture_upload_at
+                .map(|last| now.duration_since(last) < REMOTE_MEDIA_UPLOAD_INTERVAL)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if video.video_width() == 0 || video.video_height() == 0 {
                 continue;
             }
@@ -2913,6 +2960,7 @@ impl WebApp {
             };
             if let Some(texture) = &media.texture {
                 renderer.update_dynamic_texture_rgba(texture, &image_data.data().0);
+                media.last_texture_upload_at = Some(now);
             }
         }
     }
@@ -3089,6 +3137,7 @@ impl WebApp {
             canvas: None,
             context: None,
             texture: None,
+            last_texture_upload_at: None,
             data_channel: None,
             data_channel_open: false,
             data_channel_bindings: None,
@@ -3869,6 +3918,7 @@ struct RemotePeerMedia {
     canvas: Option<HtmlCanvasElement>,
     context: Option<CanvasRenderingContext2d>,
     texture: Option<DynamicTexture>,
+    last_texture_upload_at: Option<Instant>,
     data_channel: Option<RtcDataChannel>,
     data_channel_open: bool,
     data_channel_bindings: Option<PeerRealtimeChannelBindings>,
@@ -4207,6 +4257,23 @@ fn create_captured_pets_panel() -> Element {
     let _ = panel.set_attribute(
         "style",
         "position:fixed;left:16px;bottom:108px;width:min(260px,calc(100vw - 32px));padding:14px 16px;border-radius:16px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:30;font-family:ui-sans-serif,system-ui,sans-serif;",
+    );
+    let _ = body.append_child(&panel);
+    panel
+}
+
+fn create_perf_panel() -> Element {
+    let Some(document) = document() else {
+        panic!("document");
+    };
+    let Some(body) = document.body() else {
+        panic!("body");
+    };
+
+    let panel = document.create_element("div").expect("perf panel");
+    let _ = panel.set_attribute(
+        "style",
+        "position:fixed;top:14px;right:14px;z-index:45;padding:10px 12px;border-radius:12px;background:rgba(7,10,14,0.74);border:1px solid rgba(255,255,255,0.10);color:rgba(233,239,245,0.92);font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-line;pointer-events:none;backdrop-filter:blur(8px);min-width:170px;",
     );
     let _ = body.append_child(&panel);
     panel

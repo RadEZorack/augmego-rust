@@ -16,8 +16,7 @@ use std::io::Cursor;
 use std::io::Write;
 use std::path::Path;
 use std::sync::{
-    Mutex,
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -104,7 +103,11 @@ const ALLIGATOR_SURFACE_TRAITS: &[TraitOption] = &[
     TraitOption::new("glossy", "Glossy", "glossy polished scales"),
 ];
 const ALLIGATOR_STYLE_TRAITS: &[TraitOption] = &[
-    TraitOption::new("hatchling", "Hatchling", "playful baby alligator proportions"),
+    TraitOption::new(
+        "hatchling",
+        "Hatchling",
+        "playful baby alligator proportions",
+    ),
     TraitOption::new("river", "River", "river alligator-inspired snout"),
     TraitOption::new("swamp", "Swamp", "swamp alligator-inspired body"),
     TraitOption::new("chunky", "Chunky", "chunky cartoon alligator proportions"),
@@ -415,7 +418,8 @@ impl PetRegistryClient {
             let model_url: Option<String> = row.try_get("model_url")?;
             let model_storage_key: Option<String> = row.try_get("model_storage_key")?;
             let captured_at: Option<DateTime<Utc>> = row.try_get("captured_at")?;
-            let identity = self.map_pet_identity(pet_id, display_name, model_url, model_storage_key);
+            let identity =
+                self.map_pet_identity(pet_id, display_name, model_url, model_storage_key);
             pets.push(CapturedPet {
                 id: identity.id.clone(),
                 display_name: identity.display_name.clone(),
@@ -633,9 +637,7 @@ impl PetRegistryClient {
 
             match result {
                 Ok(_) => return Ok(true),
-                Err(sqlx::Error::Database(error))
-                    if error.code().as_deref() == Some("23505") =>
-                {
+                Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("23505") => {
                     continue;
                 }
                 Err(error) => return Err(error).context("create queued pet"),
@@ -769,20 +771,22 @@ impl PetRegistryClient {
 
             let meshy_status = task.status.clone().unwrap_or_default().trim().to_string();
             if meshy_status.is_empty() {
-                self.handle_generation_failure(pet_id, attempts, "Meshy task returned empty status")
-                    .await?;
+                self.handle_generation_failure(
+                    pet_id,
+                    attempts,
+                    "Meshy task returned empty status",
+                )
+                .await?;
                 continue;
             }
 
             if !is_meshy_terminal_status(&meshy_status) {
-                sqlx::query(
-                    "UPDATE pets SET meshy_status = $2, updated_at = NOW() WHERE id = $1",
-                )
-                .bind(pet_id)
-                .bind(meshy_status)
-                .execute(&self.pool)
-                .await
-                .context("update meshy status")?;
+                sqlx::query("UPDATE pets SET meshy_status = $2, updated_at = NOW() WHERE id = $1")
+                    .bind(pet_id)
+                    .bind(meshy_status)
+                    .execute(&self.pool)
+                    .await
+                    .context("update meshy status")?;
                 continue;
             }
 
@@ -796,8 +800,7 @@ impl PetRegistryClient {
                 continue;
             }
 
-            if self.config.meshy_text_to_3d_enable_refine && !meshy_task_id.starts_with("refine:")
-            {
+            if self.config.meshy_text_to_3d_enable_refine && !meshy_task_id.starts_with("refine:") {
                 match self.create_meshy_refine_task(&actual_task_id).await {
                     Ok(refine_task_id) => {
                         sqlx::query(
@@ -871,7 +874,9 @@ impl PetRegistryClient {
                      WHERE id = $1",
                 )
                 .bind(pet_id)
-                .bind(format!("Duplicate generated mesh matched pet {duplicate_id}"))
+                .bind(format!(
+                    "Duplicate generated mesh matched pet {duplicate_id}"
+                ))
                 .execute(&self.pool)
                 .await
                 .context("mark duplicate pet failed")?;
@@ -982,7 +987,11 @@ impl PetRegistryClient {
             "should_remesh": true,
             "target_formats": ["glb"],
         });
-        let model_type = self.config.meshy_text_to_3d_model_type.trim().to_ascii_lowercase();
+        let model_type = self
+            .config
+            .meshy_text_to_3d_model_type
+            .trim()
+            .to_ascii_lowercase();
         if matches!(model_type.as_str(), "standard" | "lowpoly") {
             body["model_type"] = json!(model_type);
         }
@@ -1063,7 +1072,10 @@ impl PetRegistryClient {
             if !attempted_compat && should_retry_with_meshy_6(&text) {
                 body["ai_model"] = json!(MESHY_COMPAT_MODEL);
                 attempted_compat = true;
-                tracing::warn!(context_label, "retrying Meshy request with meshy-6 compatibility model");
+                tracing::warn!(
+                    context_label,
+                    "retrying Meshy request with meshy-6 compatibility model"
+                );
                 continue;
             }
 
@@ -1107,10 +1119,7 @@ impl PetRegistryClient {
             anyhow::bail!(
                 "failed to download generated GLB ({} {})",
                 response.status(),
-                response
-                    .status()
-                    .canonical_reason()
-                    .unwrap_or("unknown")
+                response.status().canonical_reason().unwrap_or("unknown")
             );
         }
 
@@ -1212,9 +1221,7 @@ fn render_progress_bar(current: i64, target: i64, width: usize) -> String {
 
 fn maybe_gzip_bytes(bytes: &[u8]) -> Result<(Vec<u8>, Option<&'static str>)> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
-    encoder
-        .write_all(bytes)
-        .context("gzip pet GLB bytes")?;
+    encoder.write_all(bytes).context("gzip pet GLB bytes")?;
     let compressed = encoder.finish().context("finalize gzipped pet GLB")?;
     if compressed.len() + 32 >= bytes.len() {
         return Ok((bytes.to_vec(), None));
@@ -1235,10 +1242,7 @@ fn downscale_glb_embedded_images(
         serde_json::from_slice(glb.json.as_ref()).context("parse GLB JSON as value")?;
     let mut changed = strip_material_normal_textures(&mut root);
 
-    let Some(original_buffer_views) = root
-        .get("bufferViews")
-        .and_then(Value::as_array)
-        .cloned()
+    let Some(original_buffer_views) = root.get("bufferViews").and_then(Value::as_array).cloned()
     else {
         return Ok(bytes.to_vec());
     };
@@ -1292,7 +1296,10 @@ fn downscale_glb_embedded_images(
     }
     if let Some(buffers) = root.get_mut("buffers").and_then(Value::as_array_mut) {
         if let Some(buffer) = buffers.first_mut().and_then(Value::as_object_mut) {
-            buffer.insert("byteLength".to_string(), Value::from(rebuilt_bin.len() as u64));
+            buffer.insert(
+                "byteLength".to_string(),
+                Value::from(rebuilt_bin.len() as u64),
+            );
             buffer.remove("uri");
         }
     }
@@ -1454,11 +1461,7 @@ fn remap_material_texture_indices_in_value(
             }
 
             for (key, child) in map.iter_mut() {
-                remap_material_texture_indices_in_value(
-                    child,
-                    Some(key.as_str()),
-                    texture_remap,
-                )?;
+                remap_material_texture_indices_in_value(child, Some(key.as_str()), texture_remap)?;
             }
         }
         Value::Array(values) => {
@@ -1669,7 +1672,10 @@ fn rebuild_buffer_views_and_bin(
 
         let mut rebuilt_view = object.clone();
         rebuilt_view.insert("byteOffset".to_string(), Value::from(aligned_offset as u64));
-        rebuilt_view.insert("byteLength".to_string(), Value::from(stored_bytes.len() as u64));
+        rebuilt_view.insert(
+            "byteLength".to_string(),
+            Value::from(stored_bytes.len() as u64),
+        );
         if aligned_offset != byte_offset || stored_bytes.len() != byte_length {
             changed = true;
         }
@@ -1742,10 +1748,7 @@ fn optimize_embedded_image(
     let mut encoded = Vec::new();
     let flattened = DynamicImage::ImageRgb8(resized.to_rgb8());
     flattened
-        .write_to(
-            &mut Cursor::new(&mut encoded),
-            ImageFormat::Jpeg,
-        )
+        .write_to(&mut Cursor::new(&mut encoded), ImageFormat::Jpeg)
         .context("encode resized GLB texture")?;
 
     if encoded.is_empty() {
@@ -1827,7 +1830,10 @@ fn random_variation() -> PetVariation {
 }
 
 fn is_meshy_terminal_status(status: &str) -> bool {
-    matches!(status.to_ascii_uppercase().as_str(), "SUCCEEDED" | "FAILED" | "CANCELED")
+    matches!(
+        status.to_ascii_uppercase().as_str(),
+        "SUCCEEDED" | "FAILED" | "CANCELED"
+    )
 }
 
 fn is_meshy_success_status(status: &str) -> bool {

@@ -122,7 +122,9 @@ impl StorageService {
                     serde_json::to_vec(&metadata).context("serialize storage metadata")?;
                 fs::write(&metadata_path, metadata_bytes)
                     .await
-                    .with_context(|| format!("write storage metadata {}", metadata_path.display()))?;
+                    .with_context(|| {
+                        format!("write storage metadata {}", metadata_path.display())
+                    })?;
                 Ok(())
             }
             StorageProvider::Spaces => {
@@ -280,7 +282,11 @@ impl StorageService {
             .strip_prefix("https://")
             .or_else(|| endpoint_url.strip_prefix("http://"))
             .unwrap_or(endpoint_url);
-        Some(format!("{}.{}", self.config.spaces_bucket.trim(), endpoint_host))
+        Some(format!(
+            "{}.{}",
+            self.config.spaces_bucket.trim(),
+            endpoint_host
+        ))
     }
 
     fn spaces_object_url(&self, storage_key: &str) -> Option<String> {
@@ -320,13 +326,9 @@ fn url_encode(segment: &str) -> String {
     segment
         .bytes()
         .flat_map(|byte| match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~' => vec![byte as char],
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
             _ => format!("%{byte:02X}").chars().collect::<Vec<_>>(),
         })
         .collect()
@@ -345,8 +347,9 @@ async fn read_metadata(path: &Path) -> Result<Option<StorageMetadata>> {
             Ok(Some(metadata))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error)
-            .with_context(|| format!("read storage metadata {}", metadata_path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("read storage metadata {}", metadata_path.display()))
+        }
     }
 }
 

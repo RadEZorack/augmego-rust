@@ -116,15 +116,12 @@ pub fn clear_cookie(name: &str, config: &SessionCookieConfig) -> String {
 }
 
 fn percent_encode(value: &str) -> String {
-    value.bytes()
+    value
+        .bytes()
         .flat_map(|byte| match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~' => vec![byte as char],
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
             _ => format!("%{byte:02X}").chars().collect::<Vec<_>>(),
         })
         .collect()

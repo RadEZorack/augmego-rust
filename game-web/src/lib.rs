@@ -57,7 +57,14 @@ const DEFAULT_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 1;
 const MAX_IDLE_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 2;
 const DEFAULT_NETWORK_MESSAGE_BUDGET_PER_TICK: usize = 32;
 const PENDING_REPRIORITIZE_DOT_THRESHOLD: f32 = 0.985;
-const WEB_RENDER_SCALE: f32 = 0.8;
+const DEFAULT_WEB_RENDER_SCALE: f32 = 0.8;
+const MIN_WEB_RENDER_SCALE: f32 = 0.6;
+const WEB_RENDER_SCALE_STEP: f32 = 0.1;
+const RENDER_SCALE_SMOOTHING: f32 = 0.08;
+const RENDER_SCALE_SLOW_FRAME_SECS: f32 = 1.0 / 45.0;
+const RENDER_SCALE_FAST_FRAME_SECS: f32 = 1.0 / 65.0;
+const RENDER_SCALE_WARMUP: Duration = Duration::from_secs(2);
+const RENDER_SCALE_ADJUST_COOLDOWN: Duration = Duration::from_millis(900);
 const PLAYER_RADIUS: f32 = 0.35;
 const PLAYER_HEIGHT: f32 = 1.8;
 const PLAYER_EYE_HEIGHT: f32 = 1.62;
@@ -342,12 +349,16 @@ async fn run() -> Result<()> {
     attach_canvas(canvas.clone());
 
     let initial_window_size = window.inner_size();
-    let renderer = Renderer::new_with_size(window, scaled_render_size(initial_window_size)).await?;
+    let renderer = Renderer::new_with_size(
+        window,
+        scaled_render_size(initial_window_size, DEFAULT_WEB_RENDER_SCALE),
+    )
+    .await?;
     let (mesh_result_rx, workers, worker_onmessage) = start_mesh_worker_pool(MESH_WORKER_COUNT)?;
     let (network_rx, websocket, websocket_handlers) = start_websocket_client()?;
     let (webcam_tx, webcam_rx) = mpsc::channel();
     let mut app = WebApp::new(
-        renderer.size(),
+        initial_window_size,
         canvas,
         workers,
         worker_onmessage,
@@ -362,14 +373,14 @@ async fn run() -> Result<()> {
     let mut chunk_meshes = HashMap::new();
 
     event_loop.run(move |event, target| {
-        target.set_control_flow(ControlFlow::Poll);
+        target.set_control_flow(ControlFlow::Wait);
 
         match event {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => target.exit(),
                 WindowEvent::Resized(size) => {
-                    renderer.resize(scaled_render_size(size));
                     app.resize(size);
+                    renderer.resize(app.scaled_render_size());
                 }
                 WindowEvent::KeyboardInput { event, .. } => app.handle_key(event),
                 WindowEvent::MouseInput {
@@ -381,6 +392,9 @@ async fn run() -> Result<()> {
                 }
                 WindowEvent::RedrawRequested => {
                     app.tick();
+                    if let Some(render_size) = app.maybe_adjust_render_scale() {
+                        renderer.resize(render_size);
+                    }
                     app.process_webcam_events();
                     app.process_remote_avatar_events(&renderer);
                     app.process_remote_pet_events(&renderer);
@@ -461,6 +475,10 @@ struct WebApp {
     pressed: HashSet<KeyCode>,
     last_tick: Instant,
     size: PhysicalSize<u32>,
+    render_scale: f32,
+    smoothed_frame_time_secs: f32,
+    startup_at: Instant,
+    last_render_scale_change: Instant,
     current_chunk: ChunkPos,
     desired_chunks: HashSet<ChunkPos>,
     pending_generation: VecDeque<ChunkPos>,
@@ -561,6 +579,7 @@ impl WebApp {
         webcam_tx: Sender<WebcamEvent>,
         webcam_rx: Receiver<WebcamEvent>,
     ) -> Self {
+        let now = Instant::now();
         let mut camera = Camera::default();
         camera.position = Vec3::new(0.5, PLAYER_EYE_HEIGHT + 96.0, 0.5);
         let link_panel = LinkPanel::near_spawn(camera.position);
@@ -600,8 +619,12 @@ impl WebApp {
             authoritative_chunks: HashMap::new(),
             collision_voxels: HashMap::new(),
             pressed: HashSet::new(),
-            last_tick: Instant::now(),
+            last_tick: now,
             size,
+            render_scale: DEFAULT_WEB_RENDER_SCALE,
+            smoothed_frame_time_secs: 1.0 / 60.0,
+            startup_at: now,
+            last_render_scale_change: now,
             current_chunk,
             desired_chunks,
             pending_generation,
@@ -694,6 +717,50 @@ impl WebApp {
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.size = size;
+    }
+
+    fn scaled_render_size(&self) -> PhysicalSize<u32> {
+        scaled_render_size(self.size, self.render_scale)
+    }
+
+    fn maybe_adjust_render_scale(&mut self) -> Option<PhysicalSize<u32>> {
+        let now = Instant::now();
+        if now.duration_since(self.startup_at) < RENDER_SCALE_WARMUP
+            || now.duration_since(self.last_render_scale_change) < RENDER_SCALE_ADJUST_COOLDOWN
+        {
+            return None;
+        }
+
+        let next_scale = if self.smoothed_frame_time_secs > RENDER_SCALE_SLOW_FRAME_SECS
+            && self.render_scale > MIN_WEB_RENDER_SCALE
+        {
+            (self.render_scale - WEB_RENDER_SCALE_STEP).max(MIN_WEB_RENDER_SCALE)
+        } else if self.smoothed_frame_time_secs < RENDER_SCALE_FAST_FRAME_SECS
+            && self.render_scale < DEFAULT_WEB_RENDER_SCALE
+            && !self.movement_active
+            && self.pending_generation.is_empty()
+            && self.inflight_generation.is_empty()
+            && self.completed_meshes.is_empty()
+            && self.pending_network_events.is_empty()
+        {
+            (self.render_scale + WEB_RENDER_SCALE_STEP).min(DEFAULT_WEB_RENDER_SCALE)
+        } else {
+            return None;
+        };
+
+        if (next_scale - self.render_scale).abs() <= f32::EPSILON {
+            return None;
+        }
+
+        self.render_scale = next_scale;
+        self.last_render_scale_change = now;
+        Some(self.scaled_render_size())
+    }
+
+    fn record_frame_time(&mut self, dt_secs: f32) {
+        let dt_secs = dt_secs.clamp(1.0 / 240.0, 0.25);
+        self.smoothed_frame_time_secs +=
+            (dt_secs - self.smoothed_frame_time_secs) * RENDER_SCALE_SMOOTHING;
     }
 
     fn sync_pointer_lock_state(&mut self) {
@@ -1704,6 +1771,7 @@ impl WebApp {
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
         let dt_secs = dt.as_secs_f32();
+        self.record_frame_time(dt_secs);
         self.update_remote_avatar_playback(dt_secs);
 
         let mut movement = Vec3::ZERO;
@@ -6234,13 +6302,9 @@ fn chunk_from_world_position(position: Vec3) -> ChunkPos {
     }
 }
 
-fn scaled_render_size(size: PhysicalSize<u32>) -> PhysicalSize<u32> {
-    let width = ((size.width.max(1) as f32) * WEB_RENDER_SCALE)
-        .round()
-        .max(1.0) as u32;
-    let height = ((size.height.max(1) as f32) * WEB_RENDER_SCALE)
-        .round()
-        .max(1.0) as u32;
+fn scaled_render_size(size: PhysicalSize<u32>, scale: f32) -> PhysicalSize<u32> {
+    let width = ((size.width.max(1) as f32) * scale).round().max(1.0) as u32;
+    let height = ((size.height.max(1) as f32) * scale).round().max(1.0) as u32;
     PhysicalSize::new(width, height)
 }
 

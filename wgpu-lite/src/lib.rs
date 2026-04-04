@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
-use std::mem;
+use std::{mem, num::NonZeroU64};
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -122,8 +122,7 @@ pub struct TexturedMesh {
 
 pub struct TexturedMeshDraw<'a> {
     mesh: &'a TexturedMesh,
-    model_bind_group: wgpu::BindGroup,
-    _model_buffer: wgpu::Buffer,
+    model: Mat4,
 }
 
 pub struct AnimatedMesh {
@@ -135,8 +134,7 @@ pub struct AnimatedMesh {
 
 pub struct AnimatedMeshDraw<'a> {
     mesh: &'a AnimatedMesh,
-    skin_bind_group: wgpu::BindGroup,
-    _skin_buffer: wgpu::Buffer,
+    uniform: SkinUniform,
 }
 
 struct DepthTarget {
@@ -328,6 +326,10 @@ pub struct Renderer<'a> {
     camera_bind_group: wgpu::BindGroup,
     material: MaterialTarget,
     skin_layout: wgpu::BindGroupLayout,
+    skin_buffer: wgpu::Buffer,
+    skin_bind_group: wgpu::BindGroup,
+    skin_stride: u64,
+    skin_capacity: usize,
     depth: DepthTarget,
 }
 
@@ -437,12 +439,15 @@ impl<'a> Renderer<'a> {
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                    has_dynamic_offset: true,
+                    min_binding_size: Some(skin_uniform_size()),
                 },
                 count: None,
             }],
         });
+        let skin_stride = aligned_uniform_size(device.limits().min_uniform_buffer_offset_alignment);
+        let (skin_buffer, skin_bind_group) =
+            create_skin_buffer_and_bind_group(&device, &skin_layout, skin_stride, 1);
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline-layout"),
@@ -632,6 +637,10 @@ impl<'a> Renderer<'a> {
             camera_bind_group,
             material,
             skin_layout,
+            skin_buffer,
+            skin_bind_group,
+            skin_stride,
+            skin_capacity: 1,
             depth,
         })
     }
@@ -779,31 +788,7 @@ impl<'a> Renderer<'a> {
         mesh: &'b TexturedMesh,
         model: Mat4,
     ) -> TexturedMeshDraw<'b> {
-        let uniform = SkinUniform {
-            model: model.to_cols_array_2d(),
-            joints: [Mat4::IDENTITY.to_cols_array_2d(); MAX_SKIN_JOINTS],
-        };
-        let model_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("model-buffer"),
-                contents: bytemuck::bytes_of(&uniform),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-        let model_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("model-bind-group"),
-            layout: &self.skin_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: model_buffer.as_entire_binding(),
-            }],
-        });
-
-        TexturedMeshDraw {
-            mesh,
-            model_bind_group,
-            _model_buffer: model_buffer,
-        }
+        TexturedMeshDraw { mesh, model }
     }
 
     pub fn create_animated_mesh(
@@ -849,27 +834,7 @@ impl<'a> Renderer<'a> {
             uniform.joints[index] = joint.to_cols_array_2d();
         }
 
-        let skin_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("skin-buffer"),
-                contents: bytemuck::bytes_of(&uniform),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-        let skin_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("skin-bind-group"),
-            layout: &self.skin_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: skin_buffer.as_entire_binding(),
-            }],
-        });
-
-        AnimatedMeshDraw {
-            mesh,
-            skin_bind_group,
-            _skin_buffer: skin_buffer,
-        }
+        AnimatedMeshDraw { mesh, uniform }
     }
 
     pub fn update_camera(&self, view_projection: Mat4) {
@@ -919,6 +884,9 @@ impl<'a> Renderer<'a> {
         animated_meshes: &[AnimatedMeshDraw<'_>],
         overlays: &[&Mesh],
     ) -> Result<()> {
+        self.ensure_skin_capacity(textured_draws.len() + animated_meshes.len());
+        self.upload_skin_uniforms(textured_draws, animated_meshes);
+
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -988,9 +956,9 @@ impl<'a> Renderer<'a> {
             if !textured_draws.is_empty() {
                 pass.set_pipeline(&self.modeled_textured_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                for textured in textured_draws {
+                for (index, textured) in textured_draws.iter().enumerate() {
                     pass.set_bind_group(1, &textured.mesh.bind_group, &[]);
-                    pass.set_bind_group(2, &textured.model_bind_group, &[]);
+                    pass.set_bind_group(2, &self.skin_bind_group, &[self.skin_offset(index)]);
                     pass.set_vertex_buffer(0, textured.mesh.mesh.vertex_buffer.slice(..));
                     pass.set_index_buffer(
                         textured.mesh.mesh.index_buffer.slice(..),
@@ -1002,9 +970,13 @@ impl<'a> Renderer<'a> {
             if !animated_meshes.is_empty() {
                 pass.set_pipeline(&self.animated_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                for animated in animated_meshes {
+                for (index, animated) in animated_meshes.iter().enumerate() {
                     pass.set_bind_group(1, &animated.mesh.texture_bind_group, &[]);
-                    pass.set_bind_group(2, &animated.skin_bind_group, &[]);
+                    pass.set_bind_group(
+                        2,
+                        &self.skin_bind_group,
+                        &[self.skin_offset(textured_draws.len() + index)],
+                    );
                     pass.set_vertex_buffer(0, animated.mesh.vertex_buffer.slice(..));
                     pass.set_index_buffer(
                         animated.mesh.index_buffer.slice(..),
@@ -1049,6 +1021,57 @@ impl<'a> Renderer<'a> {
     pub fn size(&self) -> PhysicalSize<u32> {
         self.size
     }
+
+    fn ensure_skin_capacity(&mut self, draw_count: usize) {
+        let required = draw_count.max(1);
+        if required <= self.skin_capacity {
+            return;
+        }
+
+        self.skin_capacity = required.next_power_of_two();
+        let (skin_buffer, skin_bind_group) = create_skin_buffer_and_bind_group(
+            &self.device,
+            &self.skin_layout,
+            self.skin_stride,
+            self.skin_capacity,
+        );
+        self.skin_buffer = skin_buffer;
+        self.skin_bind_group = skin_bind_group;
+    }
+
+    fn upload_skin_uniforms(
+        &self,
+        textured_draws: &[TexturedMeshDraw<'_>],
+        animated_meshes: &[AnimatedMeshDraw<'_>],
+    ) {
+        let total = textured_draws.len() + animated_meshes.len();
+        if total == 0 {
+            return;
+        }
+
+        let stride = self.skin_stride as usize;
+        let uniform_size = mem::size_of::<SkinUniform>();
+        let mut bytes = vec![0_u8; stride * total];
+
+        for (index, draw) in textured_draws.iter().enumerate() {
+            let uniform = model_uniform(draw.model);
+            let offset = index * stride;
+            bytes[offset..offset + uniform_size].copy_from_slice(bytemuck::bytes_of(&uniform));
+        }
+
+        for (index, draw) in animated_meshes.iter().enumerate() {
+            let offset = (textured_draws.len() + index) * stride;
+            bytes[offset..offset + uniform_size].copy_from_slice(bytemuck::bytes_of(&draw.uniform));
+        }
+
+        self.queue.write_buffer(&self.skin_buffer, 0, &bytes);
+    }
+
+    fn skin_offset(&self, slot: usize) -> u32 {
+        slot.checked_mul(self.skin_stride as usize)
+            .and_then(|value| u32::try_from(value).ok())
+            .expect("skin uniform offset fits in u32")
+    }
 }
 
 fn device_limits() -> wgpu::Limits {
@@ -1060,6 +1083,56 @@ fn device_limits() -> wgpu::Limits {
     #[cfg(not(target_arch = "wasm32"))]
     {
         wgpu::Limits::downlevel_defaults()
+    }
+}
+
+fn skin_uniform_size() -> NonZeroU64 {
+    NonZeroU64::new(mem::size_of::<SkinUniform>() as u64).expect("skin uniform size is non-zero")
+}
+
+fn aligned_uniform_size(alignment: u32) -> u64 {
+    align_to(
+        mem::size_of::<SkinUniform>() as u64,
+        u64::from(alignment.max(1)),
+    )
+}
+
+fn align_to(value: u64, alignment: u64) -> u64 {
+    value.div_ceil(alignment) * alignment
+}
+
+fn create_skin_buffer_and_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    stride: u64,
+    capacity: usize,
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("skin-buffer"),
+        size: stride * capacity.max(1) as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("skin-bind-group"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &buffer,
+                offset: 0,
+                size: Some(skin_uniform_size()),
+            }),
+        }],
+    });
+
+    (buffer, bind_group)
+}
+
+fn model_uniform(model: Mat4) -> SkinUniform {
+    SkinUniform {
+        model: model.to_cols_array_2d(),
+        joints: [Mat4::IDENTITY.to_cols_array_2d(); MAX_SKIN_JOINTS],
     }
 }
 

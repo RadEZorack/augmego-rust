@@ -76,6 +76,14 @@ Apple sign-in needs:
 
 For Apple web sign-in, `PUBLIC_BASE_URL` must use `https://` and a real domain that is registered as a Return URL for the Apple Services ID. `http://localhost` and raw IP hosts will not work.
 
+Microsoft sign-in needs:
+
+- `MICROSOFT_CLIENT_ID`
+- `MICROSOFT_CLIENT_SECRET`
+- `PUBLIC_BASE_URL`
+
+`MICROSOFT_TENANT` defaults to `common`, which allows both personal Microsoft accounts and work/school Entra ID accounts. Override it if you want to restrict sign-in to a specific tenant.
+
 During migration, the Rust server will also fall back to `apps/web/.env` if it exists, so older local setups still work.
 
 ### 4. Build or watch the game client
@@ -186,6 +194,10 @@ http://localhost:4000
 - `GOOGLE_CLIENT_ID`
 - `GOOGLE_CLIENT_SECRET`
 - `GOOGLE_SCOPE`
+- `MICROSOFT_CLIENT_ID`
+- `MICROSOFT_CLIENT_SECRET`
+- `MICROSOFT_SCOPE`
+- `MICROSOFT_TENANT`
 
 ### Pets / Meshy
 

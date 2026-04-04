@@ -25,6 +25,9 @@ const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 const GOOGLE_STATE_COOKIE_NAME: &str = "oauth_state_google";
+const MICROSOFT_DEFAULT_TENANT: &str = "common";
+const MICROSOFT_SCOPE_DEFAULT: &str = "openid profile email";
+const MICROSOFT_STATE_COOKIE_NAME: &str = "oauth_state_microsoft";
 const PLAYER_AVATAR_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 #[derive(Clone, Debug)]
@@ -36,6 +39,10 @@ pub struct AccountConfig {
     pub google_client_id: String,
     pub google_client_secret: String,
     pub google_scope: String,
+    pub microsoft_client_id: String,
+    pub microsoft_client_secret: String,
+    pub microsoft_scope: String,
+    pub microsoft_tenant: String,
     pub game_auth_secret: String,
     pub game_auth_ttl: Duration,
 }
@@ -119,6 +126,19 @@ struct AppleIdTokenClaims {
     sub: String,
     email: Option<String>,
     nonce: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MicrosoftOpenIdConfiguration {
+    userinfo_endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MicrosoftUserInfo {
+    sub: String,
+    name: Option<String>,
+    email: Option<String>,
+    picture: Option<String>,
 }
 
 pub enum AvatarFileResponse {
@@ -236,6 +256,36 @@ impl AccountService {
             redirect_url: format!("{GOOGLE_AUTH_URL}?{query}"),
             set_cookies: vec![make_cookie(
                 GOOGLE_STATE_COOKIE_NAME,
+                &state,
+                &self.config.session_cookie,
+                Some(Duration::from_secs(60 * 15)),
+            )],
+        })
+    }
+
+    pub fn start_microsoft_signin(&self) -> Result<OAuthSigninStart> {
+        if self.config.microsoft_client_id.trim().is_empty() {
+            return Err(anyhow!("Microsoft OAuth is not configured"));
+        }
+
+        let state = Uuid::new_v4().to_string();
+        let query = [
+            ("client_id", self.config.microsoft_client_id.clone()),
+            ("response_type", "code".to_string()),
+            ("redirect_uri", self.microsoft_redirect_uri()),
+            ("response_mode", "query".to_string()),
+            ("scope", self.microsoft_scope().to_string()),
+            ("state", state.clone()),
+        ]
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", url_encode(&value)))
+        .collect::<Vec<_>>()
+        .join("&");
+
+        Ok(OAuthSigninStart {
+            redirect_url: format!("{}?{query}", self.microsoft_authorize_url()),
+            set_cookies: vec![make_cookie(
+                MICROSOFT_STATE_COOKIE_NAME,
                 &state,
                 &self.config.session_cookie,
                 Some(Duration::from_secs(60 * 15)),
@@ -441,6 +491,98 @@ impl AccountService {
                 clear_cookie(APPLE_STATE_COOKIE_NAME, &cookie_config),
                 clear_cookie(APPLE_NONCE_COOKIE_NAME, &cookie_config),
             ],
+        )
+        .await
+    }
+
+    pub async fn handle_microsoft_callback(
+        &self,
+        code: &str,
+        state: &str,
+        cookie_header: Option<&str>,
+    ) -> Result<OAuthCallbackResult> {
+        let expected_state = parse_cookie(cookie_header, MICROSOFT_STATE_COOKIE_NAME)
+            .ok_or_else(|| anyhow!("missing microsoft oauth state cookie"))?;
+        if expected_state != state {
+            return Err(anyhow!("invalid microsoft oauth state"));
+        }
+        if self.config.microsoft_client_id.trim().is_empty()
+            || self.config.microsoft_client_secret.trim().is_empty()
+        {
+            return Err(anyhow!("Microsoft OAuth is not configured"));
+        }
+
+        let scope = self.microsoft_scope().to_string();
+        let redirect_uri = self.microsoft_redirect_uri();
+        let token_response = self
+            .http
+            .post(self.microsoft_token_url())
+            .form(&vec![
+                ("grant_type".to_string(), "authorization_code".to_string()),
+                ("code".to_string(), code.to_string()),
+                ("redirect_uri".to_string(), redirect_uri),
+                (
+                    "client_id".to_string(),
+                    self.config.microsoft_client_id.clone(),
+                ),
+                (
+                    "client_secret".to_string(),
+                    self.config.microsoft_client_secret.clone(),
+                ),
+                ("scope".to_string(), scope),
+            ])
+            .send()
+            .await
+            .context("exchange microsoft auth code")?;
+        if !token_response.status().is_success() {
+            let status = token_response.status();
+            let text = token_response.text().await.unwrap_or_default();
+            anyhow::bail!("Microsoft token exchange failed ({status}): {text}");
+        }
+
+        let token_body = token_response
+            .json::<Value>()
+            .await
+            .context("decode microsoft token response")?;
+        let access_token = token_body
+            .get("access_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing microsoft access token"))?;
+
+        let openid_config = self.load_microsoft_openid_configuration().await?;
+        let profile_response = self
+            .http
+            .get(&openid_config.userinfo_endpoint)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context("fetch microsoft user info")?;
+        if !profile_response.status().is_success() {
+            let status = profile_response.status();
+            let text = profile_response.text().await.unwrap_or_default();
+            anyhow::bail!("Microsoft userinfo failed ({status}): {text}");
+        }
+
+        let profile = profile_response
+            .json::<MicrosoftUserInfo>()
+            .await
+            .context("decode microsoft user info")?;
+        let user_id = self
+            .upsert_oauth_user(
+                "microsoft",
+                "Microsoft",
+                &profile.sub,
+                profile.email.as_deref(),
+                profile.name.as_deref(),
+                profile.picture.as_deref(),
+            )
+            .await?;
+        self.create_oauth_session(
+            user_id,
+            vec![clear_cookie(
+                MICROSOFT_STATE_COOKIE_NAME,
+                &self.config.session_cookie,
+            )],
         )
         .await
     }
@@ -659,6 +801,52 @@ impl AccountService {
         )
     }
 
+    fn microsoft_authorize_url(&self) -> String {
+        format!(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/authorize",
+            self.microsoft_tenant()
+        )
+    }
+
+    fn microsoft_openid_configuration_url(&self) -> String {
+        format!(
+            "https://login.microsoftonline.com/{}/v2.0/.well-known/openid-configuration",
+            self.microsoft_tenant()
+        )
+    }
+
+    fn microsoft_redirect_uri(&self) -> String {
+        format!(
+            "{}/api/v1/auth/microsoft/callback",
+            self.config.public_base_url.trim_end_matches('/')
+        )
+    }
+
+    fn microsoft_scope(&self) -> &str {
+        let scope = self.config.microsoft_scope.trim();
+        if scope.is_empty() {
+            MICROSOFT_SCOPE_DEFAULT
+        } else {
+            scope
+        }
+    }
+
+    fn microsoft_tenant(&self) -> &str {
+        let tenant = self.config.microsoft_tenant.trim().trim_matches('/');
+        if tenant.is_empty() {
+            MICROSOFT_DEFAULT_TENANT
+        } else {
+            tenant
+        }
+    }
+
+    fn microsoft_token_url(&self) -> String {
+        format!(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+            self.microsoft_tenant()
+        )
+    }
+
     fn apple_oauth_cookie_config(&self) -> Result<SessionCookieConfig> {
         let redirect_uri = self.apple_redirect_uri();
         let redirect_uri = Url::parse(&redirect_uri).context("parse apple redirect uri")?;
@@ -759,6 +947,25 @@ impl AccountService {
         }
 
         Ok(claims)
+    }
+
+    async fn load_microsoft_openid_configuration(&self) -> Result<MicrosoftOpenIdConfiguration> {
+        let response = self
+            .http
+            .get(self.microsoft_openid_configuration_url())
+            .send()
+            .await
+            .context("fetch microsoft openid configuration")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Microsoft OpenID configuration failed ({status}): {text}");
+        }
+
+        response
+            .json::<MicrosoftOpenIdConfiguration>()
+            .await
+            .context("decode microsoft openid configuration")
     }
 
     fn resolve_player_avatar_storage_key(&self, user_id: Uuid, slot: PlayerAvatarSlot) -> String {

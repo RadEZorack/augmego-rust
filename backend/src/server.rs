@@ -75,6 +75,10 @@ pub struct ServerConfig {
     pub google_client_id: String,
     pub google_client_secret: String,
     pub google_scope: String,
+    pub microsoft_client_id: String,
+    pub microsoft_client_secret: String,
+    pub microsoft_scope: String,
+    pub microsoft_tenant: String,
     pub game_backend_auth_secret: String,
     pub game_auth_ttl: Duration,
     pub storage_provider: StorageProvider,
@@ -178,6 +182,12 @@ impl Default for ServerConfig {
             google_client_secret: std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
             google_scope: std::env::var("GOOGLE_SCOPE")
                 .unwrap_or_else(|_| "openid email profile".to_string()),
+            microsoft_client_id: std::env::var("MICROSOFT_CLIENT_ID").unwrap_or_default(),
+            microsoft_client_secret: std::env::var("MICROSOFT_CLIENT_SECRET").unwrap_or_default(),
+            microsoft_scope: std::env::var("MICROSOFT_SCOPE")
+                .unwrap_or_else(|_| "openid profile email".to_string()),
+            microsoft_tenant: std::env::var("MICROSOFT_TENANT")
+                .unwrap_or_else(|_| "common".to_string()),
             game_backend_auth_secret: std::env::var("GAME_BACKEND_AUTH_SECRET")
                 .unwrap_or_else(|_| "dev-only-game-backend-secret".to_string()),
             game_auth_ttl: Duration::from_secs(
@@ -1228,6 +1238,14 @@ struct GoogleCallbackQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct MicrosoftCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct AppleCallbackForm {
     id_token: Option<String>,
     state: Option<String>,
@@ -1281,6 +1299,10 @@ impl VoxelServer {
                 google_client_id: config.google_client_id.clone(),
                 google_client_secret: config.google_client_secret.clone(),
                 google_scope: config.google_scope.clone(),
+                microsoft_client_id: config.microsoft_client_id.clone(),
+                microsoft_client_secret: config.microsoft_client_secret.clone(),
+                microsoft_scope: config.microsoft_scope.clone(),
+                microsoft_tenant: config.microsoft_tenant.clone(),
                 game_auth_secret: config.game_backend_auth_secret.clone(),
                 game_auth_ttl: config.game_auth_ttl,
             },
@@ -1400,6 +1422,11 @@ impl VoxelServer {
             .route("/api/v1/auth/apple/callback", post(auth_apple_callback))
             .route("/api/v1/auth/google", get(auth_google))
             .route("/api/v1/auth/google/callback", get(auth_google_callback))
+            .route("/api/v1/auth/microsoft", get(auth_microsoft))
+            .route(
+                "/api/v1/auth/microsoft/callback",
+                get(auth_microsoft_callback),
+            )
             .route("/api/v1/auth/logout", post(auth_logout))
             .route("/api/v1/auth/me", get(auth_me))
             .route(
@@ -1964,7 +1991,7 @@ async fn learn_page() -> Html<&'static str> {
     <main>
       <div style="font-size:12px;letter-spacing:0.16em;text-transform:uppercase;color:rgba(147,79,34,0.78);margin-bottom:16px;">About Augmego</div>
       <h1>A shared voxel world with collectible creatures.</h1>
-      <p>Players can drop in as guests, sign in with Google or Apple when they want persistence, upload animated avatars, and collect procedurally generated pets that stay tied to their account.</p>
+      <p>Players can drop in as guests, sign in with Google, Apple, or Microsoft when they want persistence, upload animated avatars, and collect procedurally generated pets that stay tied to their account.</p>
       <p><a href="/play/">Launch the game client</a></p>
     </main>
   </body>
@@ -2188,6 +2215,95 @@ async fn auth_google(State(server): State<VoxelServer>) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             Html(format!(
                 "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Google sign-in is unavailable right now.<br/><br/>{error}</body></html>"
+            )),
+        )
+            .into_response(),
+    }
+}
+
+async fn auth_microsoft(State(server): State<VoxelServer>) -> Response {
+    match server.account_service.start_microsoft_signin() {
+        Ok(result) => {
+            let mut response = Redirect::temporary(&result.redirect_url).into_response();
+            for cookie in result.set_cookies {
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, cookie.parse().unwrap());
+            }
+            response
+        }
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(format!(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Microsoft sign-in is unavailable right now.<br/><br/>{error}</body></html>"
+            )),
+        )
+            .into_response(),
+    }
+}
+
+async fn auth_microsoft_callback(
+    State(server): State<VoxelServer>,
+    Query(query): Query<MicrosoftCallbackQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(error) = query.error.as_deref() {
+        let details = query
+            .error_description
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(error);
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(format!(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Microsoft sign-in failed.<br/><br/>{details}</body></html>"
+            )),
+        )
+            .into_response();
+    }
+
+    let Some(code) = query.code.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Microsoft sign-in failed.<br/><br/>Missing Microsoft authorization code.</body></html>"
+                    .to_string(),
+            ),
+        )
+            .into_response();
+    };
+    let Some(state) = query.state.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Microsoft sign-in failed.<br/><br/>Missing Microsoft OAuth state.</body></html>"
+                    .to_string(),
+            ),
+        )
+            .into_response();
+    };
+
+    match server
+        .account_service
+        .handle_microsoft_callback(code, state, cookie_header(&headers))
+        .await
+    {
+        Ok(result) => {
+            let mut response = Redirect::temporary(&result.redirect_url).into_response();
+            response
+                .headers_mut()
+                .append(header::SET_COOKIE, result.session_cookie.parse().unwrap());
+            for cookie in result.clear_cookies {
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, cookie.parse().unwrap());
+            }
+            response
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Html(format!(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Microsoft sign-in failed.<br/><br/>{error}</body></html>"
             )),
         )
             .into_response(),

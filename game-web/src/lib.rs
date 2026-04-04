@@ -50,19 +50,23 @@ const WEB_RADIUS: i32 = 6;
 const INITIAL_WEB_RADIUS: i32 = 1;
 const SPAWN_READY_RADIUS: i32 = 1;
 const CHUNK_WORLD_RADIUS: f32 = (CHUNK_WIDTH as f32) * 0.5;
-const DRAW_DISTANCE_CHUNKS: f32 = 14.0;
+const DRAW_DISTANCE_CHUNKS: f32 = 6.0;
+const MAX_VISIBLE_CHUNK_MESHES: usize = 56;
 const MESH_WORKER_COUNT: usize = 3;
 const DEFAULT_GENERATION_BUDGET_PER_UPDATE: usize = 2;
 const DEFAULT_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 1;
 const MAX_IDLE_MESH_UPLOAD_BUDGET_PER_UPDATE: usize = 2;
 const DEFAULT_NETWORK_MESSAGE_BUDGET_PER_TICK: usize = 32;
-const PENDING_REPRIORITIZE_DOT_THRESHOLD: f32 = 0.985;
+const PENDING_REPRIORITIZE_DOT_THRESHOLD: f32 = 0.80;
 const DEFAULT_WEB_RENDER_SCALE: f32 = 0.8;
 const MIN_WEB_RENDER_SCALE: f32 = 0.6;
 const WEB_RENDER_SCALE_STEP: f32 = 0.1;
 const RENDER_SCALE_SMOOTHING: f32 = 0.08;
 const RENDER_SCALE_SLOW_FRAME_SECS: f32 = 1.0 / 45.0;
 const RENDER_SCALE_FAST_FRAME_SECS: f32 = 1.0 / 65.0;
+const CAMERA_VERTICAL_FOV_RADIANS: f32 = 60.0_f32.to_radians();
+const CHUNK_NEAR_VISIBILITY_DISTANCE: f32 = CHUNK_WIDTH as f32 * 2.0;
+const CHUNK_HORIZONTAL_CULL_MARGIN_RADIANS: f32 = 10.0_f32.to_radians();
 const RENDER_SCALE_WARMUP: Duration = Duration::from_secs(2);
 const RENDER_SCALE_ADJUST_COOLDOWN: Duration = Duration::from_millis(900);
 const PERF_PANEL_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
@@ -414,12 +418,7 @@ async fn run() -> Result<()> {
                         DEFAULT_GENERATION_BUDGET_PER_UPDATE,
                     );
                     renderer.update_camera(app.camera_matrix());
-                    let visible_meshes = chunk_meshes
-                        .iter()
-                        .filter_map(|(position, mesh)| {
-                            app.chunk_is_visible(*position).then_some(mesh)
-                        })
-                        .collect::<Vec<_>>();
+                    let visible_meshes = app.collect_visible_chunk_meshes(&chunk_meshes);
                     app.update_perf_panel(visible_meshes.len(), chunk_meshes.len());
                     let link_panel_mesh = app.build_link_panel_mesh(&renderer);
                     let mut visible_mesh_refs = visible_meshes;
@@ -2985,26 +2984,59 @@ impl WebApp {
     }
 
     fn chunk_is_visible(&self, position: ChunkPos) -> bool {
-        let center = Vec3::new(
-            position.x as f32 * CHUNK_WIDTH as f32 + CHUNK_WORLD_RADIUS,
-            64.0,
-            position.z as f32 * CHUNK_DEPTH as f32 + CHUNK_WORLD_RADIUS,
-        );
+        let center = chunk_center(position, self.camera.position.y);
         let to_chunk = center - self.camera.position;
-        let distance = to_chunk.length();
+        let horizontal = Vec3::new(to_chunk.x, 0.0, to_chunk.z);
+        let distance = horizontal.length();
         let max_distance = DRAW_DISTANCE_CHUNKS * CHUNK_WIDTH as f32;
 
         if distance > max_distance {
             return false;
         }
 
-        if distance <= CHUNK_WIDTH as f32 * 2.0 {
+        if distance <= CHUNK_NEAR_VISIBILITY_DISTANCE {
             return true;
         }
 
-        let direction = to_chunk / distance.max(0.001);
-        let threshold = 0.1 - (24.0 / distance).min(0.25);
-        self.camera.forward().dot(direction) >= threshold
+        let forward = horizontal_forward(self.camera.forward());
+        if forward == Vec3::ZERO {
+            return true;
+        }
+
+        let direction = horizontal / distance.max(0.001);
+        let aspect = self.size.width.max(1) as f32 / self.size.height.max(1) as f32;
+        let half_vertical_fov = CAMERA_VERTICAL_FOV_RADIANS * 0.5;
+        let half_horizontal_fov = (half_vertical_fov.tan() * aspect).atan();
+        let chunk_radius = (CHUNK_WIDTH as f32 * 0.5).hypot(CHUNK_DEPTH as f32 * 0.5);
+        let angular_padding = (chunk_radius / distance.max(chunk_radius + 0.001)).asin();
+        let threshold = (half_horizontal_fov
+            + CHUNK_HORIZONTAL_CULL_MARGIN_RADIANS
+            + angular_padding)
+            .min(std::f32::consts::PI - 0.01)
+            .cos();
+        forward.dot(direction) >= threshold
+    }
+
+    fn collect_visible_chunk_meshes<'a>(
+        &self,
+        chunk_meshes: &'a HashMap<ChunkPos, Mesh>,
+    ) -> Vec<&'a Mesh> {
+        let forward = horizontal_forward(self.camera.forward());
+        let mut visible = chunk_meshes
+            .iter()
+            .filter(|(position, _)| self.chunk_is_visible(**position))
+            .collect::<Vec<_>>();
+
+        visible.sort_by(|(a, _), (b, _)| {
+            chunk_render_priority(**a, self.camera.position, forward)
+                .total_cmp(&chunk_render_priority(**b, self.camera.position, forward))
+        });
+
+        if visible.len() > MAX_VISIBLE_CHUNK_MESHES {
+            visible.truncate(MAX_VISIBLE_CHUNK_MESHES);
+        }
+
+        visible.into_iter().map(|(_, mesh)| mesh).collect()
     }
 
     fn world_position_is_visible(&self, position: Vec3, max_distance: f32) -> bool {
@@ -6529,6 +6561,9 @@ fn ordered_chunk_positions(radius: i32) -> Vec<ChunkPos> {
                 if x.abs().max(z.abs()) != ring {
                     continue;
                 }
+                if !within_chunk_radius(x, z, radius) {
+                    continue;
+                }
 
                 positions.push(ChunkPos { x, z });
             }
@@ -6538,11 +6573,30 @@ fn ordered_chunk_positions(radius: i32) -> Vec<ChunkPos> {
     positions
 }
 
+fn within_chunk_radius(x: i32, z: i32, radius: i32) -> bool {
+    let x = i64::from(x);
+    let z = i64::from(z);
+    let radius = i64::from(radius);
+    x * x + z * z <= radius * radius
+}
+
 fn chunk_from_world_position(position: Vec3) -> ChunkPos {
     ChunkPos {
         x: (position.x / CHUNK_WIDTH as f32).floor() as i32,
         z: (position.z / CHUNK_DEPTH as f32).floor() as i32,
     }
+}
+
+fn chunk_center(position: ChunkPos, y: f32) -> Vec3 {
+    Vec3::new(
+        position.x as f32 * CHUNK_WIDTH as f32 + CHUNK_WORLD_RADIUS,
+        y,
+        position.z as f32 * CHUNK_DEPTH as f32 + CHUNK_WORLD_RADIUS,
+    )
+}
+
+fn horizontal_forward(direction: Vec3) -> Vec3 {
+    Vec3::new(direction.x, 0.0, direction.z).normalize_or_zero()
 }
 
 fn scaled_render_size(size: PhysicalSize<u32>, scale: f32) -> PhysicalSize<u32> {
@@ -6620,6 +6674,26 @@ fn chunk_priority(
     let forward_bias = 1.0 - forward.dot(to_chunk);
 
     distance_sq + forward_bias * 2.5
+}
+
+fn chunk_render_priority(position: ChunkPos, camera_position: Vec3, forward: Vec3) -> f32 {
+    let center = chunk_center(position, camera_position.y);
+    let horizontal = Vec3::new(
+        center.x - camera_position.x,
+        0.0,
+        center.z - camera_position.z,
+    );
+    let world_distance = horizontal.length();
+    let distance = world_distance / CHUNK_WIDTH as f32;
+    if world_distance <= f32::EPSILON || forward == Vec3::ZERO {
+        return distance;
+    }
+
+    let view_dot = forward
+        .dot(horizontal / world_distance.max(0.001))
+        .clamp(-1.0, 1.0);
+    let forward_penalty = (1.0 - view_dot) * 6.0;
+    distance + forward_penalty
 }
 
 struct MeshBuildResult {

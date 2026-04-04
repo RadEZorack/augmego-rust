@@ -68,6 +68,14 @@ At minimum, Google sign-in needs:
 - `PUBLIC_BASE_URL`
 - `GAME_BACKEND_AUTH_SECRET`
 
+Apple sign-in needs:
+
+- `APPLE_CLIENT_ID`
+- `PUBLIC_BASE_URL`
+- `GAME_BACKEND_AUTH_SECRET`
+
+For Apple web sign-in, `PUBLIC_BASE_URL` must use `https://` and a real domain that is registered as a Return URL for the Apple Services ID. `http://localhost` and raw IP hosts will not work.
+
 During migration, the Rust server will also fall back to `apps/web/.env` if it exists, so older local setups still work.
 
 ### 4. Build or watch the game client
@@ -173,6 +181,8 @@ http://localhost:4000
 - `SESSION_COOKIE_TTL_SECS`
 - `GAME_BACKEND_AUTH_SECRET`
 - `GAME_AUTH_TTL_SECS`
+- `APPLE_CLIENT_ID`
+- `APPLE_SCOPE`
 - `GOOGLE_CLIENT_ID`
 - `GOOGLE_CLIENT_SECRET`
 - `GOOGLE_SCOPE`

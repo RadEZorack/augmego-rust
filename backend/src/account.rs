@@ -1,26 +1,38 @@
 use crate::auth::{
-    SessionCookieConfig, clear_cookie, make_cookie, parse_cookie, sign_game_auth_token,
+    SameSitePolicy, SessionCookieConfig, clear_cookie, make_cookie, parse_cookie,
+    sign_game_auth_token,
 };
 use crate::storage::{StorageObject, StorageService};
 use anyhow::{Context, Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
-use reqwest::Client;
-use serde::Serialize;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use reqwest::{Client, Url};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
+use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
 
+const APPLE_AUTH_URL: &str = "https://appleid.apple.com/auth/authorize";
+const APPLE_KEYS_URL: &str = "https://appleid.apple.com/auth/keys";
+const APPLE_ISSUER: &str = "https://appleid.apple.com";
+const APPLE_SCOPE_DEFAULT: &str = "name email";
+const APPLE_STATE_COOKIE_NAME: &str = "oauth_state_apple";
+const APPLE_NONCE_COOKIE_NAME: &str = "oauth_nonce_apple";
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+const GOOGLE_STATE_COOKIE_NAME: &str = "oauth_state_google";
 const PLAYER_AVATAR_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 #[derive(Clone, Debug)]
 pub struct AccountConfig {
     pub public_base_url: String,
     pub session_cookie: SessionCookieConfig,
+    pub apple_client_id: String,
+    pub apple_scope: String,
     pub google_client_id: String,
     pub google_client_secret: String,
     pub google_scope: String,
@@ -64,16 +76,49 @@ pub struct SessionUser {
 }
 
 #[derive(Clone, Debug)]
-pub struct GoogleSigninStart {
+pub struct OAuthSigninStart {
     pub redirect_url: String,
-    pub state_cookie: String,
+    pub set_cookies: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
-pub struct GoogleCallbackResult {
+pub struct OAuthCallbackResult {
     pub redirect_url: String,
     pub session_cookie: String,
-    pub clear_state_cookie: String,
+    pub clear_cookies: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppleAuthorizeUser {
+    email: Option<String>,
+    name: Option<AppleAuthorizeUserName>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppleAuthorizeUserName {
+    first_name: Option<String>,
+    last_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppleKeySet {
+    keys: Vec<AppleJsonWebKey>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppleJsonWebKey {
+    kid: String,
+    n: String,
+    e: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppleIdTokenClaims {
+    sub: String,
+    email: Option<String>,
+    nonce: Option<String>,
 }
 
 pub enum AvatarFileResponse {
@@ -168,7 +213,7 @@ impl AccountService {
         }))
     }
 
-    pub fn start_google_signin(&self) -> Result<GoogleSigninStart> {
+    pub fn start_google_signin(&self) -> Result<OAuthSigninStart> {
         if self.config.google_client_id.trim().is_empty() {
             return Err(anyhow!("Google OAuth is not configured"));
         }
@@ -187,14 +232,66 @@ impl AccountService {
         .collect::<Vec<_>>()
         .join("&");
 
-        Ok(GoogleSigninStart {
+        Ok(OAuthSigninStart {
             redirect_url: format!("{GOOGLE_AUTH_URL}?{query}"),
-            state_cookie: make_cookie(
-                "oauth_state_google",
+            set_cookies: vec![make_cookie(
+                GOOGLE_STATE_COOKIE_NAME,
                 &state,
                 &self.config.session_cookie,
                 Some(Duration::from_secs(60 * 15)),
-            ),
+            )],
+        })
+    }
+
+    pub fn start_apple_signin(&self) -> Result<OAuthSigninStart> {
+        if self.config.apple_client_id.trim().is_empty() {
+            return Err(anyhow!("Apple OAuth is not configured"));
+        }
+
+        let cookie_config = self.apple_oauth_cookie_config()?;
+        let state = Uuid::new_v4().to_string();
+        let nonce = Uuid::new_v4().to_string();
+        let mut query = vec![
+            ("response_type", "code id_token".to_string()),
+            ("response_mode", "form_post".to_string()),
+            ("client_id", self.config.apple_client_id.clone()),
+            ("redirect_uri", self.apple_redirect_uri()),
+            ("state", state.clone()),
+            ("nonce", nonce.clone()),
+        ];
+        let scope = self.config.apple_scope.trim();
+        query.push((
+            "scope",
+            if scope.is_empty() {
+                APPLE_SCOPE_DEFAULT
+            } else {
+                scope
+            }
+            .to_string(),
+        ));
+
+        let query = query
+            .into_iter()
+            .map(|(key, value)| format!("{key}={}", url_encode(&value)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        Ok(OAuthSigninStart {
+            redirect_url: format!("{APPLE_AUTH_URL}?{query}"),
+            set_cookies: vec![
+                make_cookie(
+                    APPLE_STATE_COOKIE_NAME,
+                    &state,
+                    &cookie_config,
+                    Some(Duration::from_secs(60 * 15)),
+                ),
+                make_cookie(
+                    APPLE_NONCE_COOKIE_NAME,
+                    &nonce,
+                    &cookie_config,
+                    Some(Duration::from_secs(60 * 15)),
+                ),
+            ],
         })
     }
 
@@ -203,8 +300,8 @@ impl AccountService {
         code: &str,
         state: &str,
         cookie_header: Option<&str>,
-    ) -> Result<GoogleCallbackResult> {
-        let expected_state = parse_cookie(cookie_header, "oauth_state_google")
+    ) -> Result<OAuthCallbackResult> {
+        let expected_state = parse_cookie(cookie_header, GOOGLE_STATE_COOKIE_NAME)
             .ok_or_else(|| anyhow!("missing oauth state cookie"))?;
         if expected_state != state {
             return Err(anyhow!("invalid oauth state"));
@@ -265,46 +362,94 @@ impl AccountService {
             .get("sub")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("missing google subject"))?;
-        let email = profile.get("email").and_then(Value::as_str).map(str::to_string);
-        let name = profile.get("name").and_then(Value::as_str).map(str::to_string);
+        let email = profile
+            .get("email")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let name = profile
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let avatar_url = profile
             .get("picture")
             .and_then(Value::as_str)
             .map(str::to_string);
 
         let user_id = self
-            .upsert_google_user(google_subject, email.as_deref(), name.as_deref(), avatar_url.as_deref())
+            .upsert_oauth_user(
+                "google",
+                "Google",
+                google_subject,
+                email.as_deref(),
+                name.as_deref(),
+                avatar_url.as_deref(),
+            )
             .await?;
-        let session_id = Uuid::new_v4();
-        let expires_at = Utc::now()
-            + ChronoDuration::from_std(self.config.session_cookie.ttl)
-                .unwrap_or_else(|_| ChronoDuration::hours(24 * 7));
-
-        sqlx::query(
-            "INSERT INTO sessions (id, user_id, expires_at)
-             VALUES ($1, $2, $3)",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(expires_at)
-        .execute(&self.pool)
-        .await
-        .context("create session")?;
-
-        Ok(GoogleCallbackResult {
-            redirect_url: self.config.public_base_url.clone(),
-            session_cookie: make_cookie(
-                &self.config.session_cookie.name,
-                &session_id.to_string(),
+        self.create_oauth_session(
+            user_id,
+            vec![clear_cookie(
+                GOOGLE_STATE_COOKIE_NAME,
                 &self.config.session_cookie,
-                None,
+            )],
+        )
+        .await
+    }
+
+    pub async fn handle_apple_callback(
+        &self,
+        id_token: &str,
+        state: &str,
+        user_payload: Option<&str>,
+        cookie_header: Option<&str>,
+    ) -> Result<OAuthCallbackResult> {
+        let cookie_config = self.apple_oauth_cookie_config()?;
+        let expected_state = parse_cookie(cookie_header, APPLE_STATE_COOKIE_NAME)
+            .ok_or_else(|| anyhow!("missing apple oauth state cookie"))?;
+        if expected_state != state {
+            return Err(anyhow!("invalid apple oauth state"));
+        }
+        let expected_nonce = parse_cookie(cookie_header, APPLE_NONCE_COOKIE_NAME)
+            .ok_or_else(|| anyhow!("missing apple oauth nonce cookie"))?;
+        let claims = self
+            .validate_apple_id_token(id_token, &expected_nonce)
+            .await?;
+        let parsed_user = match user_payload
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(payload) => Some(
+                serde_json::from_str::<AppleAuthorizeUser>(payload)
+                    .context("decode apple user payload")?,
             ),
-            clear_state_cookie: clear_cookie("oauth_state_google", &self.config.session_cookie),
-        })
+            None => None,
+        };
+        let email = claims
+            .email
+            .as_deref()
+            .or_else(|| parsed_user.as_ref().and_then(|user| user.email.as_deref()));
+        let name = parsed_user
+            .as_ref()
+            .and_then(|user| user.name.as_ref())
+            .and_then(apple_user_display_name);
+
+        let user_id = self
+            .upsert_oauth_user("apple", "Apple", &claims.sub, email, name.as_deref(), None)
+            .await?;
+        self.create_oauth_session(
+            user_id,
+            vec![
+                clear_cookie(APPLE_STATE_COOKIE_NAME, &cookie_config),
+                clear_cookie(APPLE_NONCE_COOKIE_NAME, &cookie_config),
+            ],
+        )
+        .await
     }
 
     pub fn logout_cookie(&self) -> String {
-        clear_cookie(&self.config.session_cookie.name, &self.config.session_cookie)
+        clear_cookie(
+            &self.config.session_cookie.name,
+            &self.config.session_cookie,
+        )
     }
 
     pub async fn revoke_session(&self, cookie_header: Option<&str>) -> Result<()> {
@@ -373,7 +518,12 @@ impl AccountService {
                 storage_key
                     .as_deref()
                     .and_then(|key| self.storage.public_url(key))
-                    .or_else(|| Some(self.resolve_player_avatar_file_url(user_id, PlayerAvatarSlot::parse(slot.to_ascii_lowercase().as_str())?)))
+                    .or_else(|| {
+                        Some(self.resolve_player_avatar_file_url(
+                            user_id,
+                            PlayerAvatarSlot::parse(slot.to_ascii_lowercase().as_str())?,
+                        ))
+                    })
             });
             match slot.as_str() {
                 "IDLE" => selection.stationary_model_url = resolved,
@@ -391,12 +541,27 @@ impl AccountService {
         user_id: Uuid,
         selection: &AvatarSelection,
     ) -> Result<()> {
-        self.upsert_avatar_slot(user_id, PlayerAvatarSlot::Idle, selection.stationary_model_url.as_deref(), None)
-            .await?;
-        self.upsert_avatar_slot(user_id, PlayerAvatarSlot::Run, selection.move_model_url.as_deref(), None)
-            .await?;
-        self.upsert_avatar_slot(user_id, PlayerAvatarSlot::Dance, selection.special_model_url.as_deref(), None)
-            .await?;
+        self.upsert_avatar_slot(
+            user_id,
+            PlayerAvatarSlot::Idle,
+            selection.stationary_model_url.as_deref(),
+            None,
+        )
+        .await?;
+        self.upsert_avatar_slot(
+            user_id,
+            PlayerAvatarSlot::Run,
+            selection.move_model_url.as_deref(),
+            None,
+        )
+        .await?;
+        self.upsert_avatar_slot(
+            user_id,
+            PlayerAvatarSlot::Dance,
+            selection.special_model_url.as_deref(),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -480,11 +645,120 @@ impl AccountService {
         })
     }
 
+    fn apple_redirect_uri(&self) -> String {
+        format!(
+            "{}/api/v1/auth/apple/callback",
+            self.config.public_base_url.trim_end_matches('/')
+        )
+    }
+
     fn google_redirect_uri(&self) -> String {
         format!(
             "{}/api/v1/auth/google/callback",
             self.config.public_base_url.trim_end_matches('/')
         )
+    }
+
+    fn apple_oauth_cookie_config(&self) -> Result<SessionCookieConfig> {
+        let redirect_uri = self.apple_redirect_uri();
+        let redirect_uri = Url::parse(&redirect_uri).context("parse apple redirect uri")?;
+        if redirect_uri.scheme() != "https" {
+            anyhow::bail!("Apple OAuth requires PUBLIC_BASE_URL to use https");
+        }
+        let host = redirect_uri
+            .host_str()
+            .ok_or_else(|| anyhow!("Apple OAuth requires PUBLIC_BASE_URL to include a host"))?;
+        if host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok() {
+            anyhow::bail!("Apple OAuth requires a domain-based PUBLIC_BASE_URL");
+        }
+
+        Ok(SessionCookieConfig {
+            name: self.config.session_cookie.name.clone(),
+            secure: true,
+            same_site: SameSitePolicy::None,
+            ttl: self.config.session_cookie.ttl,
+        })
+    }
+
+    async fn create_oauth_session(
+        &self,
+        user_id: Uuid,
+        clear_cookies: Vec<String>,
+    ) -> Result<OAuthCallbackResult> {
+        let session_id = Uuid::new_v4();
+        let expires_at = Utc::now()
+            + ChronoDuration::from_std(self.config.session_cookie.ttl)
+                .unwrap_or_else(|_| ChronoDuration::hours(24 * 7));
+
+        sqlx::query(
+            "INSERT INTO sessions (id, user_id, expires_at)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .context("create session")?;
+
+        Ok(OAuthCallbackResult {
+            redirect_url: self.config.public_base_url.clone(),
+            session_cookie: make_cookie(
+                &self.config.session_cookie.name,
+                &session_id.to_string(),
+                &self.config.session_cookie,
+                None,
+            ),
+            clear_cookies,
+        })
+    }
+
+    async fn validate_apple_id_token(
+        &self,
+        id_token: &str,
+        expected_nonce: &str,
+    ) -> Result<AppleIdTokenClaims> {
+        let header = decode_header(id_token).context("decode apple id token header")?;
+        let kid = header
+            .kid
+            .ok_or_else(|| anyhow!("apple id token missing key id"))?;
+
+        let keys_response = self
+            .http
+            .get(APPLE_KEYS_URL)
+            .send()
+            .await
+            .context("fetch apple signing keys")?;
+        if !keys_response.status().is_success() {
+            let status = keys_response.status();
+            let text = keys_response.text().await.unwrap_or_default();
+            anyhow::bail!("Apple signing key lookup failed ({status}): {text}");
+        }
+        let key_set = keys_response
+            .json::<AppleKeySet>()
+            .await
+            .context("decode apple signing keys")?;
+        let key = key_set
+            .keys
+            .into_iter()
+            .find(|candidate| candidate.kid == kid)
+            .ok_or_else(|| anyhow!("apple signing key not found"))?;
+
+        let decoding_key =
+            DecodingKey::from_rsa_components(&key.n, &key.e).context("build apple decoding key")?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&[self.config.apple_client_id.as_str()]);
+        validation.set_issuer(&[APPLE_ISSUER]);
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        let claims = decode::<AppleIdTokenClaims>(id_token, &decoding_key, &validation)
+            .context("validate apple id token")?
+            .claims;
+
+        if claims.nonce.as_deref() != Some(expected_nonce) {
+            anyhow::bail!("invalid apple oauth nonce");
+        }
+
+        Ok(claims)
     }
 
     fn resolve_player_avatar_storage_key(&self, user_id: Uuid, slot: PlayerAvatarSlot) -> String {
@@ -531,8 +805,10 @@ impl AccountService {
         Ok(())
     }
 
-    async fn upsert_google_user(
+    async fn upsert_oauth_user(
         &self,
+        provider: &str,
+        provider_label: &str,
         subject: &str,
         email: Option<&str>,
         name: Option<&str>,
@@ -544,11 +820,12 @@ impl AccountService {
                  FROM users
                  LEFT JOIN auth_identities
                    ON auth_identities.user_id = users.id
-                  AND auth_identities.provider = 'google'
+                  AND auth_identities.provider = $2
                  WHERE users.email = $1
                  LIMIT 1",
             )
             .bind(email)
+            .bind(provider)
             .fetch_optional(&self.pool)
             .await
             .context("load existing user by email")?
@@ -560,7 +837,7 @@ impl AccountService {
             let existing_subject: Option<String> = row.try_get("subject")?;
             if let Some(existing_subject) = existing_subject {
                 if existing_subject != subject {
-                    anyhow::bail!("email already linked to another Google account");
+                    anyhow::bail!("email already linked to another {provider_label} account");
                 }
             }
         }
@@ -581,33 +858,35 @@ impl AccountService {
             .bind(avatar_url)
             .execute(&self.pool)
             .await
-            .context("update user from google profile")?;
+            .context("update user from oauth profile")?;
             sqlx::query(
                 "INSERT INTO auth_identities (id, user_id, provider, subject, email)
-                 VALUES ($1, $2, 'google', $3, $4)
+                 VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT (provider, subject)
                  DO UPDATE SET email = EXCLUDED.email",
             )
             .bind(Uuid::new_v4())
             .bind(user_id)
+            .bind(provider)
             .bind(subject)
             .bind(email)
             .execute(&self.pool)
             .await
-            .context("upsert google identity for existing user")?;
+            .context("upsert oauth identity for existing user")?;
             return Ok(user_id);
         }
 
         let existing_identity = sqlx::query(
             "SELECT user_id
              FROM auth_identities
-             WHERE provider = 'google' AND subject = $1
+             WHERE provider = $1 AND subject = $2
              LIMIT 1",
         )
+        .bind(provider)
         .bind(subject)
         .fetch_optional(&self.pool)
         .await
-        .context("load google identity")?;
+        .context("load oauth identity")?;
 
         if let Some(row) = existing_identity {
             let user_id: Uuid = row.try_get("user_id")?;
@@ -625,7 +904,7 @@ impl AccountService {
             .bind(avatar_url)
             .execute(&self.pool)
             .await
-            .context("refresh google linked user")?;
+            .context("refresh oauth linked user")?;
             return Ok(user_id);
         }
 
@@ -643,16 +922,28 @@ impl AccountService {
         .context("insert user")?;
         sqlx::query(
             "INSERT INTO auth_identities (id, user_id, provider, subject, email)
-             VALUES ($1, $2, 'google', $3, $4)",
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(Uuid::new_v4())
         .bind(user_id)
+        .bind(provider)
         .bind(subject)
         .bind(email)
         .execute(&self.pool)
         .await
-        .context("insert google identity")?;
+        .context("insert oauth identity")?;
         Ok(user_id)
+    }
+}
+
+fn apple_user_display_name(name: &AppleAuthorizeUserName) -> Option<String> {
+    let first = name.first_name.as_deref().unwrap_or_default().trim();
+    let last = name.last_name.as_deref().unwrap_or_default().trim();
+    let combined = format!("{first} {last}").trim().to_string();
+    if combined.is_empty() {
+        None
+    } else {
+        Some(combined)
     }
 }
 
@@ -660,13 +951,9 @@ fn url_encode(value: &str) -> String {
     value
         .bytes()
         .flat_map(|byte| match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~' => vec![byte as char],
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
             _ => format!("%{byte:02X}").chars().collect::<Vec<_>>(),
         })
         .collect()

@@ -8,8 +8,8 @@ use shared_protocol::{
     CapturedPetsSnapshot, ClientHello, ClientMessage, ClientWebRtcSignal, InventorySnapshot,
     LoginRequest, PROTOCOL_VERSION, PeerRealtimeState, PetIdentity, PetStateSnapshot,
     PlaceBlockRequest, PlayerInputTick, PlayerLeft, ServerMessage, ServerWebRtcSignal,
-    SubscribeChunks, WebRtcSignalPayload, WildPetMotionSnapshot, WildPetSnapshot,
-    WildPetUnload, decode, encode,
+    SubscribeChunks, WebRtcSignalPayload, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload,
+    decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::cell::RefCell;
@@ -126,7 +126,7 @@ const REMOTE_AVATAR_RUN_SPEED_THRESHOLD: f32 = 0.15;
 const REMOTE_AVATAR_IDLE_DELAY_SECS: f32 = 0.35;
 const REMOTE_AVATAR_DANCE_DELAY_SECS: f32 = 5.0;
 const AUTH_STATUS_CHECKING: &str = "Checking your sign-in session...";
-const AUTH_STATUS_SIGNED_OUT: &str = "Sign in with Google, or continue as a guest.";
+const AUTH_STATUS_SIGNED_OUT: &str = "Sign in with Google or Apple, or continue as a guest.";
 
 #[derive(Clone, Debug)]
 struct AuthUser {
@@ -1862,7 +1862,10 @@ impl WebApp {
         if !self.spawn_settled {
             return;
         }
-        let desired_count = self.active_captured_pet_identities().len().min(PET_FOLLOWER_COUNT);
+        let desired_count = self
+            .active_captured_pet_identities()
+            .len()
+            .min(PET_FOLLOWER_COUNT);
         if desired_count == 0 {
             self.pet_followers.clear();
             self.pet_followers_need_reset = false;
@@ -1890,7 +1893,10 @@ impl WebApp {
 
     fn update_pet_followers(&mut self, dt: Duration) {
         let dt_secs = dt.as_secs_f32();
-        let desired_count = self.active_captured_pet_identities().len().min(PET_FOLLOWER_COUNT);
+        let desired_count = self
+            .active_captured_pet_identities()
+            .len()
+            .min(PET_FOLLOWER_COUNT);
         if desired_count == 0 {
             self.pet_followers.clear();
             return;
@@ -1978,7 +1984,8 @@ impl WebApp {
                 pet.last_goal_distance = horizontal_distance(pet.feet_position, pet.wander_target);
             }
         } else if horizontal_distance(pet.feet_position, pet.wander_target)
-            <= WILD_PET_TARGET_REACHED_DISTANCE {
+            <= WILD_PET_TARGET_REACHED_DISTANCE
+        {
             pet.idle_timer = wild_pet_idle_duration();
             pet.wander_target = pet.feet_position;
             pet.horizontal_velocity = Vec3::ZERO;
@@ -2642,7 +2649,8 @@ impl WebApp {
         for identities in self.remote_player_pet_identities.values() {
             requested_pet_identities.extend(identities.iter().cloned());
         }
-        requested_pet_identities.extend(self.wild_pets.values().map(|pet| pet.pet_identity.clone()));
+        requested_pet_identities
+            .extend(self.wild_pets.values().map(|pet| pet.pet_identity.clone()));
         self.ensure_pet_identities_requested(&requested_pet_identities);
     }
 
@@ -2651,7 +2659,8 @@ impl WebApp {
             let Some(url) = identity.model_url.as_deref() else {
                 continue;
             };
-            if self.remote_pet_assets.contains_key(url) || self.pending_remote_pet_urls.contains(url)
+            if self.remote_pet_assets.contains_key(url)
+                || self.pending_remote_pet_urls.contains(url)
             {
                 continue;
             }
@@ -2660,7 +2669,10 @@ impl WebApp {
         }
     }
 
-    fn pet_mesh_for_identity<'a>(&'a self, identity: Option<&PetIdentity>) -> Option<&'a TexturedMesh> {
+    fn pet_mesh_for_identity<'a>(
+        &'a self,
+        identity: Option<&PetIdentity>,
+    ) -> Option<&'a TexturedMesh> {
         if let Some(url) = identity.and_then(|pet| pet.model_url.as_deref()) {
             if let Some(mesh) = self.remote_pet_assets.get(url) {
                 return Some(mesh);
@@ -4170,7 +4182,7 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
         "margin:0 0 18px 0;color:rgba(230,237,243,0.78);font-size:15px;line-height:1.5;",
     );
     body_copy.set_text_content(Some(
-        "Sign in with Google for saved pets and avatars, or continue as a guest to explore.",
+        "Sign in with Google or Apple for saved pets and avatars, or continue as a guest to explore.",
     ));
     let _ = card.append_child(&body_copy);
 
@@ -4186,7 +4198,10 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
     let _ = buttons.set_attribute("style", "display:grid;gap:10px;");
 
     let mut onclicks = Vec::new();
-    for (provider, label) in [("google", "Continue With Google")] {
+    for (provider, label) in [
+        ("google", "Continue With Google"),
+        ("apple", "Continue With Apple"),
+    ] {
         let button = document
             .create_element("button")
             .expect("auth provider button");

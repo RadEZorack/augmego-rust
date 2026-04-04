@@ -10,7 +10,7 @@ use crate::storage::{StorageConfig, StorageProvider, StorageService};
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Multipart, Path as AxumPath, Query, State};
+use axum::extract::{Form, Multipart, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -70,6 +70,8 @@ pub struct ServerConfig {
     pub session_cookie_secure: bool,
     pub session_cookie_same_site: SameSitePolicy,
     pub session_cookie_ttl: Duration,
+    pub apple_client_id: String,
+    pub apple_scope: String,
     pub google_client_id: String,
     pub google_client_secret: String,
     pub google_scope: String,
@@ -170,6 +172,8 @@ impl Default for ServerConfig {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(60 * 60 * 24 * 7),
             ),
+            apple_client_id: std::env::var("APPLE_CLIENT_ID").unwrap_or_default(),
+            apple_scope: std::env::var("APPLE_SCOPE").unwrap_or_else(|_| "name email".to_string()),
             google_client_id: std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
             google_client_secret: std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
             google_scope: std::env::var("GOOGLE_SCOPE")
@@ -1223,6 +1227,14 @@ struct GoogleCallbackQuery {
     state: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AppleCallbackForm {
+    id_token: Option<String>,
+    state: Option<String>,
+    user: Option<String>,
+    error: Option<String>,
+}
+
 pub struct VoxelServer {
     config: ServerConfig,
     account_service: AccountService,
@@ -1264,6 +1276,8 @@ impl VoxelServer {
                     same_site: config.session_cookie_same_site,
                     ttl: config.session_cookie_ttl,
                 },
+                apple_client_id: config.apple_client_id.clone(),
+                apple_scope: config.apple_scope.clone(),
                 google_client_id: config.google_client_id.clone(),
                 google_client_secret: config.google_client_secret.clone(),
                 google_scope: config.google_scope.clone(),
@@ -1382,6 +1396,8 @@ impl VoxelServer {
             .route("/mesh-worker.js", get(play_mesh_worker_compat))
             .route("/ws", get(websocket_upgrade))
             .route("/api/v1/health", get(api_health))
+            .route("/api/v1/auth/apple", get(auth_apple))
+            .route("/api/v1/auth/apple/callback", post(auth_apple_callback))
             .route("/api/v1/auth/google", get(auth_google))
             .route("/api/v1/auth/google/callback", get(auth_google_callback))
             .route("/api/v1/auth/logout", post(auth_logout))
@@ -1948,7 +1964,7 @@ async fn learn_page() -> Html<&'static str> {
     <main>
       <div style="font-size:12px;letter-spacing:0.16em;text-transform:uppercase;color:rgba(147,79,34,0.78);margin-bottom:16px;">About Augmego</div>
       <h1>A shared voxel world with collectible creatures.</h1>
-      <p>Players can drop in as guests, sign in with Google when they want persistence, upload animated avatars, and collect procedurally generated pets that stay tied to their account.</p>
+      <p>Players can drop in as guests, sign in with Google or Apple when they want persistence, upload animated avatars, and collect procedurally generated pets that stay tied to their account.</p>
       <p><a href="/play/">Launch the game client</a></p>
     </main>
   </body>
@@ -2068,13 +2084,104 @@ async fn api_health(State(server): State<VoxelServer>) -> Response {
     }
 }
 
+async fn auth_apple(State(server): State<VoxelServer>) -> Response {
+    match server.account_service.start_apple_signin() {
+        Ok(result) => {
+            let mut response = Redirect::temporary(&result.redirect_url).into_response();
+            for cookie in result.set_cookies {
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, cookie.parse().unwrap());
+            }
+            response
+        }
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(format!(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Apple sign-in is unavailable right now.<br/><br/>{error}</body></html>"
+            )),
+        )
+            .into_response(),
+    }
+}
+
+async fn auth_apple_callback(
+    State(server): State<VoxelServer>,
+    headers: HeaderMap,
+    Form(form): Form<AppleCallbackForm>,
+) -> Response {
+    if let Some(error) = form.error.as_deref() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(format!(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Apple sign-in failed.<br/><br/>{error}</body></html>"
+            )),
+        )
+            .into_response();
+    }
+
+    let Some(state) = form.state.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Apple sign-in failed.<br/><br/>Missing Apple OAuth state.</body></html>"
+                    .to_string(),
+            ),
+        )
+            .into_response();
+    };
+    let Some(id_token) = form.id_token.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Apple sign-in failed.<br/><br/>Missing Apple identity token.</body></html>"
+                    .to_string(),
+            ),
+        )
+            .into_response();
+    };
+
+    match server
+        .account_service
+        .handle_apple_callback(id_token, state, form.user.as_deref(), cookie_header(&headers))
+        .await
+    {
+        Ok(result) => {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::SEE_OTHER;
+            response.headers_mut().insert(
+                header::LOCATION,
+                result.redirect_url.parse().unwrap(),
+            );
+            response
+                .headers_mut()
+                .append(header::SET_COOKIE, result.session_cookie.parse().unwrap());
+            for cookie in result.clear_cookies {
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, cookie.parse().unwrap());
+            }
+            response
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Html(format!(
+                "<!doctype html><html><body style=\"font-family:ui-sans-serif,system-ui,sans-serif;padding:32px;\">Apple sign-in failed.<br/><br/>{error}</body></html>"
+            )),
+        )
+            .into_response(),
+    }
+}
+
 async fn auth_google(State(server): State<VoxelServer>) -> Response {
     match server.account_service.start_google_signin() {
         Ok(result) => {
             let mut response = Redirect::temporary(&result.redirect_url).into_response();
-            response
-                .headers_mut()
-                .append(header::SET_COOKIE, result.state_cookie.parse().unwrap());
+            for cookie in result.set_cookies {
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, cookie.parse().unwrap());
+            }
             response
         }
         Err(error) => (
@@ -2106,9 +2213,11 @@ async fn auth_google_callback(
             response
                 .headers_mut()
                 .append(header::SET_COOKIE, result.session_cookie.parse().unwrap());
-            response
-                .headers_mut()
-                .append(header::SET_COOKIE, result.clear_state_cookie.parse().unwrap());
+            for cookie in result.clear_cookies {
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, cookie.parse().unwrap());
+            }
             response
         }
         Err(error) => (

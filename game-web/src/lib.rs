@@ -49,6 +49,7 @@ const WEB_RADIUS: i32 = 6;
 #[allow(dead_code)]
 const INITIAL_WEB_RADIUS: i32 = 1;
 const SPAWN_READY_RADIUS: i32 = 1;
+const CHUNK_QUALITY_STORAGE_KEY: &str = "augmego.chunk_quality";
 const CHUNK_WORLD_RADIUS: f32 = (CHUNK_WIDTH as f32) * 0.5;
 const DRAW_DISTANCE_CHUNKS: f32 = 6.0;
 const MAX_VISIBLE_CHUNK_MESHES: usize = 56;
@@ -339,6 +340,85 @@ impl Default for RemoteAvatarPlaybackState {
 
 thread_local! {
     static AUTH_GUEST_QUEUE: RefCell<bool> = const { RefCell::new(false) };
+    static CHUNK_QUALITY_CYCLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkQualityPreset {
+    Low,
+    Balanced,
+    High,
+}
+
+impl ChunkQualityPreset {
+    fn chunk_radius(self) -> i32 {
+        match self {
+            Self::Low => 4,
+            Self::Balanced => 5,
+            Self::High => WEB_RADIUS,
+        }
+    }
+
+    fn draw_distance_chunks(self) -> f32 {
+        match self {
+            Self::Low => 4.0,
+            Self::Balanced => 5.0,
+            Self::High => DRAW_DISTANCE_CHUNKS,
+        }
+    }
+
+    fn max_visible_chunk_meshes(self) -> usize {
+        match self {
+            Self::Low => 28,
+            Self::Balanced => 40,
+            Self::High => MAX_VISIBLE_CHUNK_MESHES,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Balanced => "Balanced",
+            Self::High => "High",
+        }
+    }
+
+    fn storage_value(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Balanced => "balanced",
+            Self::High => "high",
+        }
+    }
+
+    fn from_storage_value(value: &str) -> Option<Self> {
+        match value {
+            "low" => Some(Self::Low),
+            "balanced" => Some(Self::Balanced),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    fn cycle(self) -> Self {
+        match self {
+            Self::Low => Self::Balanced,
+            Self::Balanced => Self::High,
+            Self::High => Self::Low,
+        }
+    }
+
+    fn step(self, delta: i8) -> Self {
+        if delta >= 0 {
+            self.cycle()
+        } else {
+            match self {
+                Self::Low => Self::High,
+                Self::Balanced => Self::Low,
+                Self::High => Self::Balanced,
+            }
+        }
+    }
 }
 
 #[wasm_bindgen(start)]
@@ -490,6 +570,8 @@ struct WebApp {
     last_tick: Instant,
     size: PhysicalSize<u32>,
     render_scale: f32,
+    chunk_quality_preset: ChunkQualityPreset,
+    applied_chunk_radius: i32,
     smoothed_frame_time_secs: f32,
     startup_at: Instant,
     last_render_scale_change: Instant,
@@ -568,6 +650,7 @@ struct WebApp {
     auth_overlay: Element,
     auth_overlay_status: Element,
     perf_panel: Element,
+    chunk_quality_button: Element,
     captured_pets_panel: Element,
     player_avatar_panel: Element,
     player_avatar_modal: Element,
@@ -583,6 +666,7 @@ struct WebApp {
     next_worker_index: usize,
     last_perf_panel_update: Instant,
     _worker_onmessages: Vec<Closure<dyn FnMut(MessageEvent)>>,
+    _chunk_quality_button_onclick: Closure<dyn FnMut(WebEvent)>,
 }
 
 impl WebApp {
@@ -599,6 +683,7 @@ impl WebApp {
         webcam_rx: Receiver<WebcamEvent>,
     ) -> Self {
         let now = Instant::now();
+        let chunk_quality_preset = load_chunk_quality_preset();
         let mut camera = Camera::default();
         camera.position = Vec3::new(0.5, PLAYER_EYE_HEIGHT + 96.0, 0.5);
         let link_panel = LinkPanel::near_spawn(camera.position);
@@ -619,6 +704,8 @@ impl WebApp {
         let (peer_realtime_tx, peer_realtime_rx) = mpsc::channel();
         let (auth_overlay, auth_overlay_status, auth_button_onclicks) = create_auth_overlay();
         let perf_panel = create_perf_panel();
+        let (chunk_quality_button, chunk_quality_button_onclick) =
+            create_chunk_quality_button(chunk_quality_preset);
         let captured_pets_panel = create_captured_pets_panel();
         let (
             player_avatar_panel,
@@ -642,6 +729,8 @@ impl WebApp {
             last_tick: now,
             size,
             render_scale: DEFAULT_WEB_RENDER_SCALE,
+            chunk_quality_preset,
+            applied_chunk_radius: chunk_quality_preset.chunk_radius(),
             smoothed_frame_time_secs: 1.0 / 60.0,
             startup_at: now,
             last_render_scale_change: now,
@@ -720,6 +809,7 @@ impl WebApp {
             auth_overlay,
             auth_overlay_status,
             perf_panel,
+            chunk_quality_button,
             captured_pets_panel,
             player_avatar_panel,
             player_avatar_modal,
@@ -735,7 +825,9 @@ impl WebApp {
             next_worker_index: 0,
             last_perf_panel_update: now,
             _worker_onmessages: worker_onmessages,
+            _chunk_quality_button_onclick: chunk_quality_button_onclick,
         };
+        app.update_chunk_quality_button();
         app.update_captured_pets_panel();
         app.update_perf_panel(0, 0);
         app
@@ -789,6 +881,44 @@ impl WebApp {
             (dt_secs - self.smoothed_frame_time_secs) * RENDER_SCALE_SMOOTHING;
     }
 
+    fn chunk_quality_button_text(&self) -> String {
+        format!("Chunk Quality: {}", self.chunk_quality_preset.label())
+    }
+
+    fn update_chunk_quality_button(&self) {
+        self.chunk_quality_button
+            .set_text_content(Some(&self.chunk_quality_button_text()));
+    }
+
+    fn set_chunk_quality_preset(&mut self, preset: ChunkQualityPreset) {
+        if self.chunk_quality_preset == preset {
+            return;
+        }
+
+        self.chunk_quality_preset = preset;
+        save_chunk_quality_preset(preset);
+        self.update_chunk_quality_button();
+        self.last_perf_panel_update = Instant::now()
+            .checked_sub(PERF_PANEL_UPDATE_INTERVAL)
+            .unwrap_or_else(Instant::now);
+    }
+
+    fn step_chunk_quality_preset(&mut self, delta: i8) {
+        self.set_chunk_quality_preset(self.chunk_quality_preset.step(delta));
+    }
+
+    fn process_chunk_quality_requests(&mut self) {
+        let cycle_count = CHUNK_QUALITY_CYCLE_QUEUE.with(|queue| {
+            let mut value = queue.borrow_mut();
+            let count = *value;
+            *value = 0;
+            count
+        });
+        for _ in 0..cycle_count {
+            self.step_chunk_quality_preset(1);
+        }
+    }
+
     fn update_perf_panel(&mut self, visible_chunks: usize, loaded_chunks: usize) {
         let now = Instant::now();
         if now.duration_since(self.last_perf_panel_update) < PERF_PANEL_UPDATE_INTERVAL {
@@ -809,8 +939,9 @@ impl WebApp {
             .count();
 
         self.perf_panel.set_text_content(Some(&format!(
-            "Perf\n{fps:.0} fps | {frame_ms:.1} ms\nrender scale {render_scale:.2}\nchunks {visible_chunks}/{loaded_chunks}\nmesh {pending}/{inflight}/{completed}\npets wild {wild_pets} hosted {hosted_pets}\nremote players {remote_players}\nvideo peers {remote_video_peers}\nnet queue {net_queue}",
+            "Perf\n{fps:.0} fps | {frame_ms:.1} ms\nrender scale {render_scale:.2}\nchunk quality {chunk_quality}\nchunks {visible_chunks}/{loaded_chunks}\nmesh {pending}/{inflight}/{completed}\npets wild {wild_pets} hosted {hosted_pets}\nremote players {remote_players}\nvideo peers {remote_video_peers}\nnet queue {net_queue}",
             render_scale = self.render_scale,
+            chunk_quality = self.chunk_quality_preset.label(),
             pending = self.pending_generation.len(),
             inflight = self.inflight_generation.len(),
             completed = self.completed_meshes.len(),
@@ -859,6 +990,8 @@ impl WebApp {
                 KeyCode::Digit7 => self.set_selected_hotbar(6),
                 KeyCode::Digit8 => self.set_selected_hotbar(7),
                 KeyCode::Digit9 => self.set_selected_hotbar(8),
+                KeyCode::BracketLeft | KeyCode::Minus => self.step_chunk_quality_preset(-1),
+                KeyCode::BracketRight | KeyCode::Equal => self.step_chunk_quality_preset(1),
                 _ => {}
             }
         }
@@ -1308,8 +1441,10 @@ impl WebApp {
                                 self.spawn_settled = false;
                                 self.current_chunk =
                                     chunk_from_world_position(self.camera.position);
+                                let chunk_radius = self.chunk_quality_preset.chunk_radius();
                                 self.desired_chunks =
-                                    desired_chunk_set(self.current_chunk, WEB_RADIUS);
+                                    desired_chunk_set(self.current_chunk, chunk_radius);
+                                self.applied_chunk_radius = chunk_radius;
                                 self.completed_meshes.clear();
                                 self.last_reprioritize_chunk = self.current_chunk;
                                 self.last_reprioritize_forward = self.camera.forward();
@@ -1317,7 +1452,7 @@ impl WebApp {
                                 self.inflight_generation.clear();
                                 self.dirty_generation.clear();
                                 let desired_positions =
-                                    ordered_desired_chunk_positions(self.current_chunk, WEB_RADIUS);
+                                    ordered_desired_chunk_positions(self.current_chunk, chunk_radius);
                                 for position in desired_positions {
                                     self.schedule_chunk_rebuild_deferred(position);
                                 }
@@ -1683,7 +1818,7 @@ impl WebApp {
         }
         self.send_client_message(&ClientMessage::SubscribeChunks(SubscribeChunks {
             center,
-            radius: WEB_RADIUS as u8,
+            radius: self.chunk_quality_preset.chunk_radius() as u8,
         }));
     }
 
@@ -1822,6 +1957,7 @@ impl WebApp {
 
     fn tick(&mut self) {
         self.sync_pointer_lock_state();
+        self.process_chunk_quality_requests();
         self.process_auth_events();
         self.drain_network();
         self.process_peer_realtime_events();
@@ -2988,7 +3124,7 @@ impl WebApp {
         let to_chunk = center - self.camera.position;
         let horizontal = Vec3::new(to_chunk.x, 0.0, to_chunk.z);
         let distance = horizontal.length();
-        let max_distance = DRAW_DISTANCE_CHUNKS * CHUNK_WIDTH as f32;
+        let max_distance = self.chunk_quality_preset.draw_distance_chunks() * CHUNK_WIDTH as f32;
 
         if distance > max_distance {
             return false;
@@ -3032,8 +3168,9 @@ impl WebApp {
                 .total_cmp(&chunk_render_priority(**b, self.camera.position, forward))
         });
 
-        if visible.len() > MAX_VISIBLE_CHUNK_MESHES {
-            visible.truncate(MAX_VISIBLE_CHUNK_MESHES);
+        let max_visible = self.chunk_quality_preset.max_visible_chunk_meshes();
+        if visible.len() > max_visible {
+            visible.truncate(max_visible);
         }
 
         visible.into_iter().map(|(_, mesh)| mesh).collect()
@@ -3490,13 +3627,15 @@ impl WebApp {
 
     fn update_streaming_window(&mut self, chunk_meshes: &mut HashMap<ChunkPos, Mesh>) {
         let next_chunk = chunk_from_world_position(self.camera.position);
-        if next_chunk == self.current_chunk {
+        let target_radius = self.chunk_quality_preset.chunk_radius();
+        if next_chunk == self.current_chunk && target_radius == self.applied_chunk_radius {
             return;
         }
 
         let previous_desired = self.desired_chunks.clone();
         self.current_chunk = next_chunk;
-        self.desired_chunks = desired_chunk_set(self.current_chunk, WEB_RADIUS);
+        self.applied_chunk_radius = target_radius;
+        self.desired_chunks = desired_chunk_set(self.current_chunk, target_radius);
         self.send_chunk_subscription(self.current_chunk);
         chunk_meshes.retain(|position, _| self.desired_chunks.contains(position));
         self.authoritative_chunks
@@ -3513,7 +3652,7 @@ impl WebApp {
             .retain(|position| self.desired_chunks.contains(position));
         self.completed_meshes
             .retain(|mesh| self.desired_chunks.contains(&mesh.position));
-        for position in ordered_desired_chunk_positions(self.current_chunk, WEB_RADIUS) {
+        for position in ordered_desired_chunk_positions(self.current_chunk, target_radius) {
             if !previous_desired.contains(&position) {
                 self.schedule_chunk_rebuild_deferred(position);
             }
@@ -4487,6 +4626,39 @@ fn create_perf_panel() -> Element {
     panel
 }
 
+fn create_chunk_quality_button(
+    preset: ChunkQualityPreset,
+) -> (Element, Closure<dyn FnMut(WebEvent)>) {
+    let Some(document) = document() else {
+        let closure =
+            Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        return (fallback_element(), closure);
+    };
+    let Some(body) = document.body() else {
+        let closure =
+            Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        return (fallback_element(), closure);
+    };
+
+    let button = document.create_element("button").expect("chunk quality button");
+    button.set_text_content(Some(&format!("Chunk Quality: {}", preset.label())));
+    let _ = button.set_attribute("type", "button");
+    let _ = button.set_attribute(
+        "style",
+        "position:fixed;left:16px;top:74px;padding:10px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:45;cursor:pointer;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;",
+    );
+    let _ = button.set_attribute("title", "Click to cycle Low, Balanced, High");
+    let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        CHUNK_QUALITY_CYCLE_QUEUE.with(|queue| {
+            let mut pending = queue.borrow_mut();
+            *pending = pending.saturating_add(1);
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = button.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+    let _ = body.append_child(&button);
+    (button, onclick)
+}
+
 fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>) {
     let Some(document) = document() else {
         return (fallback_element(), fallback_element(), Vec::new());
@@ -4722,6 +4894,59 @@ fn block_label(block: BlockId) -> &'static str {
 
 fn document() -> Option<Document> {
     web_sys::window()?.document()
+}
+
+fn load_chunk_quality_preset() -> ChunkQualityPreset {
+    browser_local_storage()
+        .and_then(|storage| browser_storage_get(&storage, CHUNK_QUALITY_STORAGE_KEY))
+        .and_then(|value| ChunkQualityPreset::from_storage_value(&value))
+        .unwrap_or(ChunkQualityPreset::Low)
+}
+
+fn save_chunk_quality_preset(preset: ChunkQualityPreset) {
+    if let Some(storage) = browser_local_storage() {
+        let _ = browser_storage_set(&storage, CHUNK_QUALITY_STORAGE_KEY, preset.storage_value());
+    }
+}
+
+fn browser_local_storage() -> Option<js_sys::Object> {
+    let window = web_sys::window()?;
+    let storage = js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("localStorage")).ok()?;
+    if storage.is_null() || storage.is_undefined() {
+        None
+    } else {
+        storage.dyn_into::<js_sys::Object>().ok()
+    }
+}
+
+fn browser_storage_get(storage: &js_sys::Object, key: &str) -> Option<String> {
+    let get_item = js_sys::Reflect::get(storage.as_ref(), &JsValue::from_str("getItem"))
+        .ok()?
+        .dyn_into::<js_sys::Function>()
+        .ok()?;
+    let value = get_item
+        .call1(storage.as_ref(), &JsValue::from_str(key))
+        .ok()?;
+    if value.is_null() || value.is_undefined() {
+        None
+    } else {
+        value.as_string()
+    }
+}
+
+fn browser_storage_set(storage: &js_sys::Object, key: &str, value: &str) -> Result<()> {
+    let set_item = js_sys::Reflect::get(storage.as_ref(), &JsValue::from_str("setItem"))
+        .map_err(|error| anyhow::anyhow!("resolve setItem: {error:?}"))?
+        .dyn_into::<js_sys::Function>()
+        .map_err(|error| anyhow::anyhow!("cast setItem: {error:?}"))?;
+    set_item
+        .call2(
+            storage.as_ref(),
+            &JsValue::from_str(key),
+            &JsValue::from_str(value),
+        )
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("store browser setting: {error:?}"))
 }
 
 fn pointer_is_locked(canvas: &HtmlCanvasElement) -> bool {

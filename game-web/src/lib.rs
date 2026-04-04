@@ -130,6 +130,8 @@ const WILD_PET_SLOW_RADIUS: f32 = 1.4;
 const WILD_PET_MIN_WANDER_DISTANCE: f32 = 3.0;
 const WILD_PET_MAX_WANDER_DISTANCE: f32 = 10.0;
 const WILD_PET_CAPTURE_TARGET_DISTANCE: f32 = 7.5;
+const WILD_PET_CAPTURE_PLAYER_RADIUS: f32 = 3.25;
+const WILD_PET_CAPTURE_VERTICAL_RANGE: f32 = 2.0;
 const WILD_PET_CAPTURE_BOX_RADIUS: f32 = 0.95;
 const WILD_PET_CAPTURE_BOX_HEIGHT: f32 = 1.45;
 const WILD_PET_CAPTURE_BOX_FOOT_PADDING: f32 = 0.2;
@@ -353,7 +355,7 @@ enum ChunkQualityPreset {
 impl ChunkQualityPreset {
     fn chunk_radius(self) -> i32 {
         match self {
-            Self::Low => 4,
+            Self::Low => 3,
             Self::Balanced => 5,
             Self::High => WEB_RADIUS,
         }
@@ -361,7 +363,7 @@ impl ChunkQualityPreset {
 
     fn draw_distance_chunks(self) -> f32 {
         match self {
-            Self::Low => 4.0,
+            Self::Low => 3.5,
             Self::Balanced => 5.0,
             Self::High => DRAW_DISTANCE_CHUNKS,
         }
@@ -369,7 +371,7 @@ impl ChunkQualityPreset {
 
     fn max_visible_chunk_meshes(self) -> usize {
         match self {
-            Self::Low => 28,
+            Self::Low => 18,
             Self::Balanced => 40,
             Self::High => MAX_VISIBLE_CHUNK_MESHES,
         }
@@ -1040,16 +1042,24 @@ impl WebApp {
             return;
         }
 
+        if button == MouseButton::Left {
+            if self.current_link_target().is_some() {
+                if confirm_open_url(LINK_PANEL_LABEL_URL) {
+                    open_url(LINK_PANEL_OPEN_URL);
+                }
+                return;
+            }
+
+            if self.nearby_wild_pet_capture_target().is_some() {
+                self.try_capture_nearby_wild_pet();
+            }
+        }
+
         let Some(target) = self.current_interaction_target() else {
             return;
         };
 
         match target {
-            InteractionTarget::Link if button == MouseButton::Left => {
-                if confirm_open_url(LINK_PANEL_LABEL_URL) {
-                    open_url(LINK_PANEL_OPEN_URL);
-                }
-            }
             InteractionTarget::WildPet(hit) if button == MouseButton::Left => {
                 if !self.can_capture_generated_pets() {
                     self.set_pet_notice("Sign in to capture generated pets.");
@@ -1083,6 +1093,19 @@ impl WebApp {
             },
             InteractionTarget::Link | InteractionTarget::WildPet(_) => {}
         }
+    }
+
+    fn try_capture_nearby_wild_pet(&mut self) {
+        let Some(hit) = self.nearby_wild_pet_capture_target() else {
+            return;
+        };
+        if !self.can_capture_generated_pets() {
+            self.set_pet_notice("Sign in to capture generated pets.");
+            return;
+        }
+        self.send_client_message(&ClientMessage::CaptureWildPetRequest {
+            pet_id: hit.pet_id,
+        });
     }
 
     fn ensure_webcam_requested(&mut self) {
@@ -1300,7 +1323,7 @@ impl WebApp {
         };
         let details = if self.captured_pets.is_empty() {
             if self.can_capture_generated_pets() {
-                "Explore and left click a wild animal to capture it.".to_string()
+                "Explore and left click near a wild animal to capture it.".to_string()
             } else {
                 "Guests can explore, but capture is saved only for signed-in players.".to_string()
             }
@@ -2674,6 +2697,38 @@ impl WebApp {
             if distance > WILD_PET_CAPTURE_TARGET_DISTANCE {
                 continue;
             }
+            if best_hit
+                .map(|hit: WildPetHit| distance < hit.distance)
+                .unwrap_or(true)
+            {
+                best_hit = Some(WildPetHit { pet_id, distance });
+            }
+        }
+
+        best_hit
+    }
+
+    fn nearby_wild_pet_capture_target(&self) -> Option<WildPetHit> {
+        let player_feet = self.player_feet_position();
+        let max_distance_sq = WILD_PET_CAPTURE_PLAYER_RADIUS * WILD_PET_CAPTURE_PLAYER_RADIUS;
+        let mut best_hit = None;
+
+        for (&pet_id, pet) in &self.wild_pets {
+            let horizontal = Vec3::new(
+                pet.position.x - player_feet.x,
+                0.0,
+                pet.position.z - player_feet.z,
+            );
+            let distance_sq = horizontal.length_squared();
+            if distance_sq > max_distance_sq {
+                continue;
+            }
+
+            if (pet.position.y - player_feet.y).abs() > WILD_PET_CAPTURE_VERTICAL_RANGE {
+                continue;
+            }
+
+            let distance = distance_sq.sqrt();
             if best_hit
                 .map(|hit: WildPetHit| distance < hit.distance)
                 .unwrap_or(true)

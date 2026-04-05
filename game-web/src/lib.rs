@@ -1480,7 +1480,10 @@ impl WebApp {
         })();
 
         match result {
-            Ok(()) => self.update_pet_party_modal(),
+            Ok(()) => {
+                self.update_captured_pets_panel();
+                self.update_pet_party_modal();
+            }
             Err(error) => {
                 if let Some(state) = self.pet_party_thumbnail_state.as_mut() {
                     state.failed_keys.insert(source_key.clone());
@@ -1682,73 +1685,7 @@ impl WebApp {
     }
 
     fn update_captured_pets_panel(&self) {
-        let active_count = self.captured_pets.iter().filter(|pet| pet.active).count();
-        let summary = if self.captured_pets.is_empty() {
-            if self.can_capture_generated_pets() {
-                if self.guest_pet_captures_are_temporary() {
-                    "No guest pets yet".to_string()
-                } else {
-                    "No captured pets yet".to_string()
-                }
-            } else {
-                "Choose a session to build your party".to_string()
-            }
-        } else {
-            format!(
-                "{} captured pet{}",
-                self.captured_pets.len(),
-                if self.captured_pets.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            )
-        };
-        let details = if self.captured_pets.is_empty() {
-            if self.can_capture_generated_pets() {
-                if self.guest_pet_captures_are_temporary() {
-                    "Explore and left click near a wild animal to capture it. Guest captures return to the pool when you leave."
-                        .to_string()
-                } else {
-                    "Explore and left click near a wild animal to capture it.".to_string()
-                }
-            } else {
-                "Sign in for saved pets and avatars, or continue as a guest for temporary captures."
-                    .to_string()
-            }
-        } else {
-            let pet_list = self
-                .captured_pets
-                .iter()
-                .map(|pet| {
-                    let active_label = if pet.active { " active" } else { "" };
-                    format!("{}{}", pet.display_name, active_label)
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            if self.guest_pet_captures_are_temporary() {
-                format!("{pet_list}. Guest captures return to the pool when you leave.")
-            } else {
-                pet_list
-            }
-        };
-        let manage_copy = if self.can_capture_generated_pets() {
-            "Open Pet Party"
-        } else {
-            "Choose a Session First"
-        };
-        let notice = self
-            .pet_notice
-            .as_ref()
-            .map(|message| {
-                format!(
-                    "<div style=\"margin-top:8px;color:#f7d794;font-size:12px;line-height:1.45;\">{message}</div>"
-                )
-            })
-            .unwrap_or_default();
-        self.captured_pets_panel.set_inner_html(&format!(
-            "<div style=\"font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:rgba(183,230,255,0.66);margin-bottom:8px;\">Captured Pets</div><div style=\"font-size:15px;font-weight:700;color:#f4f7fb;\">{summary}</div><div style=\"margin-top:8px;color:rgba(230,237,243,0.74);font-size:12px;line-height:1.45;\">{details}</div><div style=\"margin-top:8px;color:rgba(183,230,255,0.66);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;\">Active followers: {active_count}</div><div style=\"margin-top:8px;color:#f9d9b6;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;\">{manage_copy}</div>{notice}"
-        ));
+        self.captured_pets_panel.set_text_content(Some("Pet Party"));
     }
 
     fn drain_network(&mut self) {
@@ -5145,7 +5082,7 @@ fn create_captured_pets_panel() -> Element {
     let _ = panel.set_attribute("type", "button");
     let _ = panel.set_attribute(
         "style",
-        "position:fixed;left:16px;bottom:108px;width:min(260px,calc(100vw - 32px));padding:14px 16px;border-radius:16px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:30;font-family:ui-sans-serif,system-ui,sans-serif;text-align:left;cursor:pointer;",
+        "position:fixed;left:16px;bottom:108px;min-width:136px;padding:12px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.16);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:30;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.12em;text-transform:uppercase;text-align:center;cursor:pointer;",
     );
     let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
         PET_PARTY_MODAL_OPEN_QUEUE.with(|queue| {
@@ -5302,13 +5239,21 @@ async fn create_pet_party_thumbnail_renderer() -> Result<PetPartyThumbnailRender
     let Some(document) = document() else {
         anyhow::bail!("document unavailable");
     };
+    let Some(body) = document.body() else {
+        anyhow::bail!("document body unavailable");
+    };
     let canvas = document
         .create_element("canvas")
         .map_err(|error| anyhow::anyhow!("create thumbnail canvas: {error:?}"))?
         .dyn_into::<HtmlCanvasElement>()
         .map_err(|_| anyhow::anyhow!("cast thumbnail canvas"))?;
+    let _ = canvas.set_attribute(
+        "style",
+        "position:fixed;left:-9999px;top:-9999px;width:88px;height:88px;opacity:0;pointer-events:none;z-index:-1;",
+    );
     canvas.set_width(PET_PARTY_THUMBNAIL_SIZE);
     canvas.set_height(PET_PARTY_THUMBNAIL_SIZE);
+    let _ = body.append_child(&canvas);
     let renderer = Renderer::new_with_canvas(
         canvas.clone(),
         PhysicalSize::new(PET_PARTY_THUMBNAIL_SIZE, PET_PARTY_THUMBNAIL_SIZE),

@@ -3,7 +3,7 @@ use shared_math::{ChunkPos, WorldPos};
 use shared_world::{BlockId, ChunkData, ChunkDelta};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -155,6 +155,14 @@ pub struct WorldWeaponSnapshot {
     pub tick: u64,
     pub position: [f32; 3],
     pub weapon_identity: WeaponIdentity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PetWeaponShot {
+    pub tick: u64,
+    pub shooter_player_id: u64,
+    pub origin: [f32; 3],
+    pub target: [f32; 3],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +331,7 @@ pub enum ServerMessage {
     WildPetUnload(WildPetUnload),
     WorldWeaponSnapshot(WorldWeaponSnapshot),
     WorldWeaponUnload(WorldWeaponUnload),
+    PetWeaponShot(PetWeaponShot),
     CapturedPetsSnapshot(CapturedPetsSnapshot),
     CollectedWeaponsSnapshot(CollectedWeaponsSnapshot),
     CaptureWildPetResult(CaptureWildPetResult),
@@ -447,6 +456,27 @@ mod tests {
             ServerMessage::PickupWorldWeaponResult(result) => {
                 assert_eq!(result.weapon_id, 42);
                 assert!(matches!(result.status, PickupWorldWeaponStatus::Collected));
+            }
+            _ => panic!("unexpected server message variant"),
+        }
+    }
+
+    #[test]
+    fn pet_weapon_shot_message_round_trip() {
+        let response = ServerMessage::PetWeaponShot(PetWeaponShot {
+            tick: 99,
+            shooter_player_id: 7,
+            origin: [1.0, 2.0, 3.0],
+            target: [4.0, 5.0, 6.0],
+        });
+        let response_bytes = encode(&response).unwrap();
+        let decoded_response: ServerMessage = decode(&response_bytes).unwrap();
+        match decoded_response {
+            ServerMessage::PetWeaponShot(shot) => {
+                assert_eq!(shot.tick, 99);
+                assert_eq!(shot.shooter_player_id, 7);
+                assert_eq!(shot.origin, [1.0, 2.0, 3.0]);
+                assert_eq!(shot.target, [4.0, 5.0, 6.0]);
             }
             _ => panic!("unexpected server message variant"),
         }

@@ -7,8 +7,8 @@ use shared_protocol::{
     BreakBlockRequest, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
     CapturedPetsSnapshot, ClientHello, ClientMessage, ClientWebRtcSignal, CollectedWeapon,
     CollectedWeaponsSnapshot, InventorySnapshot, LoginRequest, PROTOCOL_VERSION, PeerRealtimeState,
-    PetIdentity, PetStateSnapshot, PetWeaponAssignment, PickupWorldWeaponResult,
-    PickupWorldWeaponStatus, PlaceBlockRequest, PlayerInputTick, PlayerLeft, ServerMessage,
+    PetIdentity, PetStateSnapshot, PetWeaponAssignment, PetWeaponShot,
+    PickupWorldWeaponResult, PlaceBlockRequest, PlayerInputTick, PlayerLeft, ServerMessage,
     ServerWebRtcSignal, SubscribeChunks, UpdatePetPartyRequest, UpdatePetPartyResult,
     WeaponIdentity, WebRtcSignalPayload, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload,
     WorldWeaponSnapshot, WorldWeaponUnload, decode, encode,
@@ -144,6 +144,9 @@ const WORLD_WEAPON_PICKUP_TARGET_DISTANCE: f32 = 7.5;
 const WORLD_WEAPON_PICKUP_BOX_RADIUS: f32 = 0.75;
 const WORLD_WEAPON_PICKUP_BOX_HEIGHT: f32 = 0.95;
 const WORLD_WEAPON_PICKUP_BOX_FOOT_PADDING: f32 = 0.18;
+const PET_WEAPON_SHOT_LIFETIME: Duration = Duration::from_millis(150);
+const PET_WEAPON_SHOT_HALF_WIDTH: f32 = 0.03;
+const PET_WEAPON_SHOT_HALF_DEPTH: f32 = 0.02;
 const PET_SLOT_OFFSETS: [(f32, f32); PET_FOLLOWER_COUNT] = [
     (-1.0, 3.3),
     (1.0, 3.3),
@@ -567,6 +570,9 @@ async fn run() -> Result<()> {
                     if let Some(mesh) = app.build_target_highlight_mesh(&renderer) {
                         overlay_meshes.push(mesh);
                     }
+                    if let Some(mesh) = app.build_pet_weapon_shot_mesh(&renderer) {
+                        overlay_meshes.push(mesh);
+                    }
                     let textured_mesh_refs = textured_meshes.iter().collect::<Vec<_>>();
                     let mut pet_mesh_draws = app.build_pet_mesh_draws(&renderer);
                     pet_mesh_draws.extend(app.build_weapon_mesh_draws(&renderer));
@@ -648,6 +654,7 @@ struct WebApp {
     wild_pets: HashMap<u64, WildPetClientState>,
     hosted_wild_pets: HashMap<u64, HostedWildPetState>,
     world_weapons: HashMap<u64, WorldWeaponClientState>,
+    pet_weapon_shots: Vec<PetWeaponShotClientState>,
     remote_media: HashMap<u64, RemotePeerMedia>,
     remote_avatar_assets: HashMap<String, RemoteAvatarAsset>,
     pending_remote_avatar_urls: HashSet<String>,
@@ -838,6 +845,7 @@ impl WebApp {
             wild_pets: HashMap::new(),
             hosted_wild_pets: HashMap::new(),
             world_weapons: HashMap::new(),
+            pet_weapon_shots: Vec::new(),
             remote_media: HashMap::new(),
             remote_avatar_assets: HashMap::new(),
             pending_remote_avatar_urls: HashSet::new(),
@@ -2157,6 +2165,9 @@ impl WebApp {
                                 self.world_weapons.remove(&weapon_id);
                             }
                         }
+                        ServerMessage::PetWeaponShot(shot) => {
+                            self.apply_pet_weapon_shot(shot);
+                        }
                         ServerMessage::CapturedPetsSnapshot(CapturedPetsSnapshot { pets }) => {
                             self.captured_pets = pets;
                             self.pet_notice = None;
@@ -2616,6 +2627,17 @@ impl WebApp {
                 weapon.weapon_identity = snapshot.weapon_identity.clone();
             })
             .or_insert_with(|| WorldWeaponClientState::from_snapshot(&snapshot));
+    }
+
+    fn apply_pet_weapon_shot(&mut self, shot: PetWeaponShot) {
+        let now = Instant::now();
+        self.pet_weapon_shots
+            .retain(|active_shot| active_shot.expires_at > now);
+        self.pet_weapon_shots.push(PetWeaponShotClientState {
+            origin: Vec3::from_array(shot.origin),
+            target: Vec3::from_array(shot.target),
+            expires_at: now + PET_WEAPON_SHOT_LIFETIME,
+        });
     }
 
     fn player_is_nearby_for_peer_realtime(&self, position: [f32; 3]) -> bool {
@@ -3493,6 +3515,29 @@ impl WebApp {
             (3, 1),
         );
         Some(renderer.create_mesh(&vertices, &indices))
+    }
+
+    fn build_pet_weapon_shot_mesh(&mut self, renderer: &Renderer<'_>) -> Option<Mesh> {
+        let now = Instant::now();
+        self.pet_weapon_shots
+            .retain(|shot| shot.expires_at > now);
+        if self.pet_weapon_shots.is_empty() {
+            return None;
+        }
+
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for shot in &self.pet_weapon_shots {
+            add_pet_weapon_tracer(
+                &mut vertices,
+                &mut indices,
+                shot.origin,
+                shot.target,
+                [1.0, 0.82, 0.32],
+            );
+        }
+
+        (!vertices.is_empty()).then(|| renderer.create_mesh(&vertices, &indices))
     }
 
     fn build_link_panel_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
@@ -5325,6 +5370,13 @@ impl WorldWeaponClientState {
             latest_tick: snapshot.tick,
         }
     }
+}
+
+#[derive(Clone)]
+struct PetWeaponShotClientState {
+    origin: Vec3,
+    target: Vec3,
+    expires_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -8567,6 +8619,43 @@ fn add_box_oriented(
         [corners[0], corners[1], corners[5], corners[4]],
         color,
         uvs,
+    );
+}
+
+fn add_pet_weapon_tracer(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    origin: Vec3,
+    target: Vec3,
+    color: [f32; 3],
+) {
+    let delta = target - origin;
+    let length = delta.length();
+    if length <= f32::EPSILON {
+        return;
+    }
+
+    let forward = delta / length;
+    let reference_up = if forward.dot(Vec3::Y).abs() > 0.95 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let axis_x = forward.cross(reference_up).normalize_or_zero() * PET_WEAPON_SHOT_HALF_WIDTH;
+    let axis_y = axis_x.cross(forward).normalize_or_zero() * PET_WEAPON_SHOT_HALF_DEPTH;
+    if axis_x.length_squared() <= f32::EPSILON || axis_y.length_squared() <= f32::EPSILON {
+        return;
+    }
+
+    add_box_oriented(
+        vertices,
+        indices,
+        (origin + target) * 0.5,
+        axis_x,
+        axis_y,
+        forward * (length * 0.5),
+        color,
+        (3, 1),
     );
 }
 

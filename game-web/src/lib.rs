@@ -151,7 +151,7 @@ const REMOTE_AVATAR_IDLE_DELAY_SECS: f32 = 0.35;
 const REMOTE_AVATAR_DANCE_DELAY_SECS: f32 = 5.0;
 const AUTH_STATUS_CHECKING: &str = "Checking your sign-in session...";
 const AUTH_STATUS_SIGNED_OUT: &str =
-    "Sign in with Google, Apple, or Microsoft, or continue as a guest.";
+    "Sign in with Google, Apple, or Microsoft, or continue as a guest for temporary pet captures.";
 
 #[derive(Clone, Debug)]
 struct AuthUser {
@@ -1290,11 +1290,12 @@ impl WebApp {
             .collect()
     }
 
+    fn guest_pet_captures_are_temporary(&self) -> bool {
+        self.auth_user.as_ref().is_some_and(auth_user_is_guest)
+    }
+
     fn can_capture_generated_pets(&self) -> bool {
-        self.auth_user
-            .as_ref()
-            .and_then(|user| user.game_auth_token.as_ref())
-            .is_some()
+        self.auth_user.is_some()
     }
 
     fn set_pet_notice(&mut self, message: impl Into<String>) {
@@ -1306,9 +1307,13 @@ impl WebApp {
         let active_count = self.captured_pets.iter().filter(|pet| pet.active).count();
         let summary = if self.captured_pets.is_empty() {
             if self.can_capture_generated_pets() {
-                "No captured pets yet".to_string()
+                if self.guest_pet_captures_are_temporary() {
+                    "No guest pets yet".to_string()
+                } else {
+                    "No captured pets yet".to_string()
+                }
             } else {
-                "Sign in to build your party".to_string()
+                "Choose a session to build your party".to_string()
             }
         } else {
             format!(
@@ -1323,19 +1328,31 @@ impl WebApp {
         };
         let details = if self.captured_pets.is_empty() {
             if self.can_capture_generated_pets() {
-                "Explore and left click near a wild animal to capture it.".to_string()
+                if self.guest_pet_captures_are_temporary() {
+                    "Explore and left click near a wild animal to capture it. Guest captures return to the pool when you leave."
+                        .to_string()
+                } else {
+                    "Explore and left click near a wild animal to capture it.".to_string()
+                }
             } else {
-                "Guests can explore, but capture is saved only for signed-in players.".to_string()
+                "Sign in for saved pets and avatars, or continue as a guest for temporary captures."
+                    .to_string()
             }
         } else {
-            self.captured_pets
+            let pet_list = self
+                .captured_pets
                 .iter()
                 .map(|pet| {
                     let active_label = if pet.active { " active" } else { "" };
                     format!("{}{}", pet.display_name, active_label)
                 })
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", ");
+            if self.guest_pet_captures_are_temporary() {
+                format!("{pet_list}. Guest captures return to the pool when you leave.")
+            } else {
+                pet_list
+            }
         };
         let notice = self
             .pet_notice
@@ -1770,18 +1787,27 @@ impl WebApp {
     fn sync_logout_button(&self) {
         match &self.auth_status {
             AuthStatus::SignedIn => {
-                let label = self
+                let is_guest = self
                     .auth_user
                     .as_ref()
                     .filter(|user| auth_user_is_guest(user))
-                    .map(|_| "Exit Guest Session")
-                    .unwrap_or("Log Out");
+                    .is_some();
+                let label = if is_guest {
+                    "Exit Guest Session"
+                } else {
+                    "Log Out"
+                };
                 self.logout_button.set_text_content(Some(label));
+                let _ = self.logout_button.set_attribute(
+                    "data-session-kind",
+                    if is_guest { "guest" } else { "account" },
+                );
                 let _ = self
                     .logout_button
                     .set_attribute("style", logout_button_style());
             }
             _ => {
+                let _ = self.logout_button.remove_attribute("data-session-kind");
                 let _ = self.logout_button.set_attribute("style", "display:none;");
             }
         }
@@ -4753,7 +4779,7 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
         "margin:0 0 18px 0;color:rgba(230,237,243,0.78);font-size:15px;line-height:1.5;",
     );
     body_copy.set_text_content(Some(
-        "Sign in with Google, Apple, or Microsoft for saved pets and avatars, or continue as a guest to explore.",
+        "Sign in with Google, Apple, or Microsoft for saved pets and avatars, or continue as a guest to explore and try temporary pet captures.",
     ));
     let _ = card.append_child(&body_copy);
 
@@ -4891,7 +4917,15 @@ fn create_logout_button() -> (Element, Closure<dyn FnMut(WebEvent)>) {
     let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
         let button = button_for_click.clone();
         spawn_local(async move {
+            let is_guest_session =
+                button.get_attribute("data-session-kind").as_deref() == Some("guest");
             let _ = button.set_attribute("disabled", "true");
+            if is_guest_session {
+                button.set_text_content(Some("Exiting guest session..."));
+                reload_current_tab();
+                return;
+            }
+
             button.set_text_content(Some("Logging out..."));
             match logout_auth_session().await {
                 Ok(()) => reload_current_tab(),

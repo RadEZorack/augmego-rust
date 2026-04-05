@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-const PET_ACTIVE_FOLLOWER_LIMIT: usize = 6;
+pub(crate) const PET_ACTIVE_FOLLOWER_LIMIT: usize = 6;
 const PET_GENERATION_START_BUDGET: i64 = 3;
 const PET_GENERATION_POLL_BUDGET: i64 = 4;
 const MESHY_COMPAT_MODEL: &str = "meshy-6";
@@ -484,6 +484,24 @@ impl PetRegistryClient {
         Ok(CapturePetOutcome::Captured(
             self.load_user_pet_collection(&user_id.to_string()).await?,
         ))
+    }
+
+    pub async fn release_spawned_pet(&self, pet_id: &str) -> Result<bool> {
+        let pet_id = parse_uuid(pet_id, "pet id")?;
+        let update = sqlx::query(
+            "UPDATE pets
+             SET status = 'READY',
+                 spawned_at = NULL,
+                 captured_at = NULL,
+                 captured_by_user_id = NULL,
+                 updated_at = NOW()
+             WHERE id = $1 AND status = 'SPAWNED'",
+        )
+        .bind(pet_id)
+        .execute(&self.pool)
+        .await
+        .context("release spawned pet")?;
+        Ok(update.rows_affected() > 0)
     }
 
     pub async fn read_pet_model_file(&self, pet_id: &str) -> Result<Option<PetModelFileResponse>> {

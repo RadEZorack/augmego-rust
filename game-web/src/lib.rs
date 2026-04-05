@@ -1520,7 +1520,7 @@ impl WebApp {
                         .pet_party_thumbnail_image_url_for_pet(pet)
                         .map(|image_url| {
                             format!(
-                                "<div style=\"width:60px;height:60px;flex:none;perspective:700px;\"><div style=\"width:100%;height:100%;transform-style:preserve-3d;animation:pet-party-thumb-spin 8s linear infinite;\"><img alt=\"{name} thumbnail\" src=\"{image_url}\" style=\"width:100%;height:100%;display:block;object-fit:cover;border-radius:14px;border:1px solid rgba(255,255,255,0.12);box-shadow:0 12px 24px rgba(0,0,0,0.28);background:radial-gradient(circle at top,rgba(255,255,255,0.14),rgba(8,12,18,0.9));backface-visibility:hidden;\" /></div></div>",
+                                "<div style=\"width:60px;height:60px;flex:none;\"><img alt=\"{name} thumbnail\" src=\"{image_url}\" style=\"width:100%;height:100%;display:block;object-fit:cover;border-radius:14px;border:1px solid rgba(255,255,255,0.12);box-shadow:0 12px 24px rgba(0,0,0,0.28);background:radial-gradient(circle at top,rgba(255,255,255,0.14),rgba(8,12,18,0.9));\" /></div>",
                                 name = pet.display_name,
                             )
                         })
@@ -5116,13 +5116,6 @@ fn create_pet_party_modal() -> (Element, Element, Element, Element, Element, Ele
             fallback_element(),
         );
     };
-
-    if let Ok(style) = document.create_element("style") {
-        style.set_text_content(Some(
-            "@keyframes pet-party-thumb-spin { 0% { transform: rotateY(-18deg); } 50% { transform: rotateY(18deg); } 100% { transform: rotateY(342deg); } }",
-        ));
-        let _ = body.append_child(&style);
-    }
 
     let modal = document.create_element("div").expect("pet party modal");
     let _ = modal.set_attribute("style", player_avatar_modal_style());

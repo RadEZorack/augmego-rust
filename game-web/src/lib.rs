@@ -1,7 +1,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use anyhow::Result;
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat4, Quat, Vec3, Vec4};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
     BreakBlockRequest, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
@@ -140,6 +140,7 @@ const WILD_PET_CAPTURE_VERTICAL_RANGE: f32 = 2.0;
 const WILD_PET_CAPTURE_BOX_RADIUS: f32 = 0.95;
 const WILD_PET_CAPTURE_BOX_HEIGHT: f32 = 1.45;
 const WILD_PET_CAPTURE_BOX_FOOT_PADDING: f32 = 0.2;
+const DEFAULT_WILD_PET_MAX_HEALTH: u8 = 30;
 const WORLD_WEAPON_PICKUP_TARGET_DISTANCE: f32 = 7.5;
 const WORLD_WEAPON_PICKUP_BOX_RADIUS: f32 = 0.75;
 const WORLD_WEAPON_PICKUP_BOX_HEIGHT: f32 = 0.95;
@@ -544,6 +545,7 @@ async fn run() -> Result<()> {
                     renderer.update_camera(app.camera_matrix());
                     let visible_meshes = app.collect_visible_chunk_meshes(&chunk_meshes);
                     app.update_perf_panel(visible_meshes.len(), chunk_meshes.len());
+                    app.update_wild_pet_health_overlay();
                     let link_panel_mesh = app.build_link_panel_mesh(&renderer);
                     let mut visible_mesh_refs = visible_meshes;
                     if let Some(mesh) = &link_panel_mesh {
@@ -716,6 +718,7 @@ struct WebApp {
     chunk_quality_button: Element,
     captured_pets_panel: Element,
     weapons_panel: Element,
+    wild_pet_health_overlay: Element,
     pet_party_modal: Element,
     pet_party_modal_copy: Element,
     pet_party_modal_count: Element,
@@ -780,6 +783,7 @@ impl WebApp {
             create_chunk_quality_button(chunk_quality_preset);
         let captured_pets_panel = create_captured_pets_panel();
         let weapons_panel = create_weapon_collection_panel();
+        let wild_pet_health_overlay = create_wild_pet_health_overlay();
         let (
             pet_party_modal,
             pet_party_modal_copy,
@@ -907,6 +911,7 @@ impl WebApp {
             chunk_quality_button,
             captured_pets_panel,
             weapons_panel,
+            wild_pet_health_overlay,
             pet_party_modal,
             pet_party_modal_copy,
             pet_party_modal_count,
@@ -2588,6 +2593,8 @@ impl WebApp {
 
         state.spawn_position = Vec3::from_array(snapshot.spawn_position);
         state.pet_identity = snapshot.pet_identity.clone();
+        state.health = snapshot.health;
+        state.max_health = snapshot.max_health;
         state.host_player_id = snapshot.host_player_id;
         if (snapshot.tick >= state.latest_tick && !is_local_host)
             || host_changed
@@ -2930,6 +2937,8 @@ impl WebApp {
                         pet.horizontal_velocity.z,
                     ),
                     yaw: pet.yaw,
+                    health: DEFAULT_WILD_PET_MAX_HEALTH,
+                    max_health: DEFAULT_WILD_PET_MAX_HEALTH,
                     host_player_id: self.player_id,
                     latest_tick: 0,
                 });
@@ -3301,6 +3310,46 @@ impl WebApp {
     fn camera_matrix(&self) -> Mat4 {
         let aspect = self.size.width as f32 / self.size.height.max(1) as f32;
         self.camera.matrix(aspect)
+    }
+
+    fn world_to_screen_point(&self, position: Vec3) -> Option<(f32, f32)> {
+        let clip = self.camera_matrix() * Vec4::new(position.x, position.y, position.z, 1.0);
+        if clip.w <= 0.0 {
+            return None;
+        }
+
+        let ndc = clip.truncate() / clip.w;
+        if ndc.z < -1.0 || ndc.z > 1.0 || ndc.x.abs() > 1.05 || ndc.y.abs() > 1.05 {
+            return None;
+        }
+
+        let (viewport_width, viewport_height) = css_viewport_size()
+            .unwrap_or((self.size.width as f32, self.size.height as f32));
+        let x = (ndc.x * 0.5 + 0.5) * viewport_width;
+        let y = (1.0 - (ndc.y * 0.5 + 0.5)) * viewport_height;
+        Some((x, y))
+    }
+
+    fn update_wild_pet_health_overlay(&self) {
+        let mut markup = String::new();
+        for pet in self.wild_pets.values() {
+            if !self.pet_should_render_impostor(pet.position) {
+                continue;
+            }
+            let Some((screen_x, screen_y)) =
+                self.world_to_screen_point(pet.position + Vec3::new(0.0, 1.9, 0.0))
+            else {
+                continue;
+            };
+
+            markup.push_str(&format!(
+                "<div style=\"position:fixed;left:{screen_x:.1}px;top:{screen_y:.1}px;transform:translate(-50%,-100%);padding:4px 8px;border-radius:999px;border:1px solid rgba(255,255,255,0.18);background:rgba(11,16,24,0.84);color:#f8df95;box-shadow:0 10px 22px rgba(0,0,0,0.28);font:700 11px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;\">{}/{} HP</div>",
+                pet.health,
+                pet.max_health,
+            ));
+        }
+
+        self.wild_pet_health_overlay.set_inner_html(&markup);
     }
 
     fn current_target(&mut self) -> Option<RaycastHit> {
@@ -5334,6 +5383,8 @@ struct WildPetClientState {
     position: Vec3,
     velocity: Vec3,
     yaw: f32,
+    health: u8,
+    max_health: u8,
     host_player_id: Option<u64>,
     latest_tick: u64,
 }
@@ -5347,6 +5398,8 @@ impl WildPetClientState {
             position: Vec3::from_array(snapshot.position),
             velocity: Vec3::from_array(snapshot.velocity),
             yaw: snapshot.yaw,
+            health: snapshot.health,
+            max_health: snapshot.max_health,
             host_player_id: snapshot.host_player_id,
             latest_tick: snapshot.tick,
         }
@@ -5464,6 +5517,13 @@ fn attach_canvas(canvas: HtmlCanvasElement) {
     let document = window.document().expect("document");
     let body = document.body().expect("body");
     let _ = body.append_child(&canvas);
+}
+
+fn css_viewport_size() -> Option<(f32, f32)> {
+    let window = web_sys::window()?;
+    let width = window.inner_width().ok()?.as_f64()? as f32;
+    let height = window.inner_height().ok()?.as_f64()? as f32;
+    Some((width.max(1.0), height.max(1.0)))
 }
 
 fn create_hotbar(blocks: &[BlockId]) -> Vec<Element> {
@@ -5648,6 +5708,25 @@ fn create_weapon_collection_panel() -> Element {
     );
     let _ = body.append_child(&panel);
     panel
+}
+
+fn create_wild_pet_health_overlay() -> Element {
+    let Some(document) = document() else {
+        return fallback_element();
+    };
+    let Some(body) = document.body() else {
+        return fallback_element();
+    };
+
+    let overlay = document
+        .create_element("div")
+        .expect("wild pet health overlay");
+    let _ = overlay.set_attribute(
+        "style",
+        "position:fixed;inset:0;pointer-events:none;z-index:34;",
+    );
+    let _ = body.append_child(&overlay);
+    overlay
 }
 
 fn create_pet_party_modal() -> (Element, Element, Element, Element, Element, Element) {

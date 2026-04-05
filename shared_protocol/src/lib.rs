@@ -3,7 +3,7 @@ use shared_math::{ChunkPos, WorldPos};
 use shared_world::{BlockId, ChunkData, ChunkDelta};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -91,6 +91,8 @@ pub struct WildPetSnapshot {
     pub position: [f32; 3],
     pub velocity: [f32; 3],
     pub yaw: f32,
+    pub health: u8,
+    pub max_health: u8,
     pub host_player_id: Option<u64>,
     pub pet_identity: PetIdentity,
 }

@@ -737,6 +737,8 @@ impl WildPet {
             position: self.position,
             velocity: self.velocity,
             yaw: self.yaw,
+            health: self.health,
+            max_health: WILD_PET_MAX_HEALTH,
             host_player_id: self.host_player_id,
             pet_identity: self.pet_identity.clone(),
         }
@@ -1079,7 +1081,7 @@ impl WildPetService {
             viewers.sort_unstable();
             if !viewers.is_empty() {
                 outcome.shot_dispatches.push(PetWeaponShotDispatch {
-                    player_ids: viewers,
+                    player_ids: viewers.clone(),
                     shot: PetWeaponShot {
                         tick,
                         shooter_player_id: player.id,
@@ -1090,6 +1092,12 @@ impl WildPetService {
             }
 
             chosen_pet.health = chosen_pet.health.saturating_sub(PET_WEAPON_DAMAGE);
+            if chosen_pet.health > 0 && !viewers.is_empty() {
+                outcome.wild_pet_dispatches.push(WildPetDispatch::Snapshot {
+                    player_ids: viewers.clone(),
+                    snapshot: chosen_pet.snapshot(),
+                });
+            }
             let completed_capture =
                 (chosen_pet.health == 0).then(|| Self::complete_capture(chosen_pet));
             drop(pets);

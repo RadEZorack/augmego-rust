@@ -670,9 +670,10 @@ impl WildPetService {
         }
 
         let pet_identity_ids = pet_identity_ids.iter().cloned().collect::<HashSet<_>>();
-        self.pets.lock().await.retain(|_, pet| {
-            !(pet.captured && pet_identity_ids.contains(&pet.pet_identity.id))
-        });
+        self.pets
+            .lock()
+            .await
+            .retain(|_, pet| !(pet.captured && pet_identity_ids.contains(&pet.pet_identity.id)));
     }
 
     async fn maintain(
@@ -1941,39 +1942,47 @@ impl VoxelServer {
         };
 
         if let Some(user_id) = player.user_id.clone() {
-            match self.pet_registry.capture_pet(&pet_identity.id, &user_id).await {
+            match self
+                .pet_registry
+                .capture_pet(&pet_identity.id, &user_id)
+                .await
+            {
                 Ok(CapturePetOutcome::Captured(collection)) => {
                     self.sync_pet_collection_for_player(player_id, sender, collection)
                         .await;
-                    let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
-                        pet_id,
-                        status: CaptureWildPetStatus::Captured,
-                        message: "Pet captured.".to_string(),
-                    }));
+                    let _ =
+                        sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                            pet_id,
+                            status: CaptureWildPetStatus::Captured,
+                            message: "Pet captured.".to_string(),
+                        }));
                 }
                 Ok(CapturePetOutcome::AlreadyTaken) => {
-                    let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
-                        pet_id,
-                        status: CaptureWildPetStatus::AlreadyTaken,
-                        message: "That pet was already captured.".to_string(),
-                    }));
+                    let _ =
+                        sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                            pet_id,
+                            status: CaptureWildPetStatus::AlreadyTaken,
+                            message: "That pet was already captured.".to_string(),
+                        }));
                     return Ok(());
                 }
                 Ok(CapturePetOutcome::NotFound | CapturePetOutcome::NotSpawned) => {
-                    let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
-                        pet_id,
-                        status: CaptureWildPetStatus::NotFound,
-                        message: "That pet is no longer available.".to_string(),
-                    }));
+                    let _ =
+                        sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                            pet_id,
+                            status: CaptureWildPetStatus::NotFound,
+                            message: "That pet is no longer available.".to_string(),
+                        }));
                     return Ok(());
                 }
                 Err(error) => {
                     tracing::warn!(?error, pet_id, "failed to capture pet in registry");
-                    let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
-                        pet_id,
-                        status: CaptureWildPetStatus::Failed,
-                        message: "We could not finalize that capture.".to_string(),
-                    }));
+                    let _ =
+                        sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
+                            pet_id,
+                            status: CaptureWildPetStatus::Failed,
+                            message: "We could not finalize that capture.".to_string(),
+                        }));
                     return Ok(());
                 }
             }
@@ -1991,8 +2000,9 @@ impl VoxelServer {
             let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
                 pet_id,
                 status: CaptureWildPetStatus::Captured,
-                message: "Pet captured for this guest session. It returns to the pool when you leave."
-                    .to_string(),
+                message:
+                    "Pet captured for this guest session. It returns to the pool when you leave."
+                        .to_string(),
             }));
         } else {
             self.release_guest_pet_captures(&[pet_identity.id.clone()])
@@ -2030,7 +2040,11 @@ impl VoxelServer {
         };
 
         let result = if let Some(user_id) = player.user_id.clone() {
-            match self.pet_registry.update_pet_party(&user_id, &active_pet_ids).await {
+            match self
+                .pet_registry
+                .update_pet_party(&user_id, &active_pet_ids)
+                .await
+            {
                 Ok(UpdatePetPartyOutcome::Updated(collection)) => {
                     self.sync_pet_collection_for_player(player_id, sender, collection)
                         .await;

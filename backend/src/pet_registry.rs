@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use shared_protocol::{CapturedPet, PetIdentity};
 use sqlx::{PgPool, Row, postgres::PgRow};
-use std::collections::HashSet;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::io::Write;
 use std::path::Path;
@@ -493,7 +493,9 @@ impl PetRegistryClient {
         .await
         .context("load captured pets after capture")?;
         let collection = self.build_player_pet_collection(rows)?;
-        tx.commit().await.context("commit capture pet transaction")?;
+        tx.commit()
+            .await
+            .context("commit capture pet transaction")?;
 
         Ok(CapturePetOutcome::Captured(collection))
     }
@@ -2070,7 +2072,10 @@ mod tests {
     #[test]
     fn validate_active_pet_selection_rejects_more_than_six_unique_pets() {
         let available = ["a", "b", "c", "d", "e", "f", "g"];
-        let requested = available.iter().map(|pet_id| pet_id.to_string()).collect::<Vec<_>>();
+        let requested = available
+            .iter()
+            .map(|pet_id| pet_id.to_string())
+            .collect::<Vec<_>>();
 
         let result = validate_active_pet_selection(available, &requested);
 

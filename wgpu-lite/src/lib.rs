@@ -3,6 +3,8 @@ use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use std::{mem, num::NonZeroU64};
 use wgpu::util::DeviceExt;
+#[cfg(target_arch = "wasm32")]
+use wgpu::web_sys::HtmlCanvasElement;
 use winit::{dpi::PhysicalSize, window::Window};
 
 const TILE_SIZE: u32 = 16;
@@ -352,6 +354,26 @@ impl<'a> Renderer<'a> {
     pub async fn new_with_size(window: &'a Window, size: PhysicalSize<u32>) -> Result<Self> {
         let instance = create_instance();
         let surface = instance.create_surface(window).context("create surface")?;
+        Self::from_surface(&instance, surface, size).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_with_canvas(
+        canvas: HtmlCanvasElement,
+        size: PhysicalSize<u32>,
+    ) -> Result<Renderer<'static>> {
+        let instance = create_instance();
+        let surface = instance
+            .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
+            .context("create canvas surface")?;
+        Renderer::from_surface(&instance, surface, size).await
+    }
+
+    async fn from_surface(
+        instance: &wgpu::Instance,
+        surface: wgpu::Surface<'a>,
+        size: PhysicalSize<u32>,
+    ) -> Result<Self> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 compatible_surface: Some(&surface),

@@ -100,6 +100,8 @@ const REMOTE_PLAYER_HALF_HEIGHT: f32 = 0.9;
 const WEBCAM_PANEL_HALF_WIDTH: f32 = 0.55;
 const WEBCAM_PANEL_HALF_HEIGHT: f32 = 0.40;
 const PET_MODEL_DESIRED_HEIGHT: f32 = 1.2;
+const PET_PARTY_THUMBNAIL_SIZE: u32 = 88;
+const PET_PARTY_THUMBNAIL_SOURCE_DEFAULT: &str = "__default-pet-thumbnail__";
 const PET_MODEL_RENDER_DISTANCE: f32 = CHUNK_WIDTH as f32 * 2.75;
 const PET_IMPOSTOR_RENDER_DISTANCE: f32 = CHUNK_WIDTH as f32 * 6.0;
 const HOSTED_WILD_PET_FULL_SIM_DISTANCE: f32 = CHUNK_WIDTH as f32 * 2.5;
@@ -255,6 +257,14 @@ enum RemoteAvatarEvent {
 enum RemotePetEvent {
     Loaded { url: String, bytes: Vec<u8> },
     Failed { url: String, message: String },
+}
+
+struct PetPartyThumbnailRendererState {
+    canvas: HtmlCanvasElement,
+    renderer: Renderer<'static>,
+    meshes: HashMap<String, TexturedMesh>,
+    image_urls: HashMap<String, String>,
+    failed_keys: HashSet<String>,
 }
 
 enum PeerRealtimeEvent {
@@ -454,12 +464,22 @@ async fn run() -> Result<()> {
         scaled_render_size(initial_window_size, DEFAULT_WEB_RENDER_SCALE),
     )
     .await?;
+    let pet_party_thumbnail_state = match create_pet_party_thumbnail_renderer().await {
+        Ok(state) => Some(state),
+        Err(error) => {
+            web_sys::console::warn_1(&JsValue::from_str(&format!(
+                "pet party thumbnails unavailable: {error:?}"
+            )));
+            None
+        }
+    };
     let (mesh_result_rx, workers, worker_onmessage) = start_mesh_worker_pool(MESH_WORKER_COUNT)?;
     let (network_rx, websocket, websocket_handlers) = start_websocket_client()?;
     let (webcam_tx, webcam_rx) = mpsc::channel();
     let mut app = WebApp::new(
         initial_window_size,
         canvas,
+        pet_party_thumbnail_state,
         workers,
         worker_onmessage,
         mesh_result_rx,
@@ -498,6 +518,7 @@ async fn run() -> Result<()> {
                     app.process_webcam_events();
                     app.process_remote_avatar_events(&renderer);
                     app.process_remote_pet_events(&renderer);
+                    app.process_pet_party_thumbnail_generation();
                     app.process_generation_updates(
                         &renderer,
                         &mut chunk_meshes,
@@ -614,6 +635,7 @@ struct WebApp {
     remote_avatar_assets: HashMap<String, RemoteAvatarAsset>,
     pending_remote_avatar_urls: HashSet<String>,
     remote_pet_assets: HashMap<String, TexturedMesh>,
+    remote_pet_model_bytes: HashMap<String, Vec<u8>>,
     pending_remote_pet_urls: HashSet<String>,
     pet_asset: Option<TexturedMesh>,
     pet_asset_attempted: bool,
@@ -626,6 +648,7 @@ struct WebApp {
     pet_party_selected_ids: HashSet<String>,
     pet_party_save_in_flight: bool,
     pet_party_modal_message: Option<String>,
+    pet_party_thumbnail_state: Option<PetPartyThumbnailRendererState>,
     spawn_position: Option<WorldPos>,
     world_seed: u64,
     webcam_requested: bool,
@@ -688,6 +711,7 @@ impl WebApp {
     fn new(
         size: PhysicalSize<u32>,
         canvas: HtmlCanvasElement,
+        pet_party_thumbnail_state: Option<PetPartyThumbnailRendererState>,
         workers: Vec<Worker>,
         worker_onmessages: Vec<Closure<dyn FnMut(MessageEvent)>>,
         mesh_result_rx: Receiver<MeshBuildResult>,
@@ -790,6 +814,7 @@ impl WebApp {
             remote_avatar_assets: HashMap::new(),
             pending_remote_avatar_urls: HashSet::new(),
             remote_pet_assets: HashMap::new(),
+            remote_pet_model_bytes: HashMap::new(),
             pending_remote_pet_urls: HashSet::new(),
             pet_asset: None,
             pet_asset_attempted: false,
@@ -802,6 +827,7 @@ impl WebApp {
             pet_party_selected_ids: HashSet::new(),
             pet_party_save_in_flight: false,
             pet_party_modal_message: None,
+            pet_party_thumbnail_state,
             spawn_position: None,
             world_seed: DEFAULT_WORLD_SEED,
             webcam_requested: false,
@@ -1129,9 +1155,7 @@ impl WebApp {
             self.set_pet_notice("Sign in to capture generated pets.");
             return;
         }
-        self.send_client_message(&ClientMessage::CaptureWildPetRequest {
-            pet_id: hit.pet_id,
-        });
+        self.send_client_message(&ClientMessage::CaptureWildPetRequest { pet_id: hit.pet_id });
     }
 
     fn ensure_webcam_requested(&mut self) {
@@ -1257,6 +1281,11 @@ impl WebApp {
             match event {
                 RemotePetEvent::Loaded { url, bytes } => {
                     self.pending_remote_pet_urls.remove(&url);
+                    self.remote_pet_model_bytes
+                        .insert(url.clone(), bytes.clone());
+                    if let Some(state) = self.pet_party_thumbnail_state.as_mut() {
+                        state.failed_keys.remove(&url);
+                    }
                     match build_pet_mesh(renderer, &bytes) {
                         Ok(asset) => {
                             self.remote_pet_assets.insert(url, asset);
@@ -1374,6 +1403,95 @@ impl WebApp {
             .set_attribute("style", player_avatar_modal_style());
     }
 
+    fn pet_party_thumbnail_source_key(pet: &CapturedPet) -> String {
+        pet.model_url
+            .clone()
+            .unwrap_or_else(|| PET_PARTY_THUMBNAIL_SOURCE_DEFAULT.to_string())
+    }
+
+    fn pet_party_thumbnail_image_url_for_pet(&self, pet: &CapturedPet) -> Option<&str> {
+        let key = Self::pet_party_thumbnail_source_key(pet);
+        self.pet_party_thumbnail_state
+            .as_ref()?
+            .image_urls
+            .get(&key)
+            .map(String::as_str)
+    }
+
+    fn pet_party_thumbnail_bytes_for_key<'a>(&'a self, key: &str) -> Option<&'a [u8]> {
+        if key == PET_PARTY_THUMBNAIL_SOURCE_DEFAULT {
+            Some(PET_MODEL_BYTES)
+        } else {
+            self.remote_pet_model_bytes.get(key).map(Vec::as_slice)
+        }
+    }
+
+    fn process_pet_party_thumbnail_generation(&mut self) {
+        let Some(source_key) = self
+            .captured_pets
+            .iter()
+            .map(Self::pet_party_thumbnail_source_key)
+            .find(|key| {
+                self.pet_party_thumbnail_state
+                    .as_ref()
+                    .is_some_and(|state| {
+                        !state.image_urls.contains_key(key)
+                            && !state.failed_keys.contains(key)
+                            && self.pet_party_thumbnail_bytes_for_key(key).is_some()
+                    })
+            })
+        else {
+            return;
+        };
+
+        let Some(bytes) = self
+            .pet_party_thumbnail_bytes_for_key(&source_key)
+            .map(|bytes| bytes.to_vec())
+        else {
+            return;
+        };
+
+        let result = (|| -> Result<()> {
+            let Some(state) = self.pet_party_thumbnail_state.as_mut() else {
+                return Ok(());
+            };
+            if !state.meshes.contains_key(&source_key) {
+                let mesh = build_pet_mesh(&state.renderer, &bytes)?;
+                state.meshes.insert(source_key.clone(), mesh);
+            }
+            let mesh = state
+                .meshes
+                .get(&source_key)
+                .ok_or_else(|| anyhow::anyhow!("thumbnail mesh missing"))?;
+
+            state
+                .renderer
+                .update_camera(pet_party_thumbnail_camera_matrix());
+            let draw = state
+                .renderer
+                .create_textured_draw(mesh, pet_party_thumbnail_model_matrix());
+            state.renderer.render(&[], &[], &[draw], &[], &[])?;
+            let image_url = state
+                .canvas
+                .to_data_url()
+                .map_err(|error| anyhow::anyhow!("thumbnail canvas toDataURL: {error:?}"))?;
+            state.image_urls.insert(source_key.clone(), image_url);
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self.update_pet_party_modal(),
+            Err(error) => {
+                if let Some(state) = self.pet_party_thumbnail_state.as_mut() {
+                    state.failed_keys.insert(source_key.clone());
+                }
+                web_sys::console::warn_1(&JsValue::from_str(&format!(
+                    "pet thumbnail generation failed for {source_key}: {error:?}"
+                )));
+            }
+        }
+    }
+
     fn update_pet_party_modal(&self) {
         let selected_count = self.pet_party_selected_ids.len();
         let copy = if self.guest_pet_captures_are_temporary() {
@@ -1382,8 +1500,9 @@ impl WebApp {
             "Choose up to 6 active followers. Your saved account keeps this party between sessions."
         };
         self.pet_party_modal_copy.set_text_content(Some(copy));
-        self.pet_party_modal_count
-            .set_text_content(Some(&format!("Selected {selected_count}/{PET_FOLLOWER_COUNT}")));
+        self.pet_party_modal_count.set_text_content(Some(&format!(
+            "Selected {selected_count}/{PET_FOLLOWER_COUNT}"
+        )));
 
         let list_markup = if self.captured_pets.is_empty() {
             "<div style=\"padding:14px 16px;border-radius:16px;border:1px dashed rgba(255,255,255,0.14);color:rgba(230,237,243,0.68);font-size:13px;line-height:1.5;\">Capture pets in the world to build a party.</div>".to_string()
@@ -1394,6 +1513,17 @@ impl WebApp {
                     let is_selected = self.pet_party_selected_ids.contains(&pet.id);
                     let is_disabled = self.pet_party_save_in_flight
                         || (!is_selected && selected_count >= PET_FOLLOWER_COUNT);
+                    let thumbnail = self
+                        .pet_party_thumbnail_image_url_for_pet(pet)
+                        .map(|image_url| {
+                            format!(
+                                "<div style=\"width:60px;height:60px;flex:none;perspective:700px;\"><div style=\"width:100%;height:100%;transform-style:preserve-3d;animation:pet-party-thumb-spin 8s linear infinite;\"><img alt=\"{name} thumbnail\" src=\"{image_url}\" style=\"width:100%;height:100%;display:block;object-fit:cover;border-radius:14px;border:1px solid rgba(255,255,255,0.12);box-shadow:0 12px 24px rgba(0,0,0,0.28);background:radial-gradient(circle at top,rgba(255,255,255,0.14),rgba(8,12,18,0.9));backface-visibility:hidden;\" /></div></div>",
+                                name = pet.display_name,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            "<div style=\"width:60px;height:60px;flex:none;border-radius:14px;border:1px solid rgba(255,255,255,0.10);background:radial-gradient(circle at 35% 25%,rgba(255,255,255,0.18),rgba(87,130,166,0.14) 30%,rgba(9,14,21,0.92) 75%);display:grid;place-items:center;color:rgba(230,237,243,0.58);font:700 10px/1.2 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.10em;text-transform:uppercase;\">Loading</div>".to_string()
+                        });
                     let button_style = if is_selected {
                         "width:100%;padding:12px 14px;border-radius:16px;border:1px solid rgba(246,198,101,0.38);background:linear-gradient(180deg,rgba(73,54,22,0.92),rgba(45,33,13,0.92));color:#f9e1aa;text-align:left;font:600 14px/1.35 ui-sans-serif,system-ui,sans-serif;"
                     } else if is_disabled {
@@ -1408,8 +1538,9 @@ impl WebApp {
                     };
                     let disabled_attr = if is_disabled { "disabled" } else { "" };
                     format!(
-                        "<button type=\"button\" data-pet-id=\"{}\" {disabled_attr} style=\"{button_style}\">{name} · {state_label}</button>",
+                        "<button type=\"button\" data-pet-id=\"{}\" {disabled_attr} style=\"{button_style}\"><div style=\"display:flex;align-items:center;gap:12px;min-width:0;\">{thumbnail}<div style=\"min-width:0;\"><div style=\"font:700 14px/1.25 ui-sans-serif,system-ui,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;\">{name}</div><div style=\"margin-top:4px;color:rgba(230,237,243,0.70);font:500 11px/1.3 ui-sans-serif,system-ui,sans-serif;text-transform:uppercase;letter-spacing:0.08em;\">{state_label}</div></div></div></button>",
                         pet.id,
+                        thumbnail = thumbnail,
                         name = pet.display_name,
                     )
                 })
@@ -1418,8 +1549,9 @@ impl WebApp {
         };
         self.pet_party_modal_list.set_inner_html(&list_markup);
 
-        let save_disabled =
-            self.pet_party_save_in_flight || !self.can_capture_generated_pets() || !self.pet_party_has_unsaved_changes();
+        let save_disabled = self.pet_party_save_in_flight
+            || !self.can_capture_generated_pets()
+            || !self.pet_party_has_unsaved_changes();
         if save_disabled {
             let _ = self.pet_party_save_button.set_attribute("disabled", "true");
         } else {
@@ -1430,12 +1562,15 @@ impl WebApp {
         } else {
             "margin-top:14px;width:100%;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.18);background:linear-gradient(180deg,#f6c665,#e8a93c);color:#1b1206;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;"
         };
-        let _ = self.pet_party_save_button.set_attribute("style", save_style);
-        self.pet_party_save_button.set_text_content(Some(if self.pet_party_save_in_flight {
-            "Saving Party..."
-        } else {
-            "Save Party"
-        }));
+        let _ = self
+            .pet_party_save_button
+            .set_attribute("style", save_style);
+        self.pet_party_save_button
+            .set_text_content(Some(if self.pet_party_save_in_flight {
+                "Saving Party..."
+            } else {
+                "Save Party"
+            }));
 
         let default_status = if self.captured_pets.is_empty() {
             "Capture pets to choose which ones follow you."
@@ -1663,6 +1798,7 @@ impl WebApp {
                             self.remote_avatar_assets.clear();
                             self.pending_remote_avatar_urls.clear();
                             self.remote_pet_assets.clear();
+                            self.remote_pet_model_bytes.clear();
                             self.pending_remote_pet_urls.clear();
                             clear_peer_connection_registries();
                             self.pet_asset = None;
@@ -1707,6 +1843,7 @@ impl WebApp {
                                 self.remote_avatar_assets.clear();
                                 self.pending_remote_avatar_urls.clear();
                                 self.remote_pet_assets.clear();
+                                self.remote_pet_model_bytes.clear();
                                 self.pending_remote_pet_urls.clear();
                                 clear_peer_connection_registries();
                                 self.last_sent_position = None;
@@ -1735,8 +1872,10 @@ impl WebApp {
                                 self.pending_generation.clear();
                                 self.inflight_generation.clear();
                                 self.dirty_generation.clear();
-                                let desired_positions =
-                                    ordered_desired_chunk_positions(self.current_chunk, chunk_radius);
+                                let desired_positions = ordered_desired_chunk_positions(
+                                    self.current_chunk,
+                                    chunk_radius,
+                                );
                                 for position in desired_positions {
                                     self.schedule_chunk_rebuild_deferred(position);
                                 }
@@ -1906,6 +2045,7 @@ impl WebApp {
                     self.remote_avatar_assets.clear();
                     self.pending_remote_avatar_urls.clear();
                     self.remote_pet_assets.clear();
+                    self.remote_pet_model_bytes.clear();
                     self.pending_remote_pet_urls.clear();
                     clear_peer_connection_registries();
                     self.pet_asset = None;
@@ -3494,11 +3634,10 @@ impl WebApp {
         let half_horizontal_fov = (half_vertical_fov.tan() * aspect).atan();
         let chunk_radius = (CHUNK_WIDTH as f32 * 0.5).hypot(CHUNK_DEPTH as f32 * 0.5);
         let angular_padding = (chunk_radius / distance.max(chunk_radius + 0.001)).asin();
-        let threshold = (half_horizontal_fov
-            + CHUNK_HORIZONTAL_CULL_MARGIN_RADIANS
-            + angular_padding)
-            .min(std::f32::consts::PI - 0.01)
-            .cos();
+        let threshold =
+            (half_horizontal_fov + CHUNK_HORIZONTAL_CULL_MARGIN_RADIANS + angular_padding)
+                .min(std::f32::consts::PI - 0.01)
+                .cos();
         forward.dot(direction) >= threshold
     }
 
@@ -5041,10 +5180,19 @@ fn create_pet_party_modal() -> (Element, Element, Element, Element, Element, Ele
         );
     };
 
+    if let Ok(style) = document.create_element("style") {
+        style.set_text_content(Some(
+            "@keyframes pet-party-thumb-spin { 0% { transform: rotateY(-18deg); } 50% { transform: rotateY(18deg); } 100% { transform: rotateY(342deg); } }",
+        ));
+        let _ = body.append_child(&style);
+    }
+
     let modal = document.create_element("div").expect("pet party modal");
     let _ = modal.set_attribute("style", player_avatar_modal_style());
 
-    let card = document.create_element("div").expect("pet party modal card");
+    let card = document
+        .create_element("div")
+        .expect("pet party modal card");
     let _ = card.set_attribute(
         "style",
         "position:relative;width:min(440px,calc(100vw - 24px));max-height:min(82vh,760px);overflow:auto;padding:18px;border-radius:20px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.96),rgba(7,11,18,0.96));color:#e6edf3;box-shadow:0 24px 60px rgba(0,0,0,0.38);",
@@ -5061,7 +5209,9 @@ fn create_pet_party_modal() -> (Element, Element, Element, Element, Element, Ele
     let _ = close_button.set_attribute("type", "button");
     let _ = card.append_child(&close_button);
 
-    let title = document.create_element("h2").expect("pet party modal title");
+    let title = document
+        .create_element("h2")
+        .expect("pet party modal title");
     let _ = title.set_attribute(
         "style",
         "margin:0 48px 6px 0;font:700 18px/1.2 ui-sans-serif,system-ui,sans-serif;",
@@ -5076,7 +5226,9 @@ fn create_pet_party_modal() -> (Element, Element, Element, Element, Element, Ele
     );
     let _ = card.append_child(&copy);
 
-    let count = document.create_element("div").expect("pet party selected count");
+    let count = document
+        .create_element("div")
+        .expect("pet party selected count");
     let _ = count.set_attribute(
         "style",
         "margin:0 0 12px 0;color:rgba(183,230,255,0.72);font-size:11px;letter-spacing:0.12em;text-transform:uppercase;",
@@ -5094,7 +5246,9 @@ fn create_pet_party_modal() -> (Element, Element, Element, Element, Element, Ele
     let _ = save_button.set_attribute("type", "button");
     let _ = card.append_child(&save_button);
 
-    let status = document.create_element("p").expect("pet party modal status");
+    let status = document
+        .create_element("p")
+        .expect("pet party modal status");
     let _ = status.set_attribute(
         "style",
         "margin:12px 0 0 0;color:rgba(230,237,243,0.72);font-size:12px;line-height:1.45;",
@@ -5115,8 +5269,8 @@ fn create_pet_party_modal() -> (Element, Element, Element, Element, Element, Ele
             *queue.borrow_mut() = true;
         });
     }) as Box<dyn FnMut(WebEvent)>);
-    let _ =
-        save_button.add_event_listener_with_callback("click", save_onclick.as_ref().unchecked_ref());
+    let _ = save_button
+        .add_event_listener_with_callback("click", save_onclick.as_ref().unchecked_ref());
     save_onclick.forget();
 
     let list_onclick = Closure::wrap(Box::new(move |event: WebEvent| {
@@ -5126,7 +5280,10 @@ fn create_pet_party_modal() -> (Element, Element, Element, Element, Element, Ele
         let Ok(target) = target.dyn_into::<Element>() else {
             return;
         };
-        let Some(pet_id) = target.get_attribute("data-pet-id") else {
+        let Ok(Some(button)) = target.closest("[data-pet-id]") else {
+            return;
+        };
+        let Some(pet_id) = button.get_attribute("data-pet-id") else {
             return;
         };
         PET_PARTY_TOGGLE_QUEUE.with(|queue| {
@@ -5139,6 +5296,44 @@ fn create_pet_party_modal() -> (Element, Element, Element, Element, Element, Ele
     let _ = modal.append_child(&card);
     let _ = body.append_child(&modal);
     (modal, copy, count, list, status, save_button)
+}
+
+async fn create_pet_party_thumbnail_renderer() -> Result<PetPartyThumbnailRendererState> {
+    let Some(document) = document() else {
+        anyhow::bail!("document unavailable");
+    };
+    let canvas = document
+        .create_element("canvas")
+        .map_err(|error| anyhow::anyhow!("create thumbnail canvas: {error:?}"))?
+        .dyn_into::<HtmlCanvasElement>()
+        .map_err(|_| anyhow::anyhow!("cast thumbnail canvas"))?;
+    canvas.set_width(PET_PARTY_THUMBNAIL_SIZE);
+    canvas.set_height(PET_PARTY_THUMBNAIL_SIZE);
+    let renderer = Renderer::new_with_canvas(
+        canvas.clone(),
+        PhysicalSize::new(PET_PARTY_THUMBNAIL_SIZE, PET_PARTY_THUMBNAIL_SIZE),
+    )
+    .await?;
+
+    Ok(PetPartyThumbnailRendererState {
+        canvas,
+        renderer,
+        meshes: HashMap::new(),
+        image_urls: HashMap::new(),
+        failed_keys: HashSet::new(),
+    })
+}
+
+fn pet_party_thumbnail_camera_matrix() -> Mat4 {
+    let eye = Vec3::new(0.0, 1.25, 2.9);
+    let target = Vec3::new(0.0, 0.62, 0.0);
+    let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+    let proj = Mat4::perspective_rh_gl(34.0_f32.to_radians(), 1.0, 0.1, 12.0);
+    proj * view
+}
+
+fn pet_party_thumbnail_model_matrix() -> Mat4 {
+    Mat4::from_rotation_y(0.72) * Mat4::from_rotation_x(-0.1)
 }
 
 fn create_perf_panel() -> Element {
@@ -5172,7 +5367,9 @@ fn create_chunk_quality_button(
         return (fallback_element(), closure);
     };
 
-    let button = document.create_element("button").expect("chunk quality button");
+    let button = document
+        .create_element("button")
+        .expect("chunk quality button");
     button.set_text_content(Some(&format!("Chunk Quality: {}", preset.label())));
     let _ = button.set_attribute("type", "button");
     let _ = button.set_attribute(

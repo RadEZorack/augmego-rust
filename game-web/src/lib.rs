@@ -956,16 +956,11 @@ impl WebApp {
 
     fn sync_pointer_lock_state(&mut self) {
         self.mouse_captured = pointer_is_locked(&self.canvas);
-        if self.mouse_captured {
-            let _ = self
-                .mouse_lock_prompt
-                .set_attribute("style", "display:none;");
-        } else {
-            let _ = self.mouse_lock_prompt.set_attribute(
-                "style",
-                "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:18px 28px;border-radius:18px;border:1px solid rgba(255,255,255,0.28);background:rgba(18,24,32,0.88);color:#f6f8fb;font:600 18px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 20px 60px rgba(0,0,0,0.35);cursor:pointer;z-index:40;backdrop-filter:blur(10px);",
-            );
-        }
+        sync_mouse_lock_prompt(
+            &self.mouse_lock_prompt,
+            self.spawn_settled,
+            self.mouse_captured,
+        );
     }
 
     fn handle_key(&mut self, event: KeyEvent) {
@@ -4629,15 +4624,14 @@ fn create_mouse_lock_prompt(canvas: &HtmlCanvasElement) -> (Element, Closure<dyn
             .expect("prompt fallback element");
         return (fallback, noop);
     };
+    ensure_mouse_lock_prompt_styles(&document);
     let body = document.body().expect("body");
     let prompt = document
         .create_element("button")
         .expect("mouse lock prompt");
-    prompt.set_text_content(Some("Click To Lock Mouse"));
-    let _ = prompt.set_attribute(
-        "style",
-        "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:18px 28px;border-radius:18px;border:1px solid rgba(255,255,255,0.28);background:rgba(18,24,32,0.88);color:#f6f8fb;font:600 18px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 20px 60px rgba(0,0,0,0.35);cursor:pointer;z-index:40;backdrop-filter:blur(10px);",
-    );
+    let _ = prompt.set_attribute("type", "button");
+    let _ = prompt.set_attribute("aria-live", "polite");
+    sync_mouse_lock_prompt(&prompt, false, false);
     let canvas = canvas.clone();
     let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
         canvas.request_pointer_lock();
@@ -4645,6 +4639,58 @@ fn create_mouse_lock_prompt(canvas: &HtmlCanvasElement) -> (Element, Closure<dyn
     let _ = prompt.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
     let _ = body.append_child(&prompt);
     (prompt, onclick)
+}
+
+fn ensure_mouse_lock_prompt_styles(document: &Document) {
+    if document
+        .get_element_by_id("augmego-mouse-lock-prompt-style")
+        .is_some()
+    {
+        return;
+    }
+
+    let style = document
+        .create_element("style")
+        .expect("mouse lock prompt style");
+    let _ = style.set_attribute("id", "augmego-mouse-lock-prompt-style");
+    style.set_text_content(Some(
+        "@keyframes augmego-mouse-lock-spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}",
+    ));
+
+    if let Some(body) = document.body() {
+        let _ = body.append_child(&style);
+    }
+}
+
+fn sync_mouse_lock_prompt(prompt: &Element, spawn_settled: bool, mouse_captured: bool) {
+    if mouse_captured {
+        let _ = prompt.set_attribute("style", "display:none;");
+        return;
+    }
+
+    if spawn_settled {
+        prompt.set_text_content(Some("Click to lock mouse"));
+        let _ = prompt.remove_attribute("disabled");
+        let _ = prompt.remove_attribute("aria-busy");
+        let _ = prompt.set_attribute("style", mouse_lock_prompt_style(true));
+    } else {
+        prompt.set_inner_html(mouse_lock_loading_markup());
+        let _ = prompt.set_attribute("disabled", "true");
+        let _ = prompt.set_attribute("aria-busy", "true");
+        let _ = prompt.set_attribute("style", mouse_lock_prompt_style(false));
+    }
+}
+
+fn mouse_lock_prompt_style(interactive: bool) -> &'static str {
+    if interactive {
+        "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;align-items:center;justify-content:center;gap:12px;min-width:220px;padding:18px 28px;border-radius:18px;border:1px solid rgba(255,255,255,0.28);background:rgba(18,24,32,0.88);color:#f6f8fb;font:600 18px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 20px 60px rgba(0,0,0,0.35);cursor:pointer;z-index:40;backdrop-filter:blur(10px);"
+    } else {
+        "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;align-items:center;justify-content:center;gap:12px;min-width:220px;padding:18px 28px;border-radius:18px;border:1px solid rgba(255,255,255,0.28);background:rgba(18,24,32,0.88);color:#f6f8fb;font:600 18px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 20px 60px rgba(0,0,0,0.35);cursor:progress;z-index:40;backdrop-filter:blur(10px);"
+    }
+}
+
+fn mouse_lock_loading_markup() -> &'static str {
+    "<span aria-hidden=\"true\" style=\"width:18px;height:18px;border:2px solid rgba(246,248,251,0.24);border-top-color:#f6f8fb;border-radius:999px;display:inline-block;animation:augmego-mouse-lock-spin 0.75s linear infinite;\"></span><span>loading</span>"
 }
 
 fn create_webcam_prompt() -> (Element, Closure<dyn FnMut(WebEvent)>) {

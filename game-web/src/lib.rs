@@ -149,6 +149,10 @@ const PET_WEAPON_LASER_LIFETIME: Duration = Duration::from_millis(150);
 const PET_WEAPON_GUN_LIFETIME: Duration = Duration::from_millis(220);
 const PET_WEAPON_FLAME_LIFETIME: Duration = Duration::from_millis(260);
 const PET_WEAPON_SWORD_LIFETIME: Duration = Duration::from_millis(520);
+const PET_ATTACK_REACTION_DURATION: Duration = Duration::from_millis(220);
+const PET_ATTACK_REACTION_MATCH_RADIUS: f32 = 0.8;
+const PET_ATTACK_REACTION_ORIGIN_HEIGHT: f32 = 1.55;
+const PET_ATTACK_REACTION_FORWARD_OFFSET: f32 = 0.45;
 const PET_WEAPON_SHOT_HALF_WIDTH: f32 = 0.03;
 const PET_WEAPON_SHOT_HALF_DEPTH: f32 = 0.02;
 const PET_WEAPON_GUN_PROJECTILE_HALF_EXTENT: f32 = 0.055;
@@ -3957,6 +3961,7 @@ impl WebApp {
 
     fn build_pet_mesh_draws(&self, renderer: &Renderer<'_>) -> Vec<TexturedMeshDraw<'_>> {
         let local_pet_identities = self.active_captured_pet_identities();
+        let now = Instant::now();
 
         let mut draws = Vec::with_capacity(
             self.pet_followers.len()
@@ -3968,7 +3973,9 @@ impl WebApp {
             let Some(pet_asset) = self.pet_mesh_for_identity(Some(identity)) else {
                 continue;
             };
-            let model = Mat4::from_translation(pet.feet_position) * Mat4::from_rotation_y(pet.yaw);
+            let attack_visual =
+                pet_attack_visual(pet.feet_position, pet.yaw, &self.pet_weapon_shots, now);
+            let model = pet_model_matrix(pet.feet_position, pet.yaw, attack_visual);
             draws.push(renderer.create_textured_draw(pet_asset, model));
         }
 
@@ -3984,7 +3991,9 @@ impl WebApp {
                 else {
                     continue;
                 };
-                let model = Mat4::from_translation(pet_position) * Mat4::from_rotation_y(pet.yaw);
+                let attack_visual =
+                    pet_attack_visual(pet_position, pet.yaw, &self.pet_weapon_shots, now);
+                let model = pet_model_matrix(pet_position, pet.yaw, attack_visual);
                 draws.push(renderer.create_textured_draw(pet_asset, model));
             }
         }
@@ -3996,7 +4005,9 @@ impl WebApp {
             let Some(pet_asset) = self.pet_mesh_for_identity(Some(&pet.pet_identity)) else {
                 continue;
             };
-            let model = Mat4::from_translation(pet.position) * Mat4::from_rotation_y(pet.yaw);
+            let attack_visual =
+                pet_attack_visual(pet.position, pet.yaw, &self.pet_weapon_shots, now);
+            let model = pet_model_matrix(pet.position, pet.yaw, attack_visual);
             draws.push(renderer.create_textured_draw(pet_asset, model));
         }
 
@@ -4005,6 +4016,7 @@ impl WebApp {
 
     fn build_weapon_mesh_draws(&self, renderer: &Renderer<'_>) -> Vec<TexturedMeshDraw<'_>> {
         let local_pet_identities = self.active_captured_pet_identities();
+        let now = Instant::now();
         let mut draws = Vec::with_capacity(
             self.world_weapons.len()
                 + self.pet_followers.len()
@@ -4031,8 +4043,14 @@ impl WebApp {
             let Some(weapon_asset) = self.weapon_mesh_for_identity(Some(weapon_identity)) else {
                 continue;
             };
-            let model =
-                equipped_pet_weapon_model_matrix(pet.feet_position, pet.yaw, index as f32 * 0.61);
+            let attack_visual =
+                pet_attack_visual(pet.feet_position, pet.yaw, &self.pet_weapon_shots, now);
+            let model = equipped_pet_weapon_model_matrix(
+                pet.feet_position,
+                pet.yaw,
+                index as f32 * 0.61,
+                attack_visual,
+            );
             draws.push(renderer.create_textured_draw(weapon_asset, model));
         }
 
@@ -4053,10 +4071,13 @@ impl WebApp {
                 else {
                     continue;
                 };
+                let attack_visual =
+                    pet_attack_visual(pet_position, pet.yaw, &self.pet_weapon_shots, now);
                 let model = equipped_pet_weapon_model_matrix(
                     pet_position,
                     pet.yaw,
                     player_id as f32 * 0.17 + index as f32 * 0.61,
+                    attack_visual,
                 );
                 draws.push(renderer.create_textured_draw(weapon_asset, model));
             }
@@ -5072,14 +5093,140 @@ fn build_weapon_mesh(renderer: &Renderer<'_>, bytes: &[u8]) -> Result<TexturedMe
     build_static_textured_model_mesh(renderer, bytes, WEAPON_MODEL_DESIRED_SIZE, false)
 }
 
-fn equipped_pet_weapon_model_matrix(pet_feet_position: Vec3, pet_yaw: f32, phase: f32) -> Mat4 {
+fn pet_model_matrix(
+    pet_feet_position: Vec3,
+    pet_yaw: f32,
+    attack_visual: PetAttackVisual,
+) -> Mat4 {
+    Mat4::from_translation(pet_feet_position + attack_visual.offset)
+        * Mat4::from_rotation_y(pet_yaw)
+        * Mat4::from_rotation_z(attack_visual.roll)
+        * Mat4::from_rotation_x(attack_visual.pitch)
+}
+
+fn equipped_pet_weapon_model_matrix(
+    pet_feet_position: Vec3,
+    pet_yaw: f32,
+    phase: f32,
+    attack_visual: PetAttackVisual,
+) -> Mat4 {
     let bob_phase = phase + (js_sys::Date::now() as f32 * 0.004);
     let bob = bob_phase.sin() * 0.08;
-    let translation = pet_feet_position + Vec3::new(0.0, 1.55 + bob, 0.0);
+    let translation = pet_feet_position + attack_visual.offset + Vec3::new(0.0, 1.55 + bob, 0.0);
     Mat4::from_translation(translation)
         * Mat4::from_rotation_y(pet_yaw + std::f32::consts::FRAC_PI_2)
-        * Mat4::from_rotation_z(0.16)
+        * Mat4::from_rotation_z(0.16 + attack_visual.roll * 0.85)
+        * Mat4::from_rotation_x(attack_visual.pitch * 0.65)
         * Mat4::from_scale(Vec3::splat(0.5))
+}
+
+fn pet_attack_origin(pet_feet_position: Vec3, pet_yaw: f32) -> Vec3 {
+    let (forward, _) = horizontal_basis_from_yaw(pet_yaw);
+    pet_feet_position
+        + Vec3::Y * PET_ATTACK_REACTION_ORIGIN_HEIGHT
+        + forward * PET_ATTACK_REACTION_FORWARD_OFFSET
+}
+
+fn pet_attack_visual(
+    pet_feet_position: Vec3,
+    pet_yaw: f32,
+    shots: &[PetWeaponShotClientState],
+    now: Instant,
+) -> PetAttackVisual {
+    let expected_origin = pet_attack_origin(pet_feet_position, pet_yaw);
+    let max_distance_sq = PET_ATTACK_REACTION_MATCH_RADIUS * PET_ATTACK_REACTION_MATCH_RADIUS;
+
+    let mut best_match = None;
+    for shot in shots {
+        let elapsed = now.saturating_duration_since(shot.started_at);
+        if elapsed >= PET_ATTACK_REACTION_DURATION {
+            continue;
+        }
+
+        let distance_sq = expected_origin.distance_squared(shot.origin);
+        if distance_sq > max_distance_sq {
+            continue;
+        }
+
+        let score = elapsed.as_secs_f32() * 0.7 + distance_sq;
+        if best_match
+            .map(|(best_score, _): (f32, &PetWeaponShotClientState)| score < best_score)
+            .unwrap_or(true)
+        {
+            best_match = Some((score, shot));
+        }
+    }
+
+    let Some((_, shot)) = best_match else {
+        return PetAttackVisual::default();
+    };
+
+    let progress = (now.saturating_duration_since(shot.started_at).as_secs_f32()
+        / PET_ATTACK_REACTION_DURATION.as_secs_f32())
+    .clamp(0.0, 1.0);
+    let decay = (1.0 - progress).clamp(0.0, 1.0);
+    let pulse = (progress * std::f32::consts::PI).sin();
+    let horizontal_delta = Vec3::new(
+        shot.target.x - shot.origin.x,
+        0.0,
+        shot.target.z - shot.origin.z,
+    );
+    let (forward, right) = if horizontal_delta.length_squared() > f32::EPSILON {
+        let forward = horizontal_delta.normalize();
+        (forward, Vec3::new(-forward.z, 0.0, forward.x))
+    } else {
+        horizontal_basis_from_yaw(pet_yaw)
+    };
+
+    match shot.kind {
+        PetWeaponEffectKind::Laser => {
+            let jitter = ((progress * std::f32::consts::TAU * 6.0) + 0.35).sin() * decay;
+            PetAttackVisual {
+                offset: -forward * (0.04 * decay)
+                    + right * (0.022 * jitter)
+                    + Vec3::Y * (0.024 * pulse),
+                pitch: -0.08 * decay,
+                roll: 0.05 * jitter,
+            }
+        }
+        PetWeaponEffectKind::Gun => {
+            let jitter = ((progress * std::f32::consts::TAU * 8.0) + 0.45).sin() * decay;
+            PetAttackVisual {
+                offset: -forward * (0.07 * decay)
+                    + right * (0.03 * jitter)
+                    + Vec3::Y * (0.03 * pulse),
+                pitch: -0.12 * decay,
+                roll: 0.08 * jitter,
+            }
+        }
+        PetWeaponEffectKind::Flamethrower => {
+            let sway = (progress * std::f32::consts::TAU * 4.0).sin() * decay;
+            PetAttackVisual {
+                offset: forward * (0.045 * pulse)
+                    + right * (0.028 * sway)
+                    + Vec3::Y * (0.038 * pulse),
+                pitch: 0.08 * pulse,
+                roll: 0.05 * sway,
+            }
+        }
+        PetWeaponEffectKind::Sword => {
+            let lunge = if progress <= 0.45 {
+                progress / 0.45
+            } else {
+                (1.0 - progress) / 0.55
+            }
+            .clamp(0.0, 1.0);
+            let sway = (progress * std::f32::consts::TAU * 3.0).sin() * decay;
+            PetAttackVisual {
+                offset: forward * (0.14 * lunge)
+                    - forward * (0.035 * (1.0 - lunge) * decay)
+                    + right * (0.02 * sway)
+                    + Vec3::Y * (0.032 * pulse),
+                pitch: 0.12 * lunge - 0.04 * (1.0 - lunge) * decay,
+                roll: 0.1 * sway,
+            }
+        }
+    }
 }
 
 fn build_static_textured_model_mesh(
@@ -5408,6 +5555,13 @@ impl PetFollowerState {
             stuck_timer: 0.0,
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PetAttackVisual {
+    offset: Vec3,
+    pitch: f32,
+    roll: f32,
 }
 
 #[derive(Clone)]

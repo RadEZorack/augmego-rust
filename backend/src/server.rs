@@ -3,8 +3,9 @@ use crate::auth::{SameSitePolicy, SessionCookieConfig};
 use crate::db;
 use crate::persistence::{ChunkStore, ChunkStoreConfig, PostgresValkeyChunkStore};
 use crate::pet_registry::{
-    CapturePetOutcome, PET_ACTIVE_FOLLOWER_LIMIT, PetModelFileResponse, PetRegistryClient,
-    PetRegistryConfig, PlayerPetCollection,
+    CapturePetOutcome, PET_ACTIVE_FOLLOWER_LIMIT, PetModelFileResponse, PetPartySelectionError,
+    PetRegistryClient, PetRegistryConfig, PlayerPetCollection, UpdatePetPartyOutcome,
+    validate_active_pet_selection,
 };
 use crate::storage::{StorageConfig, StorageProvider, StorageService};
 use anyhow::{Context, Result, anyhow};
@@ -27,7 +28,7 @@ use shared_protocol::{
     CapturedPetsSnapshot, ChunkUnload, ClientHello, ClientMessage, InventorySnapshot,
     InventoryStack, LoginResponse, PROTOCOL_VERSION, PetIdentity, PetStateSnapshot, PlayerLeft,
     PlayerStateSnapshot, ServerHello, ServerMessage, ServerWebRtcSignal, SubscribeChunks,
-    WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, decode, encode,
+    UpdatePetPartyResult, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
 use std::collections::{HashMap, HashSet};
@@ -325,6 +326,31 @@ impl Player {
     }
 }
 
+#[derive(Debug, Clone)]
+enum GuestPetPartyUpdateOutcome {
+    Updated(Player),
+    TooManySelected,
+    InvalidSelection,
+}
+
+fn active_pet_models_from_captured_pets(captured_pets: &[CapturedPet]) -> Vec<PetIdentity> {
+    captured_pets
+        .iter()
+        .filter(|pet| pet.active)
+        .map(|pet| PetIdentity {
+            id: pet.id.clone(),
+            display_name: pet.display_name.clone(),
+            model_url: pet.model_url.clone(),
+        })
+        .collect()
+}
+
+fn apply_active_pet_selection(captured_pets: &mut [CapturedPet], active_pet_ids: &HashSet<String>) {
+    for pet in captured_pets {
+        pet.active = active_pet_ids.contains(&pet.id);
+    }
+}
+
 #[derive(Clone)]
 pub struct PlayerService {
     players: Arc<Mutex<HashMap<u64, Player>>>,
@@ -476,6 +502,7 @@ impl PlayerService {
         let mut players = self.players.lock().await;
         let player = players.get_mut(&player_id)?;
 
+        let active_count = player.captured_pets.iter().filter(|pet| pet.active).count();
         player.captured_pets.retain(|pet| pet.id != pet_identity.id);
         player.captured_pets.insert(
             0,
@@ -484,26 +511,40 @@ impl PlayerService {
                 display_name: pet_identity.display_name.clone(),
                 model_url: pet_identity.model_url.clone(),
                 captured_at_ms: current_time_millis(),
-                active: false,
+                active: active_count < PET_ACTIVE_FOLLOWER_LIMIT,
             },
         );
 
-        for (index, pet) in player.captured_pets.iter_mut().enumerate() {
-            pet.active = index < PET_ACTIVE_FOLLOWER_LIMIT;
-        }
-
-        player.active_pet_models = player
-            .captured_pets
-            .iter()
-            .filter(|pet| pet.active)
-            .map(|pet| PetIdentity {
-                id: pet.id.clone(),
-                display_name: pet.display_name.clone(),
-                model_url: pet.model_url.clone(),
-            })
-            .collect();
+        player.active_pet_models = active_pet_models_from_captured_pets(&player.captured_pets);
         player.pet_states.truncate(player.active_pet_models.len());
         Some(player.clone())
+    }
+
+    async fn update_guest_pet_party(
+        &self,
+        player_id: u64,
+        requested_active_pet_ids: &[String],
+    ) -> Option<GuestPetPartyUpdateOutcome> {
+        let mut players = self.players.lock().await;
+        let player = players.get_mut(&player_id)?;
+
+        let active_pet_ids = match validate_active_pet_selection(
+            player.captured_pets.iter().map(|pet| pet.id.as_str()),
+            requested_active_pet_ids,
+        ) {
+            Ok(active_pet_ids) => active_pet_ids,
+            Err(PetPartySelectionError::TooManySelected) => {
+                return Some(GuestPetPartyUpdateOutcome::TooManySelected);
+            }
+            Err(PetPartySelectionError::UnknownPet) => {
+                return Some(GuestPetPartyUpdateOutcome::InvalidSelection);
+            }
+        };
+
+        apply_active_pet_selection(&mut player.captured_pets, &active_pet_ids);
+        player.active_pet_models = active_pet_models_from_captured_pets(&player.captured_pets);
+        player.pet_states.truncate(player.active_pet_models.len());
+        Some(GuestPetPartyUpdateOutcome::Updated(player.clone()))
     }
 }
 
@@ -1751,6 +1792,10 @@ impl VoxelServer {
                 self.capture_wild_pet_for_websocket(player_id, sender, pet_id)
                     .await?;
             }
+            ClientMessage::UpdatePetPartyRequest(request) => {
+                self.update_pet_party_for_websocket(player_id, sender, request.active_pet_ids)
+                    .await?;
+            }
             ClientMessage::PlaceBlockRequest(request) => {
                 let Some(player) = self.player_service.player(player_id).await else {
                     return Ok(());
@@ -1898,18 +1943,8 @@ impl VoxelServer {
         if let Some(user_id) = player.user_id.clone() {
             match self.pet_registry.capture_pet(&pet_identity.id, &user_id).await {
                 Ok(CapturePetOutcome::Captured(collection)) => {
-                    if let Some(updated_player) = self
-                        .player_service
-                        .set_pet_collection(player_id, collection)
-                        .await
-                    {
-                        let _ = sender.send(ServerMessage::CapturedPetsSnapshot(
-                            updated_player.captured_pets_snapshot(),
-                        ));
-                        let snapshot = updated_player.snapshot(0);
-                        let _ = sender.send(ServerMessage::PlayerStateSnapshot(snapshot.clone()));
-                        self.broadcast_player_snapshot(snapshot).await;
-                    }
+                    self.sync_pet_collection_for_player(player_id, sender, collection)
+                        .await;
                     let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
                         pet_id,
                         status: CaptureWildPetStatus::Captured,
@@ -1982,6 +2017,109 @@ impl VoxelServer {
         }
 
         Ok(())
+    }
+
+    async fn update_pet_party_for_websocket(
+        &self,
+        player_id: u64,
+        sender: &mpsc::UnboundedSender<ServerMessage>,
+        active_pet_ids: Vec<String>,
+    ) -> Result<()> {
+        let Some(player) = self.player_service.player(player_id).await else {
+            return Ok(());
+        };
+
+        let result = if let Some(user_id) = player.user_id.clone() {
+            match self.pet_registry.update_pet_party(&user_id, &active_pet_ids).await {
+                Ok(UpdatePetPartyOutcome::Updated(collection)) => {
+                    self.sync_pet_collection_for_player(player_id, sender, collection)
+                        .await;
+                    UpdatePetPartyResult {
+                        accepted: true,
+                        message: "Pet party updated.".to_string(),
+                    }
+                }
+                Ok(UpdatePetPartyOutcome::TooManySelected) => UpdatePetPartyResult {
+                    accepted: false,
+                    message: format!(
+                        "You can only have {} active followers.",
+                        PET_ACTIVE_FOLLOWER_LIMIT
+                    ),
+                },
+                Ok(UpdatePetPartyOutcome::InvalidSelection) => UpdatePetPartyResult {
+                    accepted: false,
+                    message: "One or more selected pets are no longer in your collection."
+                        .to_string(),
+                },
+                Err(error) => {
+                    tracing::warn!(?error, player_id, "failed to update saved pet party");
+                    UpdatePetPartyResult {
+                        accepted: false,
+                        message: "We could not save that pet party.".to_string(),
+                    }
+                }
+            }
+        } else {
+            match self
+                .player_service
+                .update_guest_pet_party(player_id, &active_pet_ids)
+                .await
+            {
+                Some(GuestPetPartyUpdateOutcome::Updated(updated_player)) => {
+                    let _ = sender.send(ServerMessage::CapturedPetsSnapshot(
+                        updated_player.captured_pets_snapshot(),
+                    ));
+                    let snapshot = updated_player.snapshot(0);
+                    let _ = sender.send(ServerMessage::PlayerStateSnapshot(snapshot.clone()));
+                    self.broadcast_player_snapshot(snapshot).await;
+                    UpdatePetPartyResult {
+                        accepted: true,
+                        message:
+                            "Pet party updated for this guest session. It resets when you leave."
+                                .to_string(),
+                    }
+                }
+                Some(GuestPetPartyUpdateOutcome::TooManySelected) => UpdatePetPartyResult {
+                    accepted: false,
+                    message: format!(
+                        "You can only have {} active followers.",
+                        PET_ACTIVE_FOLLOWER_LIMIT
+                    ),
+                },
+                Some(GuestPetPartyUpdateOutcome::InvalidSelection) => UpdatePetPartyResult {
+                    accepted: false,
+                    message: "One or more selected pets are no longer in your collection."
+                        .to_string(),
+                },
+                None => UpdatePetPartyResult {
+                    accepted: false,
+                    message: "We could not save that pet party.".to_string(),
+                },
+            }
+        };
+
+        let _ = sender.send(ServerMessage::UpdatePetPartyResult(result));
+        Ok(())
+    }
+
+    async fn sync_pet_collection_for_player(
+        &self,
+        player_id: u64,
+        sender: &mpsc::UnboundedSender<ServerMessage>,
+        collection: PlayerPetCollection,
+    ) {
+        if let Some(updated_player) = self
+            .player_service
+            .set_pet_collection(player_id, collection)
+            .await
+        {
+            let _ = sender.send(ServerMessage::CapturedPetsSnapshot(
+                updated_player.captured_pets_snapshot(),
+            ));
+            let snapshot = updated_player.snapshot(0);
+            let _ = sender.send(ServerMessage::PlayerStateSnapshot(snapshot.clone()));
+            self.broadcast_player_snapshot(snapshot).await;
+        }
     }
 
     async fn broadcast_chunk_update(&self, chunk: Option<ChunkData>) {
@@ -3211,6 +3349,182 @@ mod tests {
         assert_eq!(status.persisted_chunk_count, 1);
         assert_eq!(status.cache_namespace, "test");
         assert!(status.cache_connected);
+    }
+
+    #[tokio::test]
+    async fn guest_captures_only_auto_fill_open_pet_party_slots() {
+        let player_service = PlayerService::new();
+        let player = player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                WorldPos { x: 0, y: 72, z: 0 },
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        for index in 0..(PET_ACTIVE_FOLLOWER_LIMIT + 1) {
+            let pet = player_service
+                .capture_guest_pet(
+                    player.id,
+                    PetIdentity {
+                        id: format!("pet-{index}"),
+                        display_name: format!("Pet {index}"),
+                        model_url: None,
+                    },
+                )
+                .await
+                .expect("guest capture updates player");
+            if index < PET_ACTIVE_FOLLOWER_LIMIT {
+                assert_eq!(pet.active_pet_models.len(), index + 1);
+            } else {
+                assert_eq!(pet.active_pet_models.len(), PET_ACTIVE_FOLLOWER_LIMIT);
+                assert_eq!(pet.captured_pets.first().map(|pet| pet.active), Some(false));
+                assert!(
+                    !pet.active_pet_models
+                        .iter()
+                        .any(|pet_model| pet_model.id == "pet-6")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn guest_pet_party_update_rejects_unknown_pets() {
+        let player_service = PlayerService::new();
+        let player = player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                WorldPos { x: 0, y: 72, z: 0 },
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        player_service
+            .capture_guest_pet(
+                player.id,
+                PetIdentity {
+                    id: "pet-a".to_string(),
+                    display_name: "Pet A".to_string(),
+                    model_url: None,
+                },
+            )
+            .await
+            .expect("first guest capture");
+
+        let result = player_service
+            .update_guest_pet_party(player.id, &["missing".to_string()])
+            .await;
+
+        assert!(matches!(
+            result,
+            Some(GuestPetPartyUpdateOutcome::InvalidSelection)
+        ));
+    }
+
+    #[tokio::test]
+    async fn guest_pet_party_update_rejects_more_than_six_pets() {
+        let player_service = PlayerService::new();
+        let player = player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                WorldPos { x: 0, y: 72, z: 0 },
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        let mut pet_ids = Vec::new();
+        for index in 0..(PET_ACTIVE_FOLLOWER_LIMIT + 1) {
+            let pet_id = format!("pet-{index}");
+            pet_ids.push(pet_id.clone());
+            player_service
+                .capture_guest_pet(
+                    player.id,
+                    PetIdentity {
+                        id: pet_id,
+                        display_name: format!("Pet {index}"),
+                        model_url: None,
+                    },
+                )
+                .await
+                .expect("guest capture");
+        }
+
+        let result = player_service
+            .update_guest_pet_party(player.id, &pet_ids)
+            .await;
+
+        assert!(matches!(
+            result,
+            Some(GuestPetPartyUpdateOutcome::TooManySelected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn guest_pet_party_update_dedupes_and_applies_selection() {
+        let player_service = PlayerService::new();
+        let player = player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                WorldPos { x: 0, y: 72, z: 0 },
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        for pet_id in ["pet-a", "pet-b", "pet-c"] {
+            player_service
+                .capture_guest_pet(
+                    player.id,
+                    PetIdentity {
+                        id: pet_id.to_string(),
+                        display_name: pet_id.to_string(),
+                        model_url: None,
+                    },
+                )
+                .await
+                .expect("guest capture");
+        }
+
+        let result = player_service
+            .update_guest_pet_party(
+                player.id,
+                &[
+                    "pet-a".to_string(),
+                    "pet-b".to_string(),
+                    "pet-a".to_string(),
+                ],
+            )
+            .await;
+
+        let Some(GuestPetPartyUpdateOutcome::Updated(player)) = result else {
+            panic!("expected updated guest pet party");
+        };
+        let active_ids = player
+            .captured_pets
+            .iter()
+            .filter(|pet| pet.active)
+            .map(|pet| pet.id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(active_ids.len(), 2);
+        assert!(active_ids.contains("pet-a"));
+        assert!(active_ids.contains("pet-b"));
+        assert!(!active_ids.contains("pet-c"));
     }
 
     #[test]

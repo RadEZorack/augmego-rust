@@ -317,5 +317,5 @@ cargo check --target wasm32-unknown-unknown -p game-web
 
 - Guest mode still works.
 - Signed-in users receive a short-lived game auth token from `/api/v1/auth/me`.
-- The newest six captured pets become active followers automatically.
+- Captured pets can be toggled into or out of your active six-slot pet party.
 - World/chunk persistence now uses Postgres sparse overrides with a Valkey cache instead of local disk.

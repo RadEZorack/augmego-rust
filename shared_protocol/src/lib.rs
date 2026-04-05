@@ -3,7 +3,7 @@ use shared_math::{ChunkPos, WorldPos};
 use shared_world::{BlockId, ChunkData, ChunkDelta};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -141,6 +141,18 @@ pub struct CaptureWildPetResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePetPartyRequest {
+    pub active_pet_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePetPartyResult {
+    pub accepted: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerStateSnapshot {
     pub player_id: u64,
     pub tick: u64,
@@ -227,6 +239,7 @@ pub enum ClientMessage {
     SubscribeChunks(SubscribeChunks),
     PlayerInputTick(PlayerInputTick),
     CaptureWildPetRequest { pet_id: u64 },
+    UpdatePetPartyRequest(UpdatePetPartyRequest),
     PlaceBlockRequest(PlaceBlockRequest),
     BreakBlockRequest(BreakBlockRequest),
     ChatMessage(ChatMessage),
@@ -246,6 +259,7 @@ pub enum ServerMessage {
     WildPetUnload(WildPetUnload),
     CapturedPetsSnapshot(CapturedPetsSnapshot),
     CaptureWildPetResult(CaptureWildPetResult),
+    UpdatePetPartyResult(UpdatePetPartyResult),
     InventorySnapshot(InventorySnapshot),
     BlockActionResult(BlockActionResult),
     ChatMessage(ChatMessage),
@@ -300,6 +314,35 @@ mod tests {
                 assert!(response.accepted);
             }
             _ => panic!("unexpected message variant"),
+        }
+    }
+
+    #[test]
+    fn pet_party_message_round_trip() {
+        let request = ClientMessage::UpdatePetPartyRequest(UpdatePetPartyRequest {
+            active_pet_ids: vec!["pet-a".to_string(), "pet-b".to_string()],
+        });
+        let request_bytes = encode(&request).unwrap();
+        let decoded_request: ClientMessage = decode(&request_bytes).unwrap();
+        match decoded_request {
+            ClientMessage::UpdatePetPartyRequest(request) => {
+                assert_eq!(request.active_pet_ids, vec!["pet-a", "pet-b"]);
+            }
+            _ => panic!("unexpected client message variant"),
+        }
+
+        let response = ServerMessage::UpdatePetPartyResult(UpdatePetPartyResult {
+            accepted: true,
+            message: "Pet party updated.".to_string(),
+        });
+        let response_bytes = encode(&response).unwrap();
+        let decoded_response: ServerMessage = decode(&response_bytes).unwrap();
+        match decoded_response {
+            ServerMessage::UpdatePetPartyResult(result) => {
+                assert!(result.accepted);
+                assert_eq!(result.message, "Pet party updated.");
+            }
+            _ => panic!("unexpected server message variant"),
         }
     }
 }

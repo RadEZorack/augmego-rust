@@ -8,8 +8,8 @@ use shared_protocol::{
     CapturedPetsSnapshot, ClientHello, ClientMessage, ClientWebRtcSignal, InventorySnapshot,
     LoginRequest, PROTOCOL_VERSION, PeerRealtimeState, PetIdentity, PetStateSnapshot,
     PlaceBlockRequest, PlayerInputTick, PlayerLeft, ServerMessage, ServerWebRtcSignal,
-    SubscribeChunks, WebRtcSignalPayload, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload,
-    decode, encode,
+    SubscribeChunks, UpdatePetPartyRequest, UpdatePetPartyResult, WebRtcSignalPayload,
+    WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::cell::RefCell;
@@ -343,6 +343,10 @@ impl Default for RemoteAvatarPlaybackState {
 thread_local! {
     static AUTH_GUEST_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static CHUNK_QUALITY_CYCLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
+    static PET_PARTY_MODAL_OPEN_QUEUE: RefCell<bool> = const { RefCell::new(false) };
+    static PET_PARTY_MODAL_CLOSE_QUEUE: RefCell<bool> = const { RefCell::new(false) };
+    static PET_PARTY_SAVE_QUEUE: RefCell<bool> = const { RefCell::new(false) };
+    static PET_PARTY_TOGGLE_QUEUE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -619,6 +623,9 @@ struct WebApp {
     pet_followers_need_reset: bool,
     captured_pets: Vec<CapturedPet>,
     pet_notice: Option<String>,
+    pet_party_selected_ids: HashSet<String>,
+    pet_party_save_in_flight: bool,
+    pet_party_modal_message: Option<String>,
     spawn_position: Option<WorldPos>,
     world_seed: u64,
     webcam_requested: bool,
@@ -654,6 +661,12 @@ struct WebApp {
     perf_panel: Element,
     chunk_quality_button: Element,
     captured_pets_panel: Element,
+    pet_party_modal: Element,
+    pet_party_modal_copy: Element,
+    pet_party_modal_count: Element,
+    pet_party_modal_list: Element,
+    pet_party_modal_status: Element,
+    pet_party_save_button: Element,
     player_avatar_panel: Element,
     player_avatar_modal: Element,
     player_avatar_panel_status: Element,
@@ -709,6 +722,14 @@ impl WebApp {
         let (chunk_quality_button, chunk_quality_button_onclick) =
             create_chunk_quality_button(chunk_quality_preset);
         let captured_pets_panel = create_captured_pets_panel();
+        let (
+            pet_party_modal,
+            pet_party_modal_copy,
+            pet_party_modal_count,
+            pet_party_modal_list,
+            pet_party_modal_status,
+            pet_party_save_button,
+        ) = create_pet_party_modal();
         let (
             player_avatar_panel,
             player_avatar_modal,
@@ -778,6 +799,9 @@ impl WebApp {
             pet_followers_need_reset: false,
             captured_pets: Vec::new(),
             pet_notice: None,
+            pet_party_selected_ids: HashSet::new(),
+            pet_party_save_in_flight: false,
+            pet_party_modal_message: None,
             spawn_position: None,
             world_seed: DEFAULT_WORLD_SEED,
             webcam_requested: false,
@@ -813,6 +837,12 @@ impl WebApp {
             perf_panel,
             chunk_quality_button,
             captured_pets_panel,
+            pet_party_modal,
+            pet_party_modal_copy,
+            pet_party_modal_count,
+            pet_party_modal_list,
+            pet_party_modal_status,
+            pet_party_save_button,
             player_avatar_panel,
             player_avatar_modal,
             player_avatar_panel_status,
@@ -831,6 +861,7 @@ impl WebApp {
         };
         app.update_chunk_quality_button();
         app.update_captured_pets_panel();
+        app.update_pet_party_modal();
         app.update_perf_panel(0, 0);
         app
     }
@@ -1298,6 +1329,223 @@ impl WebApp {
         self.update_captured_pets_panel();
     }
 
+    fn sync_pet_party_draft_from_snapshot(&mut self) {
+        self.pet_party_selected_ids = self
+            .captured_pets
+            .iter()
+            .filter(|pet| pet.active)
+            .map(|pet| pet.id.clone())
+            .collect();
+    }
+
+    fn current_pet_party_selection_ids(&self) -> Vec<String> {
+        self.captured_pets
+            .iter()
+            .filter(|pet| self.pet_party_selected_ids.contains(&pet.id))
+            .map(|pet| pet.id.clone())
+            .collect()
+    }
+
+    fn pet_party_has_unsaved_changes(&self) -> bool {
+        let saved_active_pet_ids = self
+            .captured_pets
+            .iter()
+            .filter(|pet| pet.active)
+            .map(|pet| pet.id.as_str())
+            .collect::<HashSet<_>>();
+
+        saved_active_pet_ids.len() != self.pet_party_selected_ids.len()
+            || self
+                .pet_party_selected_ids
+                .iter()
+                .any(|pet_id| !saved_active_pet_ids.contains(pet_id.as_str()))
+    }
+
+    fn show_pet_party_modal(&self) {
+        let _ = self.pet_party_modal.set_attribute(
+            "style",
+            "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(5,8,12,0.72);backdrop-filter:blur(10px);z-index:65;",
+        );
+    }
+
+    fn hide_pet_party_modal(&self) {
+        let _ = self
+            .pet_party_modal
+            .set_attribute("style", player_avatar_modal_style());
+    }
+
+    fn update_pet_party_modal(&self) {
+        let selected_count = self.pet_party_selected_ids.len();
+        let copy = if self.guest_pet_captures_are_temporary() {
+            "Choose up to 6 active followers for this guest session. Party choices reset when you leave."
+        } else {
+            "Choose up to 6 active followers. Your saved account keeps this party between sessions."
+        };
+        self.pet_party_modal_copy.set_text_content(Some(copy));
+        self.pet_party_modal_count
+            .set_text_content(Some(&format!("Selected {selected_count}/{PET_FOLLOWER_COUNT}")));
+
+        let list_markup = if self.captured_pets.is_empty() {
+            "<div style=\"padding:14px 16px;border-radius:16px;border:1px dashed rgba(255,255,255,0.14);color:rgba(230,237,243,0.68);font-size:13px;line-height:1.5;\">Capture pets in the world to build a party.</div>".to_string()
+        } else {
+            self.captured_pets
+                .iter()
+                .map(|pet| {
+                    let is_selected = self.pet_party_selected_ids.contains(&pet.id);
+                    let is_disabled = self.pet_party_save_in_flight
+                        || (!is_selected && selected_count >= PET_FOLLOWER_COUNT);
+                    let button_style = if is_selected {
+                        "width:100%;padding:12px 14px;border-radius:16px;border:1px solid rgba(246,198,101,0.38);background:linear-gradient(180deg,rgba(73,54,22,0.92),rgba(45,33,13,0.92));color:#f9e1aa;text-align:left;font:600 14px/1.35 ui-sans-serif,system-ui,sans-serif;"
+                    } else if is_disabled {
+                        "width:100%;padding:12px 14px;border-radius:16px;border:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.04);color:rgba(230,237,243,0.42);text-align:left;font:600 14px/1.35 ui-sans-serif,system-ui,sans-serif;cursor:not-allowed;"
+                    } else {
+                        "width:100%;padding:12px 14px;border-radius:16px;border:1px solid rgba(255,255,255,0.10);background:rgba(255,255,255,0.05);color:#e6edf3;text-align:left;font:600 14px/1.35 ui-sans-serif,system-ui,sans-serif;cursor:pointer;"
+                    };
+                    let state_label = if is_selected {
+                        "Active follower"
+                    } else {
+                        "Inactive"
+                    };
+                    let disabled_attr = if is_disabled { "disabled" } else { "" };
+                    format!(
+                        "<button type=\"button\" data-pet-id=\"{}\" {disabled_attr} style=\"{button_style}\">{name} · {state_label}</button>",
+                        pet.id,
+                        name = pet.display_name,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("<div style=\"height:10px;\"></div>")
+        };
+        self.pet_party_modal_list.set_inner_html(&list_markup);
+
+        let save_disabled =
+            self.pet_party_save_in_flight || !self.can_capture_generated_pets() || !self.pet_party_has_unsaved_changes();
+        if save_disabled {
+            let _ = self.pet_party_save_button.set_attribute("disabled", "true");
+        } else {
+            let _ = self.pet_party_save_button.remove_attribute("disabled");
+        }
+        let save_style = if save_disabled {
+            "margin-top:14px;width:100%;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.10);background:rgba(255,255,255,0.06);color:rgba(230,237,243,0.52);font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:not-allowed;"
+        } else {
+            "margin-top:14px;width:100%;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.18);background:linear-gradient(180deg,#f6c665,#e8a93c);color:#1b1206;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;"
+        };
+        let _ = self.pet_party_save_button.set_attribute("style", save_style);
+        self.pet_party_save_button.set_text_content(Some(if self.pet_party_save_in_flight {
+            "Saving Party..."
+        } else {
+            "Save Party"
+        }));
+
+        let default_status = if self.captured_pets.is_empty() {
+            "Capture pets to choose which ones follow you."
+        } else if self.pet_party_has_unsaved_changes() {
+            "Choose up to 6 pets, then save your party."
+        } else {
+            "Your current party is saved."
+        };
+        self.pet_party_modal_status.set_text_content(Some(
+            self.pet_party_modal_message
+                .as_deref()
+                .unwrap_or(default_status),
+        ));
+    }
+
+    fn process_pet_party_requests(&mut self) {
+        let should_close_modal = PET_PARTY_MODAL_CLOSE_QUEUE.with(|queue| {
+            let mut queued = queue.borrow_mut();
+            let should_close = *queued;
+            *queued = false;
+            should_close
+        });
+        if should_close_modal {
+            self.sync_pet_party_draft_from_snapshot();
+            self.pet_party_save_in_flight = false;
+            self.pet_party_modal_message = None;
+            self.hide_pet_party_modal();
+            self.update_pet_party_modal();
+        }
+
+        let should_open_modal = PET_PARTY_MODAL_OPEN_QUEUE.with(|queue| {
+            let mut queued = queue.borrow_mut();
+            let should_open = *queued;
+            *queued = false;
+            should_open
+        });
+        if should_open_modal {
+            if !self.can_capture_generated_pets() {
+                self.set_pet_notice("Sign in or continue as a guest to manage a pet party.");
+            } else {
+                self.sync_pet_party_draft_from_snapshot();
+                self.pet_party_save_in_flight = false;
+                self.pet_party_modal_message = None;
+                self.show_pet_party_modal();
+                self.update_pet_party_modal();
+            }
+        }
+
+        let toggled_pet_ids = PET_PARTY_TOGGLE_QUEUE.with(|queue| {
+            let mut queued = queue.borrow_mut();
+            std::mem::take(&mut *queued)
+        });
+        for pet_id in toggled_pet_ids {
+            if self.pet_party_save_in_flight || !self.can_capture_generated_pets() {
+                continue;
+            }
+            if !self.captured_pets.iter().any(|pet| pet.id == pet_id) {
+                continue;
+            }
+            if self.pet_party_selected_ids.contains(&pet_id) {
+                self.pet_party_selected_ids.remove(&pet_id);
+                self.pet_party_modal_message = None;
+            } else if self.pet_party_selected_ids.len() >= PET_FOLLOWER_COUNT {
+                self.pet_party_modal_message = Some(format!(
+                    "You can only have {} active followers.",
+                    PET_FOLLOWER_COUNT
+                ));
+            } else {
+                self.pet_party_selected_ids.insert(pet_id);
+                self.pet_party_modal_message = None;
+            }
+            self.update_pet_party_modal();
+        }
+
+        let should_save_party = PET_PARTY_SAVE_QUEUE.with(|queue| {
+            let mut queued = queue.borrow_mut();
+            let should_save = *queued;
+            *queued = false;
+            should_save
+        });
+        if should_save_party {
+            if !self.can_capture_generated_pets() {
+                self.pet_party_modal_message =
+                    Some("Sign in or continue as a guest to build a pet party.".to_string());
+            } else if self.pet_party_save_in_flight {
+                return;
+            } else {
+                self.pet_party_save_in_flight = true;
+                self.pet_party_modal_message = Some("Saving pet party...".to_string());
+                self.send_client_message(&ClientMessage::UpdatePetPartyRequest(
+                    UpdatePetPartyRequest {
+                        active_pet_ids: self.current_pet_party_selection_ids(),
+                    },
+                ));
+            }
+            self.update_pet_party_modal();
+        }
+    }
+
+    fn reset_pet_party_state(&mut self) {
+        self.captured_pets.clear();
+        self.pet_notice = None;
+        self.pet_party_selected_ids.clear();
+        self.pet_party_save_in_flight = false;
+        self.pet_party_modal_message = None;
+        self.hide_pet_party_modal();
+        self.update_captured_pets_panel();
+        self.update_pet_party_modal();
+    }
+
     fn update_captured_pets_panel(&self) {
         let active_count = self.captured_pets.iter().filter(|pet| pet.active).count();
         let summary = if self.captured_pets.is_empty() {
@@ -1349,6 +1597,11 @@ impl WebApp {
                 pet_list
             }
         };
+        let manage_copy = if self.can_capture_generated_pets() {
+            "Open Pet Party"
+        } else {
+            "Choose a Session First"
+        };
         let notice = self
             .pet_notice
             .as_ref()
@@ -1359,7 +1612,7 @@ impl WebApp {
             })
             .unwrap_or_default();
         self.captured_pets_panel.set_inner_html(&format!(
-            "<div style=\"font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:rgba(183,230,255,0.66);margin-bottom:8px;\">Captured Pets</div><div style=\"font-size:15px;font-weight:700;color:#f4f7fb;\">{summary}</div><div style=\"margin-top:8px;color:rgba(230,237,243,0.74);font-size:12px;line-height:1.45;\">{details}</div><div style=\"margin-top:8px;color:rgba(183,230,255,0.66);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;\">Active followers: {active_count}</div>{notice}"
+            "<div style=\"font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:rgba(183,230,255,0.66);margin-bottom:8px;\">Captured Pets</div><div style=\"font-size:15px;font-weight:700;color:#f4f7fb;\">{summary}</div><div style=\"margin-top:8px;color:rgba(230,237,243,0.74);font-size:12px;line-height:1.45;\">{details}</div><div style=\"margin-top:8px;color:rgba(183,230,255,0.66);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;\">Active followers: {active_count}</div><div style=\"margin-top:8px;color:#f9d9b6;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;\">{manage_copy}</div>{notice}"
         ));
     }
 
@@ -1421,9 +1674,7 @@ impl WebApp {
                             self.last_sent_yaw = None;
                             self.last_input_broadcast_at = None;
                             self.last_peer_realtime_broadcast_at = None;
-                            self.captured_pets.clear();
-                            self.pet_notice = None;
-                            self.update_captured_pets_panel();
+                            self.reset_pet_party_state();
                             web_sys::console::error_1(&JsValue::from_str(&format!(
                                 "multiplayer disconnected: decode websocket message: {error}"
                             )));
@@ -1463,9 +1714,7 @@ impl WebApp {
                                 self.last_sent_yaw = None;
                                 self.last_input_broadcast_at = None;
                                 self.last_peer_realtime_broadcast_at = None;
-                                self.captured_pets.clear();
-                                self.pet_notice = None;
-                                self.update_captured_pets_panel();
+                                self.reset_pet_party_state();
                                 self.camera.position = Vec3::new(
                                     response.spawn_position.x as f32 + 0.5,
                                     response.spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
@@ -1599,8 +1848,11 @@ impl WebApp {
                         ServerMessage::CapturedPetsSnapshot(CapturedPetsSnapshot { pets }) => {
                             self.captured_pets = pets;
                             self.pet_notice = None;
+                            self.pet_party_modal_message = None;
+                            self.sync_pet_party_draft_from_snapshot();
                             self.pet_followers_need_reset = true;
                             self.update_captured_pets_panel();
+                            self.update_pet_party_modal();
                         }
                         ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
                             status,
@@ -1611,6 +1863,18 @@ impl WebApp {
                             if matches!(status, CaptureWildPetStatus::Captured) {
                                 self.pet_followers_need_reset = true;
                             }
+                        }
+                        ServerMessage::UpdatePetPartyResult(UpdatePetPartyResult {
+                            accepted,
+                            message,
+                        }) => {
+                            self.pet_party_save_in_flight = false;
+                            self.pet_party_modal_message = Some(message.clone());
+                            self.set_pet_notice(message);
+                            if accepted {
+                                self.pet_followers_need_reset = true;
+                            }
+                            self.update_pet_party_modal();
                         }
                         ServerMessage::WebRtcSignal(signal) => self.handle_webrtc_signal(signal),
                         ServerMessage::BlockActionResult(result) => {
@@ -1653,9 +1917,7 @@ impl WebApp {
                     self.last_sent_yaw = None;
                     self.last_input_broadcast_at = None;
                     self.last_peer_realtime_broadcast_at = None;
-                    self.captured_pets.clear();
-                    self.pet_notice = None;
-                    self.update_captured_pets_panel();
+                    self.reset_pet_party_state();
                     web_sys::console::error_1(&JsValue::from_str(&format!(
                         "multiplayer disconnected: {reason}"
                     )));
@@ -1672,19 +1934,27 @@ impl WebApp {
                         self.auth_user = Some(user);
                         self.auth_status = AuthStatus::SignedIn;
                         self.pet_notice = None;
+                        self.pet_party_modal_message = None;
                         self.update_captured_pets_panel();
+                        self.update_pet_party_modal();
                     }
                     Ok(None) => {
                         self.auth_user = None;
                         self.auth_status = AuthStatus::SignedOut;
                         self.pet_notice = None;
+                        self.pet_party_modal_message = None;
+                        self.hide_pet_party_modal();
                         self.update_captured_pets_panel();
+                        self.update_pet_party_modal();
                     }
                     Err(message) => {
                         self.auth_user = None;
                         self.auth_status = AuthStatus::Failed(message);
                         self.pet_notice = None;
+                        self.pet_party_modal_message = None;
+                        self.hide_pet_party_modal();
                         self.update_captured_pets_panel();
+                        self.update_pet_party_modal();
                     }
                 },
             }
@@ -1700,7 +1970,9 @@ impl WebApp {
             self.auth_user = Some(AuthUser::guest());
             self.auth_status = AuthStatus::SignedIn;
             self.pet_notice = None;
+            self.pet_party_modal_message = None;
             self.update_captured_pets_panel();
+            self.update_pet_party_modal();
         }
 
         self.sync_auth_overlay();
@@ -2003,6 +2275,7 @@ impl WebApp {
         self.sync_pointer_lock_state();
         self.process_chunk_quality_requests();
         self.process_auth_events();
+        self.process_pet_party_requests();
         self.drain_network();
         self.process_peer_realtime_events();
         let now = Instant::now();
@@ -4727,13 +5000,145 @@ fn create_captured_pets_panel() -> Element {
         return fallback_element();
     };
 
-    let panel = document.create_element("div").expect("captured pets panel");
+    let panel = document
+        .create_element("button")
+        .expect("captured pets panel");
+    let _ = panel.set_attribute("type", "button");
     let _ = panel.set_attribute(
         "style",
-        "position:fixed;left:16px;bottom:108px;width:min(260px,calc(100vw - 32px));padding:14px 16px;border-radius:16px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:30;font-family:ui-sans-serif,system-ui,sans-serif;",
+        "position:fixed;left:16px;bottom:108px;width:min(260px,calc(100vw - 32px));padding:14px 16px;border-radius:16px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:30;font-family:ui-sans-serif,system-ui,sans-serif;text-align:left;cursor:pointer;",
     );
+    let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        PET_PARTY_MODAL_OPEN_QUEUE.with(|queue| {
+            *queue.borrow_mut() = true;
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = panel.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+    onclick.forget();
     let _ = body.append_child(&panel);
     panel
+}
+
+fn create_pet_party_modal() -> (Element, Element, Element, Element, Element, Element) {
+    let Some(document) = document() else {
+        return (
+            fallback_element(),
+            fallback_element(),
+            fallback_element(),
+            fallback_element(),
+            fallback_element(),
+            fallback_element(),
+        );
+    };
+    let Some(body) = document.body() else {
+        return (
+            fallback_element(),
+            fallback_element(),
+            fallback_element(),
+            fallback_element(),
+            fallback_element(),
+            fallback_element(),
+        );
+    };
+
+    let modal = document.create_element("div").expect("pet party modal");
+    let _ = modal.set_attribute("style", player_avatar_modal_style());
+
+    let card = document.create_element("div").expect("pet party modal card");
+    let _ = card.set_attribute(
+        "style",
+        "position:relative;width:min(440px,calc(100vw - 24px));max-height:min(82vh,760px);overflow:auto;padding:18px;border-radius:20px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.96),rgba(7,11,18,0.96));color:#e6edf3;box-shadow:0 24px 60px rgba(0,0,0,0.38);",
+    );
+
+    let close_button = document
+        .create_element("button")
+        .expect("pet party modal close button");
+    close_button.set_text_content(Some("Close"));
+    let _ = close_button.set_attribute(
+        "style",
+        "position:absolute;top:14px;right:14px;padding:8px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.08);color:#f2f6fb;font:600 12px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;",
+    );
+    let _ = close_button.set_attribute("type", "button");
+    let _ = card.append_child(&close_button);
+
+    let title = document.create_element("h2").expect("pet party modal title");
+    let _ = title.set_attribute(
+        "style",
+        "margin:0 48px 6px 0;font:700 18px/1.2 ui-sans-serif,system-ui,sans-serif;",
+    );
+    title.set_text_content(Some("Pet Party"));
+    let _ = card.append_child(&title);
+
+    let copy = document.create_element("p").expect("pet party modal copy");
+    let _ = copy.set_attribute(
+        "style",
+        "margin:0 0 12px 0;color:rgba(230,237,243,0.72);font-size:13px;line-height:1.45;",
+    );
+    let _ = card.append_child(&copy);
+
+    let count = document.create_element("div").expect("pet party selected count");
+    let _ = count.set_attribute(
+        "style",
+        "margin:0 0 12px 0;color:rgba(183,230,255,0.72);font-size:11px;letter-spacing:0.12em;text-transform:uppercase;",
+    );
+    let _ = card.append_child(&count);
+
+    let list = document.create_element("div").expect("pet party pet list");
+    let _ = list.set_attribute("style", "display:grid;gap:10px;");
+    let _ = card.append_child(&list);
+
+    let save_button = document
+        .create_element("button")
+        .expect("pet party save button");
+    save_button.set_text_content(Some("Save Party"));
+    let _ = save_button.set_attribute("type", "button");
+    let _ = card.append_child(&save_button);
+
+    let status = document.create_element("p").expect("pet party modal status");
+    let _ = status.set_attribute(
+        "style",
+        "margin:12px 0 0 0;color:rgba(230,237,243,0.72);font-size:12px;line-height:1.45;",
+    );
+    let _ = card.append_child(&status);
+
+    let close_onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        PET_PARTY_MODAL_CLOSE_QUEUE.with(|queue| {
+            *queue.borrow_mut() = true;
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = close_button
+        .add_event_listener_with_callback("click", close_onclick.as_ref().unchecked_ref());
+    close_onclick.forget();
+
+    let save_onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        PET_PARTY_SAVE_QUEUE.with(|queue| {
+            *queue.borrow_mut() = true;
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ =
+        save_button.add_event_listener_with_callback("click", save_onclick.as_ref().unchecked_ref());
+    save_onclick.forget();
+
+    let list_onclick = Closure::wrap(Box::new(move |event: WebEvent| {
+        let Some(target) = event.target() else {
+            return;
+        };
+        let Ok(target) = target.dyn_into::<Element>() else {
+            return;
+        };
+        let Some(pet_id) = target.get_attribute("data-pet-id") else {
+            return;
+        };
+        PET_PARTY_TOGGLE_QUEUE.with(|queue| {
+            queue.borrow_mut().push(pet_id);
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = list.add_event_listener_with_callback("click", list_onclick.as_ref().unchecked_ref());
+    list_onclick.forget();
+
+    let _ = modal.append_child(&card);
+    let _ = body.append_child(&modal);
+    (modal, copy, count, list, status, save_button)
 }
 
 fn create_perf_panel() -> Element {

@@ -10,7 +10,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use shared_protocol::{CapturedPet, PetIdentity};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Row, postgres::PgRow};
+use std::collections::HashSet;
 use std::borrow::Cow;
 use std::io::Cursor;
 use std::io::Write;
@@ -299,6 +300,19 @@ pub enum CapturePetOutcome {
     NotSpawned,
 }
 
+#[derive(Clone, Debug)]
+pub enum UpdatePetPartyOutcome {
+    Updated(PlayerPetCollection),
+    TooManySelected,
+    InvalidSelection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PetPartySelectionError {
+    TooManySelected,
+    UnknownPet,
+}
+
 pub enum PetModelFileResponse {
     Redirect { url: String },
     Bytes(StorageObject),
@@ -395,7 +409,7 @@ impl PetRegistryClient {
     pub async fn load_user_pet_collection(&self, user_id: &str) -> Result<PlayerPetCollection> {
         let user_id = parse_uuid(user_id, "user id")?;
         let rows = sqlx::query(
-            "SELECT id, display_name, model_url, model_storage_key, captured_at
+            "SELECT id, display_name, model_url, model_storage_key, captured_at, party_active
              FROM pets
              WHERE captured_by_user_id = $1 AND status = 'CAPTURED'
              ORDER BY captured_at DESC NULLS LAST, created_at DESC",
@@ -404,52 +418,21 @@ impl PetRegistryClient {
         .fetch_all(&self.pool)
         .await
         .context("load captured pets")?;
-
-        let active_ids = rows
-            .iter()
-            .take(PET_ACTIVE_FOLLOWER_LIMIT)
-            .filter_map(|row| row.try_get::<Uuid, _>("id").ok())
-            .collect::<Vec<_>>();
-
-        let mut pets = Vec::with_capacity(rows.len());
-        for row in rows {
-            let pet_id: Uuid = row.try_get("id")?;
-            let display_name: String = row.try_get("display_name")?;
-            let model_url: Option<String> = row.try_get("model_url")?;
-            let model_storage_key: Option<String> = row.try_get("model_storage_key")?;
-            let captured_at: Option<DateTime<Utc>> = row.try_get("captured_at")?;
-            let identity =
-                self.map_pet_identity(pet_id, display_name, model_url, model_storage_key);
-            pets.push(CapturedPet {
-                id: identity.id.clone(),
-                display_name: identity.display_name.clone(),
-                model_url: identity.model_url.clone(),
-                captured_at_ms: captured_at
-                    .and_then(|value| u64::try_from(value.timestamp_millis()).ok()),
-                active: active_ids.contains(&pet_id),
-            });
-        }
-
-        let active_pets = pets
-            .iter()
-            .filter(|pet| pet.active)
-            .map(|pet| PetIdentity {
-                id: pet.id.clone(),
-                display_name: pet.display_name.clone(),
-                model_url: pet.model_url.clone(),
-            })
-            .collect();
-
-        Ok(PlayerPetCollection { pets, active_pets })
+        self.build_player_pet_collection(rows)
     }
 
     pub async fn capture_pet(&self, pet_id: &str, user_id: &str) -> Result<CapturePetOutcome> {
         let pet_id = parse_uuid(pet_id, "pet id")?;
         let user_id = parse_uuid(user_id, "user id")?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin capture pet transaction")?;
 
-        let row = sqlx::query("SELECT status FROM pets WHERE id = $1")
+        let row = sqlx::query("SELECT status FROM pets WHERE id = $1 FOR UPDATE")
             .bind(pet_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .context("load pet for capture")?;
         let Some(row) = row else {
@@ -463,27 +446,146 @@ impl PetRegistryClient {
             return Ok(CapturePetOutcome::NotSpawned);
         }
 
+        let active_rows = sqlx::query(
+            "SELECT party_active
+             FROM pets
+             WHERE captured_by_user_id = $1 AND status = 'CAPTURED'
+             FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("lock active pet collection before capture")?;
+        let active_count = active_rows
+            .iter()
+            .filter(|row| row.try_get::<bool, _>("party_active").unwrap_or(false))
+            .count();
+        let should_activate = active_count < PET_ACTIVE_FOLLOWER_LIMIT;
+
         let update = sqlx::query(
             "UPDATE pets
              SET status = 'CAPTURED',
                  captured_by_user_id = $2,
                  captured_at = NOW(),
+                 party_active = $3,
                  spawned_at = NULL,
                  updated_at = NOW()
              WHERE id = $1 AND status = 'SPAWNED'",
         )
         .bind(pet_id)
         .bind(user_id)
-        .execute(&self.pool)
+        .bind(should_activate)
+        .execute(&mut *tx)
         .await
         .context("capture pet")?;
         if update.rows_affected() == 0 {
             return Ok(CapturePetOutcome::AlreadyTaken);
         }
 
-        Ok(CapturePetOutcome::Captured(
-            self.load_user_pet_collection(&user_id.to_string()).await?,
-        ))
+        let rows = sqlx::query(
+            "SELECT id, display_name, model_url, model_storage_key, captured_at, party_active
+             FROM pets
+             WHERE captured_by_user_id = $1 AND status = 'CAPTURED'
+             ORDER BY captured_at DESC NULLS LAST, created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("load captured pets after capture")?;
+        let collection = self.build_player_pet_collection(rows)?;
+        tx.commit().await.context("commit capture pet transaction")?;
+
+        Ok(CapturePetOutcome::Captured(collection))
+    }
+
+    pub async fn update_pet_party(
+        &self,
+        user_id: &str,
+        requested_active_pet_ids: &[String],
+    ) -> Result<UpdatePetPartyOutcome> {
+        let user_id = parse_uuid(user_id, "user id")?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin update pet party transaction")?;
+
+        let rows = sqlx::query(
+            "SELECT id
+             FROM pets
+             WHERE captured_by_user_id = $1 AND status = 'CAPTURED'
+             ORDER BY captured_at DESC NULLS LAST, created_at DESC
+             FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("load captured pets for party update")?;
+
+        let owned_pet_ids = rows
+            .iter()
+            .map(|row| -> Result<(String, Uuid)> {
+                let pet_id: Uuid = row.try_get("id")?;
+                Ok((pet_id.to_string(), pet_id))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let active_pet_ids = match validate_active_pet_selection(
+            owned_pet_ids.iter().map(|(pet_id, _)| pet_id.as_str()),
+            requested_active_pet_ids,
+        ) {
+            Ok(active_pet_ids) => active_pet_ids,
+            Err(PetPartySelectionError::TooManySelected) => {
+                return Ok(UpdatePetPartyOutcome::TooManySelected);
+            }
+            Err(PetPartySelectionError::UnknownPet) => {
+                return Ok(UpdatePetPartyOutcome::InvalidSelection);
+            }
+        };
+
+        sqlx::query(
+            "UPDATE pets
+             SET party_active = FALSE,
+                 updated_at = NOW()
+             WHERE captured_by_user_id = $1 AND status = 'CAPTURED'",
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .context("clear active pet party")?;
+
+        for (_, pet_id) in owned_pet_ids
+            .iter()
+            .filter(|(pet_id, _)| active_pet_ids.contains(pet_id))
+        {
+            sqlx::query(
+                "UPDATE pets
+                 SET party_active = TRUE,
+                     updated_at = NOW()
+                 WHERE id = $1 AND captured_by_user_id = $2 AND status = 'CAPTURED'",
+            )
+            .bind(*pet_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .context("activate pet party member")?;
+        }
+
+        let rows = sqlx::query(
+            "SELECT id, display_name, model_url, model_storage_key, captured_at, party_active
+             FROM pets
+             WHERE captured_by_user_id = $1 AND status = 'CAPTURED'
+             ORDER BY captured_at DESC NULLS LAST, created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("load pet party after update")?;
+        let collection = self.build_player_pet_collection(rows)?;
+        tx.commit()
+            .await
+            .context("commit update pet party transaction")?;
+
+        Ok(UpdatePetPartyOutcome::Updated(collection))
     }
 
     pub async fn release_spawned_pet(&self, pet_id: &str) -> Result<bool> {
@@ -494,6 +596,7 @@ impl PetRegistryClient {
                  spawned_at = NULL,
                  captured_at = NULL,
                  captured_by_user_id = NULL,
+                 party_active = FALSE,
                  updated_at = NOW()
              WHERE id = $1 AND status = 'SPAWNED'",
         )
@@ -525,6 +628,40 @@ impl PetRegistryClient {
 
         let object = self.storage.read_object(&storage_key).await?;
         Ok(object.map(PetModelFileResponse::Bytes))
+    }
+
+    fn build_player_pet_collection(&self, rows: Vec<PgRow>) -> Result<PlayerPetCollection> {
+        let mut pets = Vec::with_capacity(rows.len());
+        for row in rows {
+            let pet_id: Uuid = row.try_get("id")?;
+            let display_name: String = row.try_get("display_name")?;
+            let model_url: Option<String> = row.try_get("model_url")?;
+            let model_storage_key: Option<String> = row.try_get("model_storage_key")?;
+            let captured_at: Option<DateTime<Utc>> = row.try_get("captured_at")?;
+            let party_active: bool = row.try_get("party_active")?;
+            let identity =
+                self.map_pet_identity(pet_id, display_name, model_url, model_storage_key);
+            pets.push(CapturedPet {
+                id: identity.id.clone(),
+                display_name: identity.display_name.clone(),
+                model_url: identity.model_url.clone(),
+                captured_at_ms: captured_at
+                    .and_then(|value| u64::try_from(value.timestamp_millis()).ok()),
+                active: party_active,
+            });
+        }
+
+        let active_pets = pets
+            .iter()
+            .filter(|pet| pet.active)
+            .map(|pet| PetIdentity {
+                id: pet.id.clone(),
+                display_name: pet.display_name.clone(),
+                model_url: pet.model_url.clone(),
+            })
+            .collect();
+
+        Ok(PlayerPetCollection { pets, active_pets })
     }
 
     async fn run_generation_worker_tick(&self) -> Result<()> {
@@ -1204,6 +1341,34 @@ impl PetRegistryClient {
     }
 }
 
+pub(crate) fn validate_active_pet_selection<'a, I>(
+    owned_pet_ids: I,
+    requested_active_pet_ids: &[String],
+) -> std::result::Result<HashSet<String>, PetPartySelectionError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let owned_pet_ids = owned_pet_ids
+        .into_iter()
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let mut selected_pet_ids = HashSet::new();
+
+    for pet_id in requested_active_pet_ids {
+        let pet_id = pet_id.trim();
+        if !owned_pet_ids.contains(pet_id) {
+            return Err(PetPartySelectionError::UnknownPet);
+        }
+
+        selected_pet_ids.insert(pet_id.to_string());
+        if selected_pet_ids.len() > PET_ACTIVE_FOLLOWER_LIMIT {
+            return Err(PetPartySelectionError::TooManySelected);
+        }
+    }
+
+    Ok(selected_pet_ids)
+}
+
 fn parse_uuid(value: &str, label: &str) -> Result<Uuid> {
     Uuid::parse_str(value).with_context(|| format!("parse {label}"))
 }
@@ -1871,4 +2036,44 @@ fn extract_meshy_glb_url(task: &MeshyTextTo3dTaskResponse) -> Option<String> {
     .into_iter()
     .flatten()
     .find(|candidate| !candidate.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_active_pet_selection_dedupes_requested_ids() {
+        let selected = validate_active_pet_selection(
+            ["pet-a", "pet-b", "pet-c"],
+            &[
+                "pet-a".to_string(),
+                "pet-b".to_string(),
+                "pet-a".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains("pet-a"));
+        assert!(selected.contains("pet-b"));
+    }
+
+    #[test]
+    fn validate_active_pet_selection_rejects_unknown_pets() {
+        let result =
+            validate_active_pet_selection(["pet-a"], &["pet-b".to_string(), "pet-a".to_string()]);
+
+        assert_eq!(result, Err(PetPartySelectionError::UnknownPet));
+    }
+
+    #[test]
+    fn validate_active_pet_selection_rejects_more_than_six_unique_pets() {
+        let available = ["a", "b", "c", "d", "e", "f", "g"];
+        let requested = available.iter().map(|pet_id| pet_id.to_string()).collect::<Vec<_>>();
+
+        let result = validate_active_pet_selection(available, &requested);
+
+        assert_eq!(result, Err(PetPartySelectionError::TooManySelected));
+    }
 }

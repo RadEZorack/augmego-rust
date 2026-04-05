@@ -3,7 +3,7 @@ use shared_math::{ChunkPos, WorldPos};
 use shared_world::{BlockId, ChunkData, ChunkDelta};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -106,6 +106,16 @@ pub struct PetIdentity {
     pub id: String,
     pub display_name: String,
     pub model_url: Option<String>,
+    pub equipped_weapon: Option<WeaponIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WeaponIdentity {
+    pub id: String,
+    pub kind: String,
+    pub display_name: String,
+    pub model_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,11 +126,56 @@ pub struct CapturedPet {
     pub model_url: Option<String>,
     pub captured_at_ms: Option<u64>,
     pub active: bool,
+    pub equipped_weapon_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapturedPetsSnapshot {
     pub pets: Vec<CapturedPet>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectedWeapon {
+    pub id: String,
+    pub kind: String,
+    pub display_name: String,
+    pub model_url: Option<String>,
+    pub collected_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectedWeaponsSnapshot {
+    pub weapons: Vec<CollectedWeapon>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldWeaponSnapshot {
+    pub weapon_id: u64,
+    pub tick: u64,
+    pub position: [f32; 3],
+    pub weapon_identity: WeaponIdentity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldWeaponUnload {
+    pub weapon_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PickupWorldWeaponStatus {
+    Collected,
+    AlreadyTaken,
+    OutOfRange,
+    NotFound,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PickupWorldWeaponResult {
+    pub weapon_id: u64,
+    pub status: PickupWorldWeaponStatus,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,8 +197,16 @@ pub struct CaptureWildPetResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PetWeaponAssignment {
+    pub pet_id: String,
+    pub weapon_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdatePetPartyRequest {
     pub active_pet_ids: Vec<String>,
+    pub equipped_weapon_assignments: Vec<PetWeaponAssignment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +302,7 @@ pub enum ClientMessage {
     SubscribeChunks(SubscribeChunks),
     PlayerInputTick(PlayerInputTick),
     CaptureWildPetRequest { pet_id: u64 },
+    PickupWorldWeaponRequest { weapon_id: u64 },
     UpdatePetPartyRequest(UpdatePetPartyRequest),
     PlaceBlockRequest(PlaceBlockRequest),
     BreakBlockRequest(BreakBlockRequest),
@@ -257,8 +321,12 @@ pub enum ServerMessage {
     PlayerLeft(PlayerLeft),
     WildPetSnapshot(WildPetSnapshot),
     WildPetUnload(WildPetUnload),
+    WorldWeaponSnapshot(WorldWeaponSnapshot),
+    WorldWeaponUnload(WorldWeaponUnload),
     CapturedPetsSnapshot(CapturedPetsSnapshot),
+    CollectedWeaponsSnapshot(CollectedWeaponsSnapshot),
     CaptureWildPetResult(CaptureWildPetResult),
+    PickupWorldWeaponResult(PickupWorldWeaponResult),
     UpdatePetPartyResult(UpdatePetPartyResult),
     InventorySnapshot(InventorySnapshot),
     BlockActionResult(BlockActionResult),
@@ -321,12 +389,22 @@ mod tests {
     fn pet_party_message_round_trip() {
         let request = ClientMessage::UpdatePetPartyRequest(UpdatePetPartyRequest {
             active_pet_ids: vec!["pet-a".to_string(), "pet-b".to_string()],
+            equipped_weapon_assignments: vec![PetWeaponAssignment {
+                pet_id: "pet-a".to_string(),
+                weapon_id: Some("weapon-a".to_string()),
+            }],
         });
         let request_bytes = encode(&request).unwrap();
         let decoded_request: ClientMessage = decode(&request_bytes).unwrap();
         match decoded_request {
             ClientMessage::UpdatePetPartyRequest(request) => {
                 assert_eq!(request.active_pet_ids, vec!["pet-a", "pet-b"]);
+                assert_eq!(request.equipped_weapon_assignments.len(), 1);
+                assert_eq!(request.equipped_weapon_assignments[0].pet_id, "pet-a");
+                assert_eq!(
+                    request.equipped_weapon_assignments[0].weapon_id.as_deref(),
+                    Some("weapon-a")
+                );
             }
             _ => panic!("unexpected client message variant"),
         }
@@ -341,6 +419,34 @@ mod tests {
             ServerMessage::UpdatePetPartyResult(result) => {
                 assert!(result.accepted);
                 assert_eq!(result.message, "Pet party updated.");
+            }
+            _ => panic!("unexpected server message variant"),
+        }
+    }
+
+    #[test]
+    fn weapon_pickup_message_round_trip() {
+        let request = ClientMessage::PickupWorldWeaponRequest { weapon_id: 42 };
+        let request_bytes = encode(&request).unwrap();
+        let decoded_request: ClientMessage = decode(&request_bytes).unwrap();
+        match decoded_request {
+            ClientMessage::PickupWorldWeaponRequest { weapon_id } => {
+                assert_eq!(weapon_id, 42);
+            }
+            _ => panic!("unexpected client message variant"),
+        }
+
+        let response = ServerMessage::PickupWorldWeaponResult(PickupWorldWeaponResult {
+            weapon_id: 42,
+            status: PickupWorldWeaponStatus::Collected,
+            message: "Weapon collected.".to_string(),
+        });
+        let response_bytes = encode(&response).unwrap();
+        let decoded_response: ServerMessage = decode(&response_bytes).unwrap();
+        match decoded_response {
+            ServerMessage::PickupWorldWeaponResult(result) => {
+                assert_eq!(result.weapon_id, 42);
+                assert!(matches!(result.status, PickupWorldWeaponStatus::Collected));
             }
             _ => panic!("unexpected server message variant"),
         }

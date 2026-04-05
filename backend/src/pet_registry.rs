@@ -9,10 +9,10 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use shared_protocol::{CapturedPet, PetIdentity};
+use shared_protocol::{CapturedPet, PetIdentity, PetWeaponAssignment};
 use sqlx::{PgPool, Row, postgres::PgRow};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::io::Write;
 use std::path::Path;
@@ -304,13 +304,16 @@ pub enum CapturePetOutcome {
 pub enum UpdatePetPartyOutcome {
     Updated(PlayerPetCollection),
     TooManySelected,
-    InvalidSelection,
+    InvalidSelection(PetPartySelectionError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PetPartySelectionError {
+pub enum PetPartySelectionError {
     TooManySelected,
     UnknownPet,
+    UnknownWeapon,
+    DuplicateWeapon,
+    InactivePet,
 }
 
 pub enum PetModelFileResponse {
@@ -409,7 +412,7 @@ impl PetRegistryClient {
     pub async fn load_user_pet_collection(&self, user_id: &str) -> Result<PlayerPetCollection> {
         let user_id = parse_uuid(user_id, "user id")?;
         let rows = sqlx::query(
-            "SELECT id, display_name, model_url, model_storage_key, captured_at, party_active
+            "SELECT id, display_name, model_url, model_storage_key, captured_at, party_active, equipped_weapon_id
              FROM pets
              WHERE captured_by_user_id = $1 AND status = 'CAPTURED'
              ORDER BY captured_at DESC NULLS LAST, created_at DESC",
@@ -468,6 +471,7 @@ impl PetRegistryClient {
                  captured_by_user_id = $2,
                  captured_at = NOW(),
                  party_active = $3,
+                 equipped_weapon_id = NULL,
                  spawned_at = NULL,
                  updated_at = NOW()
              WHERE id = $1 AND status = 'SPAWNED'",
@@ -483,7 +487,7 @@ impl PetRegistryClient {
         }
 
         let rows = sqlx::query(
-            "SELECT id, display_name, model_url, model_storage_key, captured_at, party_active
+            "SELECT id, display_name, model_url, model_storage_key, captured_at, party_active, equipped_weapon_id
              FROM pets
              WHERE captured_by_user_id = $1 AND status = 'CAPTURED'
              ORDER BY captured_at DESC NULLS LAST, created_at DESC",
@@ -504,6 +508,7 @@ impl PetRegistryClient {
         &self,
         user_id: &str,
         requested_active_pet_ids: &[String],
+        equipped_weapon_assignments: &[PetWeaponAssignment],
     ) -> Result<UpdatePetPartyOutcome> {
         let user_id = parse_uuid(user_id, "user id")?;
         let mut tx = self
@@ -539,14 +544,42 @@ impl PetRegistryClient {
             Err(PetPartySelectionError::TooManySelected) => {
                 return Ok(UpdatePetPartyOutcome::TooManySelected);
             }
-            Err(PetPartySelectionError::UnknownPet) => {
-                return Ok(UpdatePetPartyOutcome::InvalidSelection);
+            Err(error) => {
+                return Ok(UpdatePetPartyOutcome::InvalidSelection(error));
             }
+        };
+
+        let owned_weapon_rows = sqlx::query(
+            "SELECT id
+             FROM weapons
+             WHERE collected_by_user_id = $1 AND status = 'COLLECTED'
+             FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("load collected weapons for pet loadout update")?;
+        let owned_weapon_ids = owned_weapon_rows
+            .iter()
+            .map(|row| -> Result<String> {
+                let weapon_id: Uuid = row.try_get("id")?;
+                Ok(weapon_id.to_string())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let equipped_weapon_ids = match validate_pet_weapon_assignments(
+            owned_pet_ids.iter().map(|(pet_id, _)| pet_id.as_str()),
+            &active_pet_ids,
+            owned_weapon_ids.iter().map(String::as_str),
+            equipped_weapon_assignments,
+        ) {
+            Ok(equipped_weapon_ids) => equipped_weapon_ids,
+            Err(error) => return Ok(UpdatePetPartyOutcome::InvalidSelection(error)),
         };
 
         sqlx::query(
             "UPDATE pets
              SET party_active = FALSE,
+                 equipped_weapon_id = NULL,
                  updated_at = NOW()
              WHERE captured_by_user_id = $1 AND status = 'CAPTURED'",
         )
@@ -555,25 +588,31 @@ impl PetRegistryClient {
         .await
         .context("clear active pet party")?;
 
-        for (_, pet_id) in owned_pet_ids
+        for (pet_id, pet_uuid) in owned_pet_ids
             .iter()
             .filter(|(pet_id, _)| active_pet_ids.contains(pet_id))
         {
+            let equipped_weapon_id = equipped_weapon_ids
+                .get(pet_id)
+                .map(|weapon_id| parse_uuid(weapon_id, "weapon id"))
+                .transpose()?;
             sqlx::query(
                 "UPDATE pets
                  SET party_active = TRUE,
+                     equipped_weapon_id = $3,
                      updated_at = NOW()
                  WHERE id = $1 AND captured_by_user_id = $2 AND status = 'CAPTURED'",
             )
-            .bind(*pet_id)
+            .bind(*pet_uuid)
             .bind(user_id)
+            .bind(equipped_weapon_id)
             .execute(&mut *tx)
             .await
             .context("activate pet party member")?;
         }
 
         let rows = sqlx::query(
-            "SELECT id, display_name, model_url, model_storage_key, captured_at, party_active
+            "SELECT id, display_name, model_url, model_storage_key, captured_at, party_active, equipped_weapon_id
              FROM pets
              WHERE captured_by_user_id = $1 AND status = 'CAPTURED'
              ORDER BY captured_at DESC NULLS LAST, created_at DESC",
@@ -599,6 +638,7 @@ impl PetRegistryClient {
                  captured_at = NULL,
                  captured_by_user_id = NULL,
                  party_active = FALSE,
+                 equipped_weapon_id = NULL,
                  updated_at = NOW()
              WHERE id = $1 AND status = 'SPAWNED'",
         )
@@ -641,6 +681,7 @@ impl PetRegistryClient {
             let model_storage_key: Option<String> = row.try_get("model_storage_key")?;
             let captured_at: Option<DateTime<Utc>> = row.try_get("captured_at")?;
             let party_active: bool = row.try_get("party_active")?;
+            let equipped_weapon_id: Option<Uuid> = row.try_get("equipped_weapon_id")?;
             let identity =
                 self.map_pet_identity(pet_id, display_name, model_url, model_storage_key);
             pets.push(CapturedPet {
@@ -650,6 +691,7 @@ impl PetRegistryClient {
                 captured_at_ms: captured_at
                     .and_then(|value| u64::try_from(value.timestamp_millis()).ok()),
                 active: party_active,
+                equipped_weapon_id: equipped_weapon_id.map(|weapon_id| weapon_id.to_string()),
             });
         }
 
@@ -660,6 +702,7 @@ impl PetRegistryClient {
                 id: pet.id.clone(),
                 display_name: pet.display_name.clone(),
                 model_url: pet.model_url.clone(),
+                equipped_weapon: None,
             })
             .collect();
 
@@ -1314,6 +1357,7 @@ impl PetRegistryClient {
             id: pet_id.to_string(),
             display_name,
             model_url: Some(resolved_model_url),
+            equipped_weapon: None,
         }
     }
 
@@ -1371,11 +1415,66 @@ where
     Ok(selected_pet_ids)
 }
 
-fn parse_uuid(value: &str, label: &str) -> Result<Uuid> {
+pub(crate) fn validate_pet_weapon_assignments<'a, I, J>(
+    owned_pet_ids: I,
+    active_pet_ids: &HashSet<String>,
+    owned_weapon_ids: J,
+    requested_assignments: &[PetWeaponAssignment],
+) -> std::result::Result<HashMap<String, String>, PetPartySelectionError>
+where
+    I: IntoIterator<Item = &'a str>,
+    J: IntoIterator<Item = &'a str>,
+{
+    let owned_pet_ids = owned_pet_ids
+        .into_iter()
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let owned_weapon_ids = owned_weapon_ids
+        .into_iter()
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let mut equipped_weapon_ids = HashMap::new();
+    let mut assigned_weapon_ids = HashSet::new();
+
+    for assignment in requested_assignments {
+        let pet_id = assignment.pet_id.trim();
+        if !owned_pet_ids.contains(pet_id) {
+            return Err(PetPartySelectionError::UnknownPet);
+        }
+        if !active_pet_ids.contains(pet_id) {
+            return Err(PetPartySelectionError::InactivePet);
+        }
+        if let Some(previous_weapon_id) = equipped_weapon_ids.remove(pet_id) {
+            assigned_weapon_ids.remove(&previous_weapon_id);
+        }
+
+        let Some(weapon_id) = assignment
+            .weapon_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|weapon_id| !weapon_id.is_empty())
+        else {
+            continue;
+        };
+
+        if !owned_weapon_ids.contains(weapon_id) {
+            return Err(PetPartySelectionError::UnknownWeapon);
+        }
+        if !assigned_weapon_ids.insert(weapon_id.to_string()) {
+            return Err(PetPartySelectionError::DuplicateWeapon);
+        }
+
+        equipped_weapon_ids.insert(pet_id.to_string(), weapon_id.to_string());
+    }
+
+    Ok(equipped_weapon_ids)
+}
+
+pub(crate) fn parse_uuid(value: &str, label: &str) -> Result<Uuid> {
     Uuid::parse_str(value).with_context(|| format!("parse {label}"))
 }
 
-fn should_retry_with_meshy_6(message: &str) -> bool {
+pub(crate) fn should_retry_with_meshy_6(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     normalized.contains("meshy-4")
         && normalized.contains("deprecated")
@@ -1404,7 +1503,7 @@ fn render_progress_bar(current: i64, target: i64, width: usize) -> String {
     )
 }
 
-fn maybe_gzip_bytes(bytes: &[u8]) -> Result<(Vec<u8>, Option<&'static str>)> {
+pub(crate) fn maybe_gzip_bytes(bytes: &[u8]) -> Result<(Vec<u8>, Option<&'static str>)> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
     encoder.write_all(bytes).context("gzip pet GLB bytes")?;
     let compressed = encoder.finish().context("finalize gzipped pet GLB")?;
@@ -1414,7 +1513,7 @@ fn maybe_gzip_bytes(bytes: &[u8]) -> Result<(Vec<u8>, Option<&'static str>)> {
     Ok((compressed, Some("gzip")))
 }
 
-fn downscale_glb_embedded_images(
+pub(crate) fn downscale_glb_embedded_images(
     bytes: &[u8],
     max_dimension: u32,
     jpeg_quality: u8,
@@ -2080,5 +2179,73 @@ mod tests {
         let result = validate_active_pet_selection(available, &requested);
 
         assert_eq!(result, Err(PetPartySelectionError::TooManySelected));
+    }
+
+    #[test]
+    fn validate_pet_weapon_assignments_accepts_unique_owned_weapons() {
+        let active_pet_ids = HashSet::from(["pet-a".to_string(), "pet-b".to_string()]);
+        let assignments = validate_pet_weapon_assignments(
+            ["pet-a", "pet-b", "pet-c"],
+            &active_pet_ids,
+            ["weapon-a", "weapon-b"],
+            &[
+                PetWeaponAssignment {
+                    pet_id: "pet-a".to_string(),
+                    weapon_id: Some("weapon-a".to_string()),
+                },
+                PetWeaponAssignment {
+                    pet_id: "pet-b".to_string(),
+                    weapon_id: Some("weapon-b".to_string()),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            assignments.get("pet-a").map(String::as_str),
+            Some("weapon-a")
+        );
+        assert_eq!(
+            assignments.get("pet-b").map(String::as_str),
+            Some("weapon-b")
+        );
+    }
+
+    #[test]
+    fn validate_pet_weapon_assignments_rejects_duplicate_weapons() {
+        let active_pet_ids = HashSet::from(["pet-a".to_string(), "pet-b".to_string()]);
+        let result = validate_pet_weapon_assignments(
+            ["pet-a", "pet-b"],
+            &active_pet_ids,
+            ["weapon-a"],
+            &[
+                PetWeaponAssignment {
+                    pet_id: "pet-a".to_string(),
+                    weapon_id: Some("weapon-a".to_string()),
+                },
+                PetWeaponAssignment {
+                    pet_id: "pet-b".to_string(),
+                    weapon_id: Some("weapon-a".to_string()),
+                },
+            ],
+        );
+
+        assert_eq!(result, Err(PetPartySelectionError::DuplicateWeapon));
+    }
+
+    #[test]
+    fn validate_pet_weapon_assignments_rejects_inactive_pets() {
+        let active_pet_ids = HashSet::from(["pet-a".to_string()]);
+        let result = validate_pet_weapon_assignments(
+            ["pet-a", "pet-b"],
+            &active_pet_ids,
+            ["weapon-a"],
+            &[PetWeaponAssignment {
+                pet_id: "pet-b".to_string(),
+                weapon_id: Some("weapon-a".to_string()),
+            }],
+        );
+
+        assert_eq!(result, Err(PetPartySelectionError::InactivePet));
     }
 }

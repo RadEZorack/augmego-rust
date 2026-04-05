@@ -6,3 +6,4 @@ pub mod persistence;
 pub mod pet_registry;
 pub mod server;
 pub mod storage;
+pub mod weapon_registry;

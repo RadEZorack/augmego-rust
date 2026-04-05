@@ -5,9 +5,13 @@ use crate::persistence::{ChunkStore, ChunkStoreConfig, PostgresValkeyChunkStore}
 use crate::pet_registry::{
     CapturePetOutcome, PET_ACTIVE_FOLLOWER_LIMIT, PetModelFileResponse, PetPartySelectionError,
     PetRegistryClient, PetRegistryConfig, PlayerPetCollection, UpdatePetPartyOutcome,
-    validate_active_pet_selection,
+    validate_active_pet_selection, validate_pet_weapon_assignments,
 };
 use crate::storage::{StorageConfig, StorageProvider, StorageService};
+use crate::weapon_registry::{
+    CollectWeaponOutcome, GuestCollectWeaponOutcome, PlayerWeaponCollection,
+    WeaponModelFileResponse, WeaponRegistryClient, WeaponRegistryConfig,
+};
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -25,10 +29,13 @@ use shared_content::block_definitions;
 use shared_math::{CHUNK_HEIGHT, ChunkPos, WorldPos};
 use shared_protocol::{
     BlockActionResult, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
-    CapturedPetsSnapshot, ChunkUnload, ClientHello, ClientMessage, InventorySnapshot,
-    InventoryStack, LoginResponse, PROTOCOL_VERSION, PetIdentity, PetStateSnapshot, PlayerLeft,
-    PlayerStateSnapshot, ServerHello, ServerMessage, ServerWebRtcSignal, SubscribeChunks,
-    UpdatePetPartyResult, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, decode, encode,
+    CapturedPetsSnapshot, ChunkUnload, ClientHello, ClientMessage, CollectedWeapon,
+    CollectedWeaponsSnapshot, InventorySnapshot, InventoryStack, LoginResponse, PROTOCOL_VERSION,
+    PetIdentity, PetStateSnapshot, PetWeaponAssignment, PickupWorldWeaponResult,
+    PickupWorldWeaponStatus, PlayerLeft, PlayerStateSnapshot, ServerHello, ServerMessage,
+    ServerWebRtcSignal, SubscribeChunks, UpdatePetPartyResult, WeaponIdentity,
+    WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, WorldWeaponSnapshot, WorldWeaponUnload,
+    decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
 use std::collections::{HashMap, HashSet};
@@ -54,6 +61,11 @@ const WILD_PET_TARGET_PER_PLAYER: usize = 30;
 const WILD_PET_GLOBAL_CAP: usize = 30;
 const WILD_PET_MIN_SPAWN_DISTANCE: f32 = 18.0;
 const WILD_PET_SPAWN_RADIUS: f32 = 56.0;
+const WILD_WEAPON_PICKUP_DISTANCE: f32 = 3.8;
+const WILD_WEAPON_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
+const WILD_WEAPON_TARGET_PER_PLAYER: usize = 6;
+const WILD_WEAPON_GLOBAL_CAP: usize = 12;
+const WILD_WEAPON_MIN_SPAWN_DISTANCE: f32 = 12.0;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -108,6 +120,8 @@ pub struct ServerConfig {
     pub pet_generation_worker_interval: Duration,
     pub pet_generation_poll_interval: Duration,
     pub pet_generation_max_attempts: i32,
+    pub weapon_pool_target: i64,
+    pub weapon_generation_max_in_flight: i64,
 }
 
 impl Default for ServerConfig {
@@ -282,6 +296,14 @@ impl Default for ServerConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(5),
+            weapon_pool_target: std::env::var("WEAPON_POOL_TARGET")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(16),
+            weapon_generation_max_in_flight: std::env::var("WEAPON_GENERATION_MAX_IN_FLIGHT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(2),
         }
     }
 }
@@ -299,6 +321,7 @@ struct Player {
     dance_model_url: Option<String>,
     pet_states: Vec<PetStateSnapshot>,
     captured_pets: Vec<CapturedPet>,
+    collected_weapons: Vec<CollectedWeapon>,
     active_pet_models: Vec<PetIdentity>,
     subscribed_chunks: HashSet<ChunkPos>,
 }
@@ -324,16 +347,38 @@ impl Player {
             pets: self.captured_pets.clone(),
         }
     }
+
+    fn collected_weapons_snapshot(&self) -> CollectedWeaponsSnapshot {
+        CollectedWeaponsSnapshot {
+            weapons: self.collected_weapons.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 enum GuestPetPartyUpdateOutcome {
     Updated(Player),
     TooManySelected,
-    InvalidSelection,
+    InvalidSelection(PetPartySelectionError),
 }
 
-fn active_pet_models_from_captured_pets(captured_pets: &[CapturedPet]) -> Vec<PetIdentity> {
+fn weapon_identity_from_collected_weapon(weapon: &CollectedWeapon) -> WeaponIdentity {
+    WeaponIdentity {
+        id: weapon.id.clone(),
+        kind: weapon.kind.clone(),
+        display_name: weapon.display_name.clone(),
+        model_url: weapon.model_url.clone(),
+    }
+}
+
+fn active_pet_models_from_captured_pets(
+    captured_pets: &[CapturedPet],
+    collected_weapons: &[CollectedWeapon],
+) -> Vec<PetIdentity> {
+    let collected_weapon_map = collected_weapons
+        .iter()
+        .map(|weapon| (weapon.id.as_str(), weapon))
+        .collect::<HashMap<_, _>>();
     captured_pets
         .iter()
         .filter(|pet| pet.active)
@@ -341,6 +386,11 @@ fn active_pet_models_from_captured_pets(captured_pets: &[CapturedPet]) -> Vec<Pe
             id: pet.id.clone(),
             display_name: pet.display_name.clone(),
             model_url: pet.model_url.clone(),
+            equipped_weapon: pet
+                .equipped_weapon_id
+                .as_deref()
+                .and_then(|weapon_id| collected_weapon_map.get(weapon_id))
+                .map(|weapon| weapon_identity_from_collected_weapon(weapon)),
         })
         .collect()
 }
@@ -348,6 +398,41 @@ fn active_pet_models_from_captured_pets(captured_pets: &[CapturedPet]) -> Vec<Pe
 fn apply_active_pet_selection(captured_pets: &mut [CapturedPet], active_pet_ids: &HashSet<String>) {
     for pet in captured_pets {
         pet.active = active_pet_ids.contains(&pet.id);
+    }
+}
+
+fn apply_pet_weapon_selection(
+    captured_pets: &mut [CapturedPet],
+    equipped_weapon_ids: &HashMap<String, String>,
+) {
+    for pet in captured_pets {
+        pet.equipped_weapon_id = pet
+            .active
+            .then(|| equipped_weapon_ids.get(&pet.id).cloned())
+            .flatten();
+    }
+}
+
+fn pet_party_selection_message(error: PetPartySelectionError) -> String {
+    match error {
+        PetPartySelectionError::TooManySelected => {
+            format!(
+                "You can only have {} active followers.",
+                PET_ACTIVE_FOLLOWER_LIMIT
+            )
+        }
+        PetPartySelectionError::UnknownPet => {
+            "One or more selected pets are no longer in your collection.".to_string()
+        }
+        PetPartySelectionError::UnknownWeapon => {
+            "One or more equipped weapons are no longer in your collection.".to_string()
+        }
+        PetPartySelectionError::DuplicateWeapon => {
+            "Each equipped weapon can only be assigned to one pet.".to_string()
+        }
+        PetPartySelectionError::InactivePet => {
+            "You can only equip weapons on pets that are active in your party.".to_string()
+        }
     }
 }
 
@@ -370,6 +455,7 @@ impl PlayerService {
         name: String,
         user_id: Option<String>,
         pet_collection: Option<PlayerPetCollection>,
+        weapon_collection: Option<PlayerWeaponCollection>,
         spawn: WorldPos,
         idle_model_url: Option<String>,
         run_model_url: Option<String>,
@@ -377,9 +463,22 @@ impl PlayerService {
     ) -> Player {
         let mut next_id = self.next_id.lock().await;
         let (captured_pets, active_pet_models) = match pet_collection {
-            Some(collection) => (collection.pets, collection.active_pets),
+            Some(collection) => {
+                let captured_pets = collection.pets;
+                let active_pet_models = active_pet_models_from_captured_pets(
+                    &captured_pets,
+                    weapon_collection
+                        .as_ref()
+                        .map(|collection| collection.weapons.as_slice())
+                        .unwrap_or(&[]),
+                );
+                (captured_pets, active_pet_models)
+            }
             None => (Vec::new(), Vec::new()),
         };
+        let collected_weapons = weapon_collection
+            .map(|collection| collection.weapons)
+            .unwrap_or_default();
         let player = Player {
             id: *next_id,
             name,
@@ -392,6 +491,7 @@ impl PlayerService {
             dance_model_url,
             pet_states: Vec::new(),
             captured_pets,
+            collected_weapons,
             active_pet_models,
             subscribed_chunks: HashSet::new(),
         };
@@ -493,8 +593,22 @@ impl PlayerService {
         let mut players = self.players.lock().await;
         let player = players.get_mut(&player_id)?;
         player.captured_pets = collection.pets;
-        player.active_pet_models = collection.active_pets;
+        player.active_pet_models =
+            active_pet_models_from_captured_pets(&player.captured_pets, &player.collected_weapons);
         player.pet_states.truncate(player.active_pet_models.len());
+        Some(player.clone())
+    }
+
+    async fn set_weapon_collection(
+        &self,
+        player_id: u64,
+        collection: PlayerWeaponCollection,
+    ) -> Option<Player> {
+        let mut players = self.players.lock().await;
+        let player = players.get_mut(&player_id)?;
+        player.collected_weapons = collection.weapons;
+        player.active_pet_models =
+            active_pet_models_from_captured_pets(&player.captured_pets, &player.collected_weapons);
         Some(player.clone())
     }
 
@@ -512,11 +626,38 @@ impl PlayerService {
                 model_url: pet_identity.model_url.clone(),
                 captured_at_ms: current_time_millis(),
                 active: active_count < PET_ACTIVE_FOLLOWER_LIMIT,
+                equipped_weapon_id: None,
             },
         );
 
-        player.active_pet_models = active_pet_models_from_captured_pets(&player.captured_pets);
+        player.active_pet_models =
+            active_pet_models_from_captured_pets(&player.captured_pets, &player.collected_weapons);
         player.pet_states.truncate(player.active_pet_models.len());
+        Some(player.clone())
+    }
+
+    async fn collect_guest_weapon(
+        &self,
+        player_id: u64,
+        weapon_identity: WeaponIdentity,
+    ) -> Option<Player> {
+        let mut players = self.players.lock().await;
+        let player = players.get_mut(&player_id)?;
+        player
+            .collected_weapons
+            .retain(|weapon| weapon.id != weapon_identity.id);
+        player.collected_weapons.insert(
+            0,
+            CollectedWeapon {
+                id: weapon_identity.id.clone(),
+                kind: weapon_identity.kind.clone(),
+                display_name: weapon_identity.display_name.clone(),
+                model_url: weapon_identity.model_url.clone(),
+                collected_at_ms: current_time_millis(),
+            },
+        );
+        player.active_pet_models =
+            active_pet_models_from_captured_pets(&player.captured_pets, &player.collected_weapons);
         Some(player.clone())
     }
 
@@ -524,6 +665,7 @@ impl PlayerService {
         &self,
         player_id: u64,
         requested_active_pet_ids: &[String],
+        equipped_weapon_assignments: &[PetWeaponAssignment],
     ) -> Option<GuestPetPartyUpdateOutcome> {
         let mut players = self.players.lock().await;
         let player = players.get_mut(&player_id)?;
@@ -536,13 +678,27 @@ impl PlayerService {
             Err(PetPartySelectionError::TooManySelected) => {
                 return Some(GuestPetPartyUpdateOutcome::TooManySelected);
             }
-            Err(PetPartySelectionError::UnknownPet) => {
-                return Some(GuestPetPartyUpdateOutcome::InvalidSelection);
+            Err(error) => {
+                return Some(GuestPetPartyUpdateOutcome::InvalidSelection(error));
             }
+        };
+        let equipped_weapon_ids = match validate_pet_weapon_assignments(
+            player.captured_pets.iter().map(|pet| pet.id.as_str()),
+            &active_pet_ids,
+            player
+                .collected_weapons
+                .iter()
+                .map(|weapon| weapon.id.as_str()),
+            equipped_weapon_assignments,
+        ) {
+            Ok(equipped_weapon_ids) => equipped_weapon_ids,
+            Err(error) => return Some(GuestPetPartyUpdateOutcome::InvalidSelection(error)),
         };
 
         apply_active_pet_selection(&mut player.captured_pets, &active_pet_ids);
-        player.active_pet_models = active_pet_models_from_captured_pets(&player.captured_pets);
+        apply_pet_weapon_selection(&mut player.captured_pets, &equipped_weapon_ids);
+        player.active_pet_models =
+            active_pet_models_from_captured_pets(&player.captured_pets, &player.collected_weapons);
         player.pet_states.truncate(player.active_pet_models.len());
         Some(GuestPetPartyUpdateOutcome::Updated(player.clone()))
     }
@@ -884,6 +1040,256 @@ impl WildPetService {
                 visible_viewers: HashSet::new(),
             };
             pets.insert(new_id, pet);
+            return Ok(Some(new_id));
+        }
+
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WildWeapon {
+    id: u64,
+    weapon_identity: WeaponIdentity,
+    tick: u64,
+    position: [f32; 3],
+    collected: bool,
+    visible_viewers: HashSet<u64>,
+}
+
+impl WildWeapon {
+    fn snapshot(&self) -> WorldWeaponSnapshot {
+        WorldWeaponSnapshot {
+            weapon_id: self.id,
+            tick: self.tick,
+            position: self.position,
+            weapon_identity: self.weapon_identity.clone(),
+        }
+    }
+
+    fn chunk(&self) -> ChunkPos {
+        ChunkPos::from_world(WorldPos {
+            x: self.position[0].floor() as i64,
+            y: self.position[1].floor() as i32,
+            z: self.position[2].floor() as i64,
+        })
+    }
+}
+
+enum WildWeaponDispatch {
+    Snapshot {
+        player_ids: Vec<u64>,
+        snapshot: WorldWeaponSnapshot,
+    },
+    Unload {
+        player_ids: Vec<u64>,
+        weapon_ids: Vec<u64>,
+    },
+}
+
+enum WildWeaponPickupResult {
+    Collected {
+        viewer_ids: Vec<u64>,
+        collected_weapon_id: u64,
+        weapon_identity: WeaponIdentity,
+    },
+    NotFound,
+    AlreadyTaken,
+    OutOfRange,
+}
+
+#[derive(Clone)]
+struct WildWeaponService {
+    weapons: Arc<Mutex<HashMap<u64, WildWeapon>>>,
+    next_id: Arc<Mutex<u64>>,
+    spawn_nonce: Arc<Mutex<u64>>,
+}
+
+impl WildWeaponService {
+    fn new() -> Self {
+        Self {
+            weapons: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(Mutex::new(1)),
+            spawn_nonce: Arc::new(Mutex::new(1)),
+        }
+    }
+
+    async fn sync_player_visibility(&self, player: &Player) -> Vec<WildWeaponDispatch> {
+        let players = vec![player.clone()];
+        let mut weapons = self.weapons.lock().await;
+        let mut dispatches = Vec::new();
+        for weapon in weapons.values_mut().filter(|weapon| !weapon.collected) {
+            dispatches.extend(reconcile_weapon_visibility(weapon, &players, false));
+        }
+        dispatches
+    }
+
+    async fn remove_player(&self, player_id: u64) {
+        let mut weapons = self.weapons.lock().await;
+        for weapon in weapons.values_mut() {
+            weapon.visible_viewers.remove(&player_id);
+        }
+    }
+
+    async fn maintain(
+        &self,
+        world_service: &WorldService,
+        weapon_registry: &WeaponRegistryClient,
+        players: &[Player],
+        connected_player_ids: &HashSet<u64>,
+    ) -> Result<Vec<WildWeaponDispatch>> {
+        let active_players = players
+            .iter()
+            .filter(|player| {
+                connected_player_ids.contains(&player.id) && !player.subscribed_chunks.is_empty()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut weapons = self.weapons.lock().await;
+        weapons.retain(|_, weapon| !weapon.collected);
+
+        let mut dispatches = Vec::new();
+        for weapon in weapons.values_mut().filter(|weapon| !weapon.collected) {
+            dispatches.extend(reconcile_weapon_visibility(weapon, &active_players, false));
+        }
+
+        let mut uncaptured_count = weapons.values().filter(|weapon| !weapon.collected).count();
+        for player in &active_players {
+            if uncaptured_count >= WILD_WEAPON_GLOBAL_CAP {
+                break;
+            }
+
+            let mut nearby_count = weapons
+                .values()
+                .filter(|weapon| {
+                    !weapon.collected
+                        && weapon.visible_viewers.contains(&player.id)
+                        && pet_distance_squared(weapon.position, player.position)
+                            <= WILD_PET_SPAWN_RADIUS * WILD_PET_SPAWN_RADIUS
+                })
+                .count();
+
+            while nearby_count < WILD_WEAPON_TARGET_PER_PLAYER
+                && uncaptured_count < WILD_WEAPON_GLOBAL_CAP
+            {
+                let Some(new_weapon_id) = self
+                    .spawn_weapon_for_player_locked(
+                        world_service,
+                        weapon_registry,
+                        &mut weapons,
+                        player,
+                    )
+                    .await?
+                else {
+                    break;
+                };
+                if let Some(weapon) = weapons.get_mut(&new_weapon_id) {
+                    dispatches.extend(reconcile_weapon_visibility(weapon, &active_players, true));
+                }
+                nearby_count += 1;
+                uncaptured_count += 1;
+            }
+        }
+
+        Ok(dispatches)
+    }
+
+    async fn pickup_weapon(
+        &self,
+        _player_id: u64,
+        weapon_id: u64,
+        player_position: [f32; 3],
+    ) -> WildWeaponPickupResult {
+        let mut weapons = self.weapons.lock().await;
+        let Some(weapon) = weapons.get_mut(&weapon_id) else {
+            return WildWeaponPickupResult::NotFound;
+        };
+        if weapon.collected {
+            return WildWeaponPickupResult::AlreadyTaken;
+        }
+        if !wild_weapon_within_pickup_distance(player_position, weapon.position) {
+            return WildWeaponPickupResult::OutOfRange;
+        }
+
+        weapon.collected = true;
+        let viewers = weapon.visible_viewers.drain().collect::<Vec<_>>();
+        WildWeaponPickupResult::Collected {
+            viewer_ids: viewers,
+            collected_weapon_id: weapon_id,
+            weapon_identity: weapon.weapon_identity.clone(),
+        }
+    }
+
+    async fn spawn_weapon_for_player_locked(
+        &self,
+        world_service: &WorldService,
+        weapon_registry: &WeaponRegistryClient,
+        weapons: &mut HashMap<u64, WildWeapon>,
+        player: &Player,
+    ) -> Result<Option<u64>> {
+        let base_nonce = {
+            let mut nonce = self.spawn_nonce.lock().await;
+            let value = *nonce;
+            *nonce = (*nonce).wrapping_add(1);
+            value
+        };
+
+        for attempt in 0..24u64 {
+            let sample = hashed_spawn_offset(
+                base_nonce ^ player.id ^ attempt,
+                player.position,
+                player.yaw,
+            );
+            let candidate_chunk = ChunkPos::from_world(WorldPos {
+                x: sample[0].floor() as i64,
+                y: 0,
+                z: sample[2].floor() as i64,
+            });
+            if !player.subscribed_chunks.contains(&candidate_chunk) {
+                continue;
+            }
+
+            let Some(position) = world_service
+                .find_wild_pet_spawn_position(sample[0], sample[2])
+                .await?
+            else {
+                continue;
+            };
+            let too_close = weapons.values().any(|weapon| {
+                !weapon.collected
+                    && pet_distance_squared(weapon.position, position)
+                        < WILD_WEAPON_MIN_SPAWN_DISTANCE * WILD_WEAPON_MIN_SPAWN_DISTANCE
+            });
+            if too_close {
+                continue;
+            }
+
+            let weapon_identity = match weapon_registry.reserve_weapon().await {
+                Ok(Some(weapon_identity)) => weapon_identity,
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    tracing::warn!(?error, "failed to reserve weapon from registry");
+                    return Ok(None);
+                }
+            };
+
+            let new_id = {
+                let mut next_id = self.next_id.lock().await;
+                let value = *next_id;
+                *next_id = (*next_id).wrapping_add(1);
+                value
+            };
+            weapons.insert(
+                new_id,
+                WildWeapon {
+                    id: new_id,
+                    weapon_identity,
+                    tick: 0,
+                    position,
+                    collected: false,
+                    visible_viewers: HashSet::new(),
+                },
+            );
             return Ok(Some(new_id));
         }
 
@@ -1344,10 +1750,12 @@ pub struct VoxelServer {
     config: ServerConfig,
     account_service: AccountService,
     pet_registry: PetRegistryClient,
+    weapon_registry: WeaponRegistryClient,
     websocket_sessions: WebSocketSessionService,
     chunk_streaming: ChunkStreamingService,
     player_service: PlayerService,
     wild_pet_service: WildPetService,
+    wild_weapon_service: WildWeaponService,
     world_service: WorldService,
     static_root: PathBuf,
 }
@@ -1419,6 +1827,40 @@ impl VoxelServer {
                 pet_generation_max_attempts: config.pet_generation_max_attempts,
             },
         );
+        let weapon_registry = WeaponRegistryClient::new(
+            pool.clone(),
+            StorageService::new(StorageConfig {
+                provider: config.storage_provider.clone(),
+                root: config.storage_root.clone(),
+                namespace: config.storage_namespace.clone(),
+                spaces_bucket: config.spaces_bucket.clone(),
+                spaces_endpoint: config.spaces_endpoint.clone(),
+                spaces_custom_domain: config.spaces_custom_domain.clone(),
+                spaces_access_key_id: config.spaces_access_key_id.clone(),
+                spaces_secret_access_key: config.spaces_secret_access_key.clone(),
+                spaces_region: config.spaces_region.clone(),
+            })
+            .await?,
+            WeaponRegistryConfig {
+                generated_cache_control: config.generated_pet_cache_control.clone(),
+                generated_texture_max_dimension: config.generated_pet_texture_max_dimension,
+                generated_texture_jpeg_quality: config.generated_pet_texture_jpeg_quality,
+                meshy_api_base_url: config.meshy_api_base_url.clone(),
+                meshy_api_key: config.meshy_api_key.clone(),
+                meshy_text_to_3d_model: config.meshy_text_to_3d_model.clone(),
+                meshy_text_to_3d_model_type: config.meshy_text_to_3d_model_type.clone(),
+                meshy_text_to_3d_enable_refine: config.meshy_text_to_3d_enable_refine,
+                meshy_text_to_3d_refine_model: config.meshy_text_to_3d_refine_model.clone(),
+                meshy_text_to_3d_enable_pbr: config.meshy_text_to_3d_enable_pbr,
+                meshy_text_to_3d_topology: config.meshy_text_to_3d_topology.clone(),
+                meshy_text_to_3d_target_polycount: config.meshy_text_to_3d_target_polycount,
+                weapon_pool_target: config.weapon_pool_target,
+                weapon_generation_max_in_flight: config.weapon_generation_max_in_flight,
+                weapon_generation_worker_interval: config.pet_generation_worker_interval,
+                weapon_generation_poll_interval: config.pet_generation_poll_interval,
+                weapon_generation_max_attempts: config.pet_generation_max_attempts,
+            },
+        );
 
         let chunk_store = Arc::new(
             PostgresValkeyChunkStore::new(
@@ -1439,6 +1881,7 @@ impl VoxelServer {
         let websocket_sessions = WebSocketSessionService::new();
         let player_service = PlayerService::new();
         let wild_pet_service = WildPetService::new();
+        let wild_weapon_service = WildWeaponService::new();
 
         tracing::info!(
             blocks = block_definitions().len(),
@@ -1460,10 +1903,12 @@ impl VoxelServer {
             config,
             account_service,
             pet_registry,
+            weapon_registry,
             websocket_sessions,
             chunk_streaming,
             player_service,
             wild_pet_service,
+            wild_weapon_service,
             world_service,
         })
     }
@@ -1471,6 +1916,7 @@ impl VoxelServer {
     pub async fn run(self) -> Result<()> {
         tracing::info!(http_addr = %self.config.bind_addr, "augmego rust server listening");
         self.pet_registry.start_generation_worker();
+        self.weapon_registry.start_generation_worker();
         match self.pet_registry.reset_spawned_pets().await {
             Ok(reset_count) => {
                 tracing::info!(reset_count, "reset spawned pets in pet registry");
@@ -1479,11 +1925,25 @@ impl VoxelServer {
                 tracing::warn!(?error, "failed to reset spawned pets in pet registry");
             }
         }
+        match self.weapon_registry.reset_spawned_weapons().await {
+            Ok(reset_count) => {
+                tracing::info!(reset_count, "reset spawned weapons in weapon registry");
+            }
+            Err(error) => {
+                tracing::warn!(?error, "failed to reset spawned weapons in weapon registry");
+            }
+        }
 
         let wild_pet_server = self.clone();
         tokio::spawn(async move {
             if let Err(error) = wild_pet_server.run_wild_pet_loop().await {
                 tracing::error!(?error, "wild pet loop failed");
+            }
+        });
+        let wild_weapon_server = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = wild_weapon_server.run_wild_weapon_loop().await {
+                tracing::error!(?error, "wild weapon loop failed");
             }
         });
 
@@ -1539,6 +1999,7 @@ impl VoxelServer {
                 get(public_player_avatar_file),
             )
             .route("/api/v1/pets/{pet_id}/file", get(public_pet_file))
+            .route("/api/v1/weapons/{weapon_id}/file", get(public_weapon_file))
             .layer(TraceLayer::new_for_http())
             .with_state(self.clone())
     }
@@ -1559,6 +2020,25 @@ impl VoxelServer {
                 )
                 .await?;
             self.dispatch_wild_pet_updates(dispatches).await;
+        }
+    }
+
+    async fn run_wild_weapon_loop(self) -> Result<()> {
+        let mut interval = tokio::time::interval(WILD_WEAPON_MAINTENANCE_INTERVAL);
+        loop {
+            interval.tick().await;
+            let players = self.player_service.players().await;
+            let connected_player_ids = self.websocket_sessions.connected_player_ids().await;
+            let dispatches = self
+                .wild_weapon_service
+                .maintain(
+                    &self.world_service,
+                    &self.weapon_registry,
+                    &players,
+                    &connected_player_ids,
+                )
+                .await?;
+            self.dispatch_wild_weapon_updates(dispatches).await;
         }
     }
 
@@ -1632,6 +2112,20 @@ impl VoxelServer {
             },
             None => None,
         };
+        let weapon_collection = match user_id.as_deref() {
+            Some(user_id) => match self
+                .weapon_registry
+                .load_user_weapon_collection(user_id)
+                .await
+            {
+                Ok(collection) => Some(collection),
+                Err(error) => {
+                    tracing::warn!(?error, %user_id, "failed to load websocket player weapon collection");
+                    None
+                }
+            },
+            None => None,
+        };
         let spawn_position = self.world_service.safe_spawn_position();
         let player = self
             .player_service
@@ -1639,6 +2133,7 @@ impl VoxelServer {
                 login.name,
                 user_id,
                 pet_collection,
+                weapon_collection,
                 spawn_position,
                 login.idle_model_url,
                 login.run_model_url,
@@ -1652,6 +2147,7 @@ impl VoxelServer {
             auth_source,
             captured_pet_count = player.captured_pets.len(),
             active_pet_count = player.active_pet_models.len(),
+            collected_weapon_count = player.collected_weapons.len(),
             "websocket player joined"
         );
 
@@ -1666,6 +2162,9 @@ impl VoxelServer {
         ));
         let _ = sender.send(ServerMessage::CapturedPetsSnapshot(
             player.captured_pets_snapshot(),
+        ));
+        let _ = sender.send(ServerMessage::CollectedWeaponsSnapshot(
+            player.collected_weapons_snapshot(),
         ));
 
         self.websocket_sessions
@@ -1685,6 +2184,7 @@ impl VoxelServer {
             .update_subscription_ws(&sender, &self.player_service, player.id, subscribe)
             .await?;
         self.sync_player_wild_pets_ws(player.id).await;
+        self.sync_player_wild_weapons_ws(player.id).await;
 
         let _ = sender.send(ServerMessage::PlayerStateSnapshot(player.snapshot(0)));
 
@@ -1696,10 +2196,13 @@ impl VoxelServer {
         if let Some(current_player) = self.player_service.player(player.id).await {
             self.release_guest_pet_captures_for_player(&current_player)
                 .await;
+            self.release_guest_weapon_collections_for_player(&current_player)
+                .await;
         }
         self.websocket_sessions.remove(player.id).await;
         self.broadcast_player_left(player.id).await;
         self.wild_pet_service.remove_player(player.id).await;
+        self.wild_weapon_service.remove_player(player.id).await;
         self.player_service.remove(player.id).await;
         drop(sender);
         let _ = writer.await;
@@ -1734,6 +2237,22 @@ impl VoxelServer {
         }
     }
 
+    async fn release_guest_weapon_collections_for_player(&self, player: &Player) {
+        if player.user_id.is_some() || player.collected_weapons.is_empty() {
+            return;
+        }
+
+        for weapon in &player.collected_weapons {
+            if let Err(error) = self
+                .weapon_registry
+                .release_collected_weapon(&weapon.id)
+                .await
+            {
+                tracing::warn!(?error, weapon_id = %weapon.id, "failed to return guest weapon to pool");
+            }
+        }
+    }
+
     async fn handle_websocket_message(
         &self,
         player_id: u64,
@@ -1746,6 +2265,7 @@ impl VoxelServer {
                     .update_subscription_ws(sender, &self.player_service, player_id, Some(request))
                     .await?;
                 self.sync_player_wild_pets_ws(player_id).await;
+                self.sync_player_wild_weapons_ws(player_id).await;
             }
             ClientMessage::PlayerInputTick(input) => {
                 if player_input_is_stale(input.client_sent_at_ms) {
@@ -1793,9 +2313,18 @@ impl VoxelServer {
                 self.capture_wild_pet_for_websocket(player_id, sender, pet_id)
                     .await?;
             }
-            ClientMessage::UpdatePetPartyRequest(request) => {
-                self.update_pet_party_for_websocket(player_id, sender, request.active_pet_ids)
+            ClientMessage::PickupWorldWeaponRequest { weapon_id } => {
+                self.pickup_world_weapon_for_websocket(player_id, sender, weapon_id)
                     .await?;
+            }
+            ClientMessage::UpdatePetPartyRequest(request) => {
+                self.update_pet_party_for_websocket(
+                    player_id,
+                    sender,
+                    request.active_pet_ids,
+                    request.equipped_weapon_assignments,
+                )
+                .await?;
             }
             ClientMessage::PlaceBlockRequest(request) => {
                 let Some(player) = self.player_service.player(player_id).await else {
@@ -1888,12 +2417,50 @@ impl VoxelServer {
         }
     }
 
+    async fn dispatch_wild_weapon_updates(&self, dispatches: Vec<WildWeaponDispatch>) {
+        for dispatch in dispatches {
+            match dispatch {
+                WildWeaponDispatch::Snapshot {
+                    player_ids,
+                    snapshot,
+                } if !player_ids.is_empty() => {
+                    self.websocket_sessions
+                        .broadcast_to(&player_ids, ServerMessage::WorldWeaponSnapshot(snapshot))
+                        .await;
+                }
+                WildWeaponDispatch::Unload {
+                    player_ids,
+                    weapon_ids,
+                } if !player_ids.is_empty() => {
+                    self.websocket_sessions
+                        .broadcast_to(
+                            &player_ids,
+                            ServerMessage::WorldWeaponUnload(WorldWeaponUnload { weapon_ids }),
+                        )
+                        .await;
+                }
+                _ => {}
+            }
+        }
+    }
+
     async fn sync_player_wild_pets_ws(&self, player_id: u64) {
         let Some(player) = self.player_service.player(player_id).await else {
             return;
         };
         let dispatches = self.wild_pet_service.sync_player_visibility(&player).await;
         self.dispatch_wild_pet_updates(dispatches).await;
+    }
+
+    async fn sync_player_wild_weapons_ws(&self, player_id: u64) {
+        let Some(player) = self.player_service.player(player_id).await else {
+            return;
+        };
+        let dispatches = self
+            .wild_weapon_service
+            .sync_player_visibility(&player)
+            .await;
+        self.dispatch_wild_weapon_updates(dispatches).await;
     }
 
     async fn capture_wild_pet_for_websocket(
@@ -2034,6 +2601,7 @@ impl VoxelServer {
         player_id: u64,
         sender: &mpsc::UnboundedSender<ServerMessage>,
         active_pet_ids: Vec<String>,
+        equipped_weapon_assignments: Vec<PetWeaponAssignment>,
     ) -> Result<()> {
         let Some(player) = self.player_service.player(player_id).await else {
             return Ok(());
@@ -2042,7 +2610,7 @@ impl VoxelServer {
         let result = if let Some(user_id) = player.user_id.clone() {
             match self
                 .pet_registry
-                .update_pet_party(&user_id, &active_pet_ids)
+                .update_pet_party(&user_id, &active_pet_ids, &equipped_weapon_assignments)
                 .await
             {
                 Ok(UpdatePetPartyOutcome::Updated(collection)) => {
@@ -2055,15 +2623,11 @@ impl VoxelServer {
                 }
                 Ok(UpdatePetPartyOutcome::TooManySelected) => UpdatePetPartyResult {
                     accepted: false,
-                    message: format!(
-                        "You can only have {} active followers.",
-                        PET_ACTIVE_FOLLOWER_LIMIT
-                    ),
+                    message: pet_party_selection_message(PetPartySelectionError::TooManySelected),
                 },
-                Ok(UpdatePetPartyOutcome::InvalidSelection) => UpdatePetPartyResult {
+                Ok(UpdatePetPartyOutcome::InvalidSelection(error)) => UpdatePetPartyResult {
                     accepted: false,
-                    message: "One or more selected pets are no longer in your collection."
-                        .to_string(),
+                    message: pet_party_selection_message(error),
                 },
                 Err(error) => {
                     tracing::warn!(?error, player_id, "failed to update saved pet party");
@@ -2076,7 +2640,7 @@ impl VoxelServer {
         } else {
             match self
                 .player_service
-                .update_guest_pet_party(player_id, &active_pet_ids)
+                .update_guest_pet_party(player_id, &active_pet_ids, &equipped_weapon_assignments)
                 .await
             {
                 Some(GuestPetPartyUpdateOutcome::Updated(updated_player)) => {
@@ -2095,15 +2659,11 @@ impl VoxelServer {
                 }
                 Some(GuestPetPartyUpdateOutcome::TooManySelected) => UpdatePetPartyResult {
                     accepted: false,
-                    message: format!(
-                        "You can only have {} active followers.",
-                        PET_ACTIVE_FOLLOWER_LIMIT
-                    ),
+                    message: pet_party_selection_message(PetPartySelectionError::TooManySelected),
                 },
-                Some(GuestPetPartyUpdateOutcome::InvalidSelection) => UpdatePetPartyResult {
+                Some(GuestPetPartyUpdateOutcome::InvalidSelection(error)) => UpdatePetPartyResult {
                     accepted: false,
-                    message: "One or more selected pets are no longer in your collection."
-                        .to_string(),
+                    message: pet_party_selection_message(error),
                 },
                 None => UpdatePetPartyResult {
                     accepted: false,
@@ -2113,6 +2673,217 @@ impl VoxelServer {
         };
 
         let _ = sender.send(ServerMessage::UpdatePetPartyResult(result));
+        Ok(())
+    }
+
+    async fn pickup_world_weapon_for_websocket(
+        &self,
+        player_id: u64,
+        sender: &mpsc::UnboundedSender<ServerMessage>,
+        weapon_id: u64,
+    ) -> Result<()> {
+        let Some(player) = self.player_service.player(player_id).await else {
+            return Ok(());
+        };
+        let pickup_result = self
+            .wild_weapon_service
+            .pickup_weapon(player_id, weapon_id, player.position)
+            .await;
+        let (viewer_ids, collected_weapon_id, weapon_identity) = match pickup_result {
+            WildWeaponPickupResult::Collected {
+                viewer_ids,
+                collected_weapon_id,
+                weapon_identity,
+            } => (viewer_ids, collected_weapon_id, weapon_identity),
+            WildWeaponPickupResult::NotFound => {
+                let _ = sender.send(ServerMessage::PickupWorldWeaponResult(
+                    PickupWorldWeaponResult {
+                        weapon_id,
+                        status: PickupWorldWeaponStatus::NotFound,
+                        message: "That weapon is no longer available.".to_string(),
+                    },
+                ));
+                return Ok(());
+            }
+            WildWeaponPickupResult::AlreadyTaken => {
+                let _ = sender.send(ServerMessage::PickupWorldWeaponResult(
+                    PickupWorldWeaponResult {
+                        weapon_id,
+                        status: PickupWorldWeaponStatus::AlreadyTaken,
+                        message: "That weapon was already collected.".to_string(),
+                    },
+                ));
+                return Ok(());
+            }
+            WildWeaponPickupResult::OutOfRange => {
+                let _ = sender.send(ServerMessage::PickupWorldWeaponResult(
+                    PickupWorldWeaponResult {
+                        weapon_id,
+                        status: PickupWorldWeaponStatus::OutOfRange,
+                        message: "Move closer to collect that weapon.".to_string(),
+                    },
+                ));
+                return Ok(());
+            }
+        };
+
+        if let Some(user_id) = player.user_id.clone() {
+            match self
+                .weapon_registry
+                .collect_weapon(&weapon_identity.id, &user_id)
+                .await
+            {
+                Ok(CollectWeaponOutcome::Collected(collection)) => {
+                    self.sync_weapon_collection_for_player(player_id, sender, collection)
+                        .await;
+                    let _ = sender.send(ServerMessage::PickupWorldWeaponResult(
+                        PickupWorldWeaponResult {
+                            weapon_id,
+                            status: PickupWorldWeaponStatus::Collected,
+                            message: "Weapon collected.".to_string(),
+                        },
+                    ));
+                }
+                Ok(CollectWeaponOutcome::AlreadyTaken) => {
+                    let _ = self
+                        .weapon_registry
+                        .release_spawned_weapon(&weapon_identity.id)
+                        .await;
+                    let _ = sender.send(ServerMessage::PickupWorldWeaponResult(
+                        PickupWorldWeaponResult {
+                            weapon_id,
+                            status: PickupWorldWeaponStatus::AlreadyTaken,
+                            message: "That weapon was already collected.".to_string(),
+                        },
+                    ));
+                    return Ok(());
+                }
+                Ok(CollectWeaponOutcome::NotFound | CollectWeaponOutcome::NotSpawned) => {
+                    let _ = self
+                        .weapon_registry
+                        .release_spawned_weapon(&weapon_identity.id)
+                        .await;
+                    let _ = sender.send(ServerMessage::PickupWorldWeaponResult(
+                        PickupWorldWeaponResult {
+                            weapon_id,
+                            status: PickupWorldWeaponStatus::NotFound,
+                            message: "That weapon is no longer available.".to_string(),
+                        },
+                    ));
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(?error, weapon_id, "failed to collect saved weapon");
+                    let _ = self
+                        .weapon_registry
+                        .release_spawned_weapon(&weapon_identity.id)
+                        .await;
+                    let _ = sender.send(ServerMessage::PickupWorldWeaponResult(
+                        PickupWorldWeaponResult {
+                            weapon_id,
+                            status: PickupWorldWeaponStatus::Failed,
+                            message: "We could not finalize that pickup.".to_string(),
+                        },
+                    ));
+                    return Ok(());
+                }
+            }
+        } else {
+            match self
+                .weapon_registry
+                .collect_weapon_for_guest(&weapon_identity.id)
+                .await
+            {
+                Ok(GuestCollectWeaponOutcome::Collected) => {
+                    if let Some(updated_player) = self
+                        .player_service
+                        .collect_guest_weapon(player_id, weapon_identity.clone())
+                        .await
+                    {
+                        let _ = sender.send(ServerMessage::CollectedWeaponsSnapshot(
+                            updated_player.collected_weapons_snapshot(),
+                        ));
+                        let _ = sender.send(ServerMessage::PickupWorldWeaponResult(
+                            PickupWorldWeaponResult {
+                                weapon_id,
+                                status: PickupWorldWeaponStatus::Collected,
+                                message:
+                                    "Weapon collected for this guest session. It returns to the pool when you leave."
+                                        .to_string(),
+                            },
+                        ));
+                    } else {
+                        let _ = self
+                            .weapon_registry
+                            .release_collected_weapon(&weapon_identity.id)
+                            .await;
+                        let _ = sender.send(ServerMessage::PickupWorldWeaponResult(
+                            PickupWorldWeaponResult {
+                                weapon_id,
+                                status: PickupWorldWeaponStatus::Failed,
+                                message: "We could not finalize that pickup.".to_string(),
+                            },
+                        ));
+                        return Ok(());
+                    }
+                }
+                Ok(GuestCollectWeaponOutcome::AlreadyTaken) => {
+                    let _ = self
+                        .weapon_registry
+                        .release_spawned_weapon(&weapon_identity.id)
+                        .await;
+                    let _ = sender.send(ServerMessage::PickupWorldWeaponResult(
+                        PickupWorldWeaponResult {
+                            weapon_id,
+                            status: PickupWorldWeaponStatus::AlreadyTaken,
+                            message: "That weapon was already collected.".to_string(),
+                        },
+                    ));
+                    return Ok(());
+                }
+                Ok(GuestCollectWeaponOutcome::NotFound | GuestCollectWeaponOutcome::NotSpawned) => {
+                    let _ = self
+                        .weapon_registry
+                        .release_spawned_weapon(&weapon_identity.id)
+                        .await;
+                    let _ = sender.send(ServerMessage::PickupWorldWeaponResult(
+                        PickupWorldWeaponResult {
+                            weapon_id,
+                            status: PickupWorldWeaponStatus::NotFound,
+                            message: "That weapon is no longer available.".to_string(),
+                        },
+                    ));
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(?error, weapon_id, "failed to collect guest weapon");
+                    let _ = self
+                        .weapon_registry
+                        .release_spawned_weapon(&weapon_identity.id)
+                        .await;
+                    let _ = sender.send(ServerMessage::PickupWorldWeaponResult(
+                        PickupWorldWeaponResult {
+                            weapon_id,
+                            status: PickupWorldWeaponStatus::Failed,
+                            message: "We could not finalize that pickup.".to_string(),
+                        },
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+
+        if !viewer_ids.is_empty() {
+            self.websocket_sessions
+                .broadcast_to(
+                    &viewer_ids,
+                    ServerMessage::WorldWeaponUnload(WorldWeaponUnload {
+                        weapon_ids: vec![collected_weapon_id],
+                    }),
+                )
+                .await;
+        }
+
         Ok(())
     }
 
@@ -2133,6 +2904,23 @@ impl VoxelServer {
             let snapshot = updated_player.snapshot(0);
             let _ = sender.send(ServerMessage::PlayerStateSnapshot(snapshot.clone()));
             self.broadcast_player_snapshot(snapshot).await;
+        }
+    }
+
+    async fn sync_weapon_collection_for_player(
+        &self,
+        player_id: u64,
+        sender: &mpsc::UnboundedSender<ServerMessage>,
+        collection: PlayerWeaponCollection,
+    ) {
+        if let Some(updated_player) = self
+            .player_service
+            .set_weapon_collection(player_id, collection)
+            .await
+        {
+            let _ = sender.send(ServerMessage::CollectedWeaponsSnapshot(
+                updated_player.collected_weapons_snapshot(),
+            ));
         }
     }
 
@@ -2914,6 +3702,27 @@ async fn public_pet_file(
     }
 }
 
+async fn public_weapon_file(
+    State(server): State<VoxelServer>,
+    AxumPath(weapon_id): AxumPath<String>,
+) -> Response {
+    match server
+        .weapon_registry
+        .read_weapon_model_file(&weapon_id)
+        .await
+    {
+        Ok(Some(WeaponModelFileResponse::Redirect { url })) => {
+            Redirect::temporary(&url).into_response()
+        }
+        Ok(Some(WeaponModelFileResponse::Bytes(object))) => storage_object_response(object),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND"),
+        Err(error) => {
+            tracing::warn!(?error, %weapon_id, "failed to read weapon model file");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "WEAPON_FILE_READ_FAILED")
+        }
+    }
+}
+
 async fn load_session_user(
     server: &VoxelServer,
     headers: &HeaderMap,
@@ -3100,10 +3909,12 @@ impl Clone for VoxelServer {
             config: self.config.clone(),
             account_service: self.account_service.clone(),
             pet_registry: self.pet_registry.clone(),
+            weapon_registry: self.weapon_registry.clone(),
             websocket_sessions: self.websocket_sessions.clone(),
             chunk_streaming: self.chunk_streaming.clone(),
             player_service: self.player_service.clone(),
             wild_pet_service: self.wild_pet_service.clone(),
+            wild_weapon_service: self.wild_weapon_service.clone(),
             world_service: self.world_service.clone(),
             static_root: self.static_root.clone(),
         }
@@ -3130,6 +3941,17 @@ fn wild_pet_within_capture_distance(player_position: [f32; 3], pet_position: [f3
     let dz = pet_position[2] - player_position[2];
     let distance_squared = dx * dx + dy * dy + dz * dz;
     distance_squared <= WILD_PET_CAPTURE_DISTANCE * WILD_PET_CAPTURE_DISTANCE
+}
+
+fn wild_weapon_within_pickup_distance(
+    player_position: [f32; 3],
+    weapon_position: [f32; 3],
+) -> bool {
+    let dx = weapon_position[0] - player_position[0];
+    let dy = weapon_position[1] + 0.4 - player_position[1];
+    let dz = weapon_position[2] - player_position[2];
+    let distance_squared = dx * dx + dy * dy + dz * dz;
+    distance_squared <= WILD_WEAPON_PICKUP_DISTANCE * WILD_WEAPON_PICKUP_DISTANCE
 }
 
 fn viewers_for_pet<'a>(players: &'a [Player], chunk: ChunkPos) -> Vec<&'a Player> {
@@ -3183,6 +4005,49 @@ fn reconcile_pet_visibility(
         dispatches.push(WildPetDispatch::Snapshot {
             player_ids: snapshot_targets,
             snapshot: pet.snapshot(),
+        });
+    }
+
+    dispatches
+}
+
+fn reconcile_weapon_visibility(
+    weapon: &mut WildWeapon,
+    players: &[Player],
+    broadcast_snapshot: bool,
+) -> Vec<WildWeaponDispatch> {
+    let current_viewers = viewers_for_pet(players, weapon.chunk())
+        .into_iter()
+        .map(|player| player.id)
+        .collect::<HashSet<_>>();
+    let removed_viewers = weapon
+        .visible_viewers
+        .difference(&current_viewers)
+        .copied()
+        .collect::<Vec<_>>();
+    let added_viewers = current_viewers
+        .difference(&weapon.visible_viewers)
+        .copied()
+        .collect::<Vec<_>>();
+    weapon.visible_viewers = current_viewers.clone();
+
+    let mut dispatches = Vec::new();
+    if !removed_viewers.is_empty() {
+        dispatches.push(WildWeaponDispatch::Unload {
+            player_ids: removed_viewers,
+            weapon_ids: vec![weapon.id],
+        });
+    }
+
+    let snapshot_targets = if broadcast_snapshot {
+        current_viewers.into_iter().collect::<Vec<_>>()
+    } else {
+        added_viewers
+    };
+    if !snapshot_targets.is_empty() {
+        dispatches.push(WildWeaponDispatch::Snapshot {
+            player_ids: snapshot_targets,
+            snapshot: weapon.snapshot(),
         });
     }
 
@@ -3373,6 +4238,7 @@ mod tests {
                 "guest".to_string(),
                 None,
                 None,
+                None,
                 WorldPos { x: 0, y: 72, z: 0 },
                 None,
                 None,
@@ -3388,6 +4254,7 @@ mod tests {
                         id: format!("pet-{index}"),
                         display_name: format!("Pet {index}"),
                         model_url: None,
+                        equipped_weapon: None,
                     },
                 )
                 .await
@@ -3414,6 +4281,7 @@ mod tests {
                 "guest".to_string(),
                 None,
                 None,
+                None,
                 WorldPos { x: 0, y: 72, z: 0 },
                 None,
                 None,
@@ -3428,18 +4296,21 @@ mod tests {
                     id: "pet-a".to_string(),
                     display_name: "Pet A".to_string(),
                     model_url: None,
+                    equipped_weapon: None,
                 },
             )
             .await
             .expect("first guest capture");
 
         let result = player_service
-            .update_guest_pet_party(player.id, &["missing".to_string()])
+            .update_guest_pet_party(player.id, &["missing".to_string()], &[])
             .await;
 
         assert!(matches!(
             result,
-            Some(GuestPetPartyUpdateOutcome::InvalidSelection)
+            Some(GuestPetPartyUpdateOutcome::InvalidSelection(
+                PetPartySelectionError::UnknownPet
+            ))
         ));
     }
 
@@ -3449,6 +4320,7 @@ mod tests {
         let player = player_service
             .login(
                 "guest".to_string(),
+                None,
                 None,
                 None,
                 WorldPos { x: 0, y: 72, z: 0 },
@@ -3469,6 +4341,7 @@ mod tests {
                         id: pet_id,
                         display_name: format!("Pet {index}"),
                         model_url: None,
+                        equipped_weapon: None,
                     },
                 )
                 .await
@@ -3476,7 +4349,7 @@ mod tests {
         }
 
         let result = player_service
-            .update_guest_pet_party(player.id, &pet_ids)
+            .update_guest_pet_party(player.id, &pet_ids, &[])
             .await;
 
         assert!(matches!(
@@ -3491,6 +4364,7 @@ mod tests {
         let player = player_service
             .login(
                 "guest".to_string(),
+                None,
                 None,
                 None,
                 WorldPos { x: 0, y: 72, z: 0 },
@@ -3508,6 +4382,7 @@ mod tests {
                         id: pet_id.to_string(),
                         display_name: pet_id.to_string(),
                         model_url: None,
+                        equipped_weapon: None,
                     },
                 )
                 .await
@@ -3522,6 +4397,7 @@ mod tests {
                     "pet-b".to_string(),
                     "pet-a".to_string(),
                 ],
+                &[],
             )
             .await;
 
@@ -3539,6 +4415,213 @@ mod tests {
         assert!(active_ids.contains("pet-a"));
         assert!(active_ids.contains("pet-b"));
         assert!(!active_ids.contains("pet-c"));
+    }
+
+    #[tokio::test]
+    async fn guest_pet_party_update_assigns_unique_weapons_to_active_pets() {
+        let player_service = PlayerService::new();
+        let player = player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                None,
+                WorldPos { x: 0, y: 72, z: 0 },
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        for pet_id in ["pet-a", "pet-b"] {
+            player_service
+                .capture_guest_pet(
+                    player.id,
+                    PetIdentity {
+                        id: pet_id.to_string(),
+                        display_name: pet_id.to_string(),
+                        model_url: None,
+                        equipped_weapon: None,
+                    },
+                )
+                .await
+                .expect("guest capture");
+        }
+        for (id, kind) in [("weapon-a", "sword"), ("weapon-b", "laser")] {
+            player_service
+                .collect_guest_weapon(
+                    player.id,
+                    WeaponIdentity {
+                        id: id.to_string(),
+                        kind: kind.to_string(),
+                        display_name: id.to_string(),
+                        model_url: None,
+                    },
+                )
+                .await
+                .expect("guest weapon collection");
+        }
+
+        let result = player_service
+            .update_guest_pet_party(
+                player.id,
+                &["pet-a".to_string(), "pet-b".to_string()],
+                &[
+                    PetWeaponAssignment {
+                        pet_id: "pet-a".to_string(),
+                        weapon_id: Some("weapon-a".to_string()),
+                    },
+                    PetWeaponAssignment {
+                        pet_id: "pet-b".to_string(),
+                        weapon_id: Some("weapon-b".to_string()),
+                    },
+                ],
+            )
+            .await;
+
+        let Some(GuestPetPartyUpdateOutcome::Updated(player)) = result else {
+            panic!("expected updated guest pet party with weapons");
+        };
+        assert_eq!(
+            player
+                .captured_pets
+                .iter()
+                .find(|pet| pet.id == "pet-a")
+                .and_then(|pet| pet.equipped_weapon_id.as_deref()),
+            Some("weapon-a")
+        );
+        assert_eq!(
+            player
+                .active_pet_models
+                .iter()
+                .find(|pet| pet.id == "pet-a")
+                .and_then(|pet| pet.equipped_weapon.as_ref())
+                .map(|weapon| weapon.id.as_str()),
+            Some("weapon-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn guest_weapon_collection_dedupes_and_keeps_newest_first() {
+        let player_service = PlayerService::new();
+        let player = player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                None,
+                WorldPos { x: 0, y: 72, z: 0 },
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        for (id, kind, name) in [
+            ("weapon-a", "sword", "Iron Sword"),
+            ("weapon-b", "laser", "Nova Laser"),
+            ("weapon-a", "sword", "Iron Sword"),
+        ] {
+            player_service
+                .collect_guest_weapon(
+                    player.id,
+                    WeaponIdentity {
+                        id: id.to_string(),
+                        kind: kind.to_string(),
+                        display_name: name.to_string(),
+                        model_url: None,
+                    },
+                )
+                .await
+                .expect("guest weapon collection updates player");
+        }
+
+        let updated_player = player_service
+            .player(player.id)
+            .await
+            .expect("guest player remains logged in");
+        let collected_ids = updated_player
+            .collected_weapons
+            .iter()
+            .map(|weapon| weapon.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(collected_ids, vec!["weapon-a", "weapon-b"]);
+    }
+
+    #[tokio::test]
+    async fn wild_weapon_pickup_rejects_out_of_range_requests() {
+        let service = WildWeaponService::new();
+        {
+            let mut weapons = service.weapons.lock().await;
+            weapons.insert(
+                7,
+                WildWeapon {
+                    id: 7,
+                    weapon_identity: WeaponIdentity {
+                        id: "weapon-uuid-7".to_string(),
+                        kind: "gun".to_string(),
+                        display_name: "Scatter Gun".to_string(),
+                        model_url: None,
+                    },
+                    tick: 0,
+                    position: [18.0, 72.0, 18.0],
+                    collected: false,
+                    visible_viewers: HashSet::from([11]),
+                },
+            );
+        }
+
+        let result = service.pickup_weapon(11, 7, [0.5, 72.0, 0.5]).await;
+        assert!(matches!(result, WildWeaponPickupResult::OutOfRange));
+
+        let weapons = service.weapons.lock().await;
+        assert_eq!(weapons.get(&7).map(|weapon| weapon.collected), Some(false));
+    }
+
+    #[tokio::test]
+    async fn wild_weapon_pickup_is_first_claim_wins() {
+        let service = WildWeaponService::new();
+        {
+            let mut weapons = service.weapons.lock().await;
+            weapons.insert(
+                9,
+                WildWeapon {
+                    id: 9,
+                    weapon_identity: WeaponIdentity {
+                        id: "weapon-uuid-9".to_string(),
+                        kind: "flamethrower".to_string(),
+                        display_name: "Ash Jet".to_string(),
+                        model_url: Some("https://example.com/ash-jet.glb".to_string()),
+                    },
+                    tick: 3,
+                    position: [1.5, 72.0, 1.5],
+                    collected: false,
+                    visible_viewers: HashSet::from([21, 22]),
+                },
+            );
+        }
+
+        let first_pickup = service.pickup_weapon(21, 9, [1.5, 72.0, 1.5]).await;
+        match first_pickup {
+            WildWeaponPickupResult::Collected {
+                mut viewer_ids,
+                collected_weapon_id,
+                weapon_identity,
+            } => {
+                viewer_ids.sort_unstable();
+                assert_eq!(viewer_ids, vec![21, 22]);
+                assert_eq!(collected_weapon_id, 9);
+                assert_eq!(weapon_identity.id, "weapon-uuid-9");
+            }
+            _ => panic!("expected first pickup to collect weapon"),
+        }
+
+        let second_pickup = service.pickup_weapon(22, 9, [1.5, 72.0, 1.5]).await;
+        assert!(matches!(
+            second_pickup,
+            WildWeaponPickupResult::AlreadyTaken
+        ));
     }
 
     #[test]

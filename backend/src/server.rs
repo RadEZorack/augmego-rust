@@ -1000,9 +1000,9 @@ impl WildPetService {
             .zip(player.active_pet_models.iter())
             .enumerate()
         {
-            if pet_identity.equipped_weapon.is_none() {
+            let Some(weapon_identity) = pet_identity.equipped_weapon.as_ref() else {
                 continue;
-            }
+            };
 
             let cooldown_key = (player.id, pet_identity.id.clone());
             let next_ready_at_ms = self
@@ -1085,6 +1085,7 @@ impl WildPetService {
                     shot: PetWeaponShot {
                         tick,
                         shooter_player_id: player.id,
+                        weapon_kind: weapon_identity.kind.clone(),
                         origin,
                         target,
                     },

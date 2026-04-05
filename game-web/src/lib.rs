@@ -145,9 +145,18 @@ const WORLD_WEAPON_PICKUP_TARGET_DISTANCE: f32 = 7.5;
 const WORLD_WEAPON_PICKUP_BOX_RADIUS: f32 = 0.75;
 const WORLD_WEAPON_PICKUP_BOX_HEIGHT: f32 = 0.95;
 const WORLD_WEAPON_PICKUP_BOX_FOOT_PADDING: f32 = 0.18;
-const PET_WEAPON_SHOT_LIFETIME: Duration = Duration::from_millis(150);
+const PET_WEAPON_LASER_LIFETIME: Duration = Duration::from_millis(150);
+const PET_WEAPON_GUN_LIFETIME: Duration = Duration::from_millis(220);
+const PET_WEAPON_FLAME_LIFETIME: Duration = Duration::from_millis(260);
+const PET_WEAPON_SWORD_LIFETIME: Duration = Duration::from_millis(520);
 const PET_WEAPON_SHOT_HALF_WIDTH: f32 = 0.03;
 const PET_WEAPON_SHOT_HALF_DEPTH: f32 = 0.02;
+const PET_WEAPON_GUN_PROJECTILE_HALF_EXTENT: f32 = 0.055;
+const PET_WEAPON_GUN_TRAIL_HALF_LENGTH: f32 = 0.18;
+const PET_WEAPON_FLAME_BURST_RANGE: f32 = 1.85;
+const PET_WEAPON_SWORD_HALF_LENGTH: f32 = 0.34;
+const PET_WEAPON_SWORD_HALF_WIDTH: f32 = 0.06;
+const PET_WEAPON_SWORD_HALF_DEPTH: f32 = 0.018;
 const PET_SLOT_OFFSETS: [(f32, f32); PET_FOLLOWER_COUNT] = [
     (-1.0, 3.3),
     (1.0, 3.3),
@@ -2638,12 +2647,15 @@ impl WebApp {
 
     fn apply_pet_weapon_shot(&mut self, shot: PetWeaponShot) {
         let now = Instant::now();
+        let kind = PetWeaponEffectKind::from_weapon_kind(&shot.weapon_kind);
         self.pet_weapon_shots
             .retain(|active_shot| active_shot.expires_at > now);
         self.pet_weapon_shots.push(PetWeaponShotClientState {
+            kind,
             origin: Vec3::from_array(shot.origin),
             target: Vec3::from_array(shot.target),
-            expires_at: now + PET_WEAPON_SHOT_LIFETIME,
+            started_at: now,
+            expires_at: now + kind.lifetime(),
         });
     }
 
@@ -3577,13 +3589,36 @@ impl WebApp {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         for shot in &self.pet_weapon_shots {
-            add_pet_weapon_tracer(
-                &mut vertices,
-                &mut indices,
-                shot.origin,
-                shot.target,
-                [1.0, 0.82, 0.32],
-            );
+            let progress = normalized_lifetime_progress(shot.started_at, shot.expires_at, now);
+            match shot.kind {
+                PetWeaponEffectKind::Laser => add_pet_weapon_laser(
+                    &mut vertices,
+                    &mut indices,
+                    shot.origin,
+                    shot.target,
+                ),
+                PetWeaponEffectKind::Gun => add_pet_weapon_projectile(
+                    &mut vertices,
+                    &mut indices,
+                    shot.origin,
+                    shot.target,
+                    progress,
+                ),
+                PetWeaponEffectKind::Flamethrower => add_pet_weapon_flame_burst(
+                    &mut vertices,
+                    &mut indices,
+                    shot.origin,
+                    shot.target,
+                    progress,
+                ),
+                PetWeaponEffectKind::Sword => add_pet_weapon_sword_throw(
+                    &mut vertices,
+                    &mut indices,
+                    shot.origin,
+                    shot.target,
+                    progress,
+                ),
+            }
         }
 
         (!vertices.is_empty()).then(|| renderer.create_mesh(&vertices, &indices))
@@ -5427,9 +5462,39 @@ impl WorldWeaponClientState {
 
 #[derive(Clone)]
 struct PetWeaponShotClientState {
+    kind: PetWeaponEffectKind,
     origin: Vec3,
     target: Vec3,
+    started_at: Instant,
     expires_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+enum PetWeaponEffectKind {
+    Laser,
+    Gun,
+    Flamethrower,
+    Sword,
+}
+
+impl PetWeaponEffectKind {
+    fn from_weapon_kind(kind: &str) -> Self {
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "gun" => Self::Gun,
+            "flamethrower" => Self::Flamethrower,
+            "sword" => Self::Sword,
+            _ => Self::Laser,
+        }
+    }
+
+    fn lifetime(self) -> Duration {
+        match self {
+            Self::Laser => PET_WEAPON_LASER_LIFETIME,
+            Self::Gun => PET_WEAPON_GUN_LIFETIME,
+            Self::Flamethrower => PET_WEAPON_FLAME_LIFETIME,
+            Self::Sword => PET_WEAPON_SWORD_LIFETIME,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -8701,12 +8766,32 @@ fn add_box_oriented(
     );
 }
 
-fn add_pet_weapon_tracer(
+fn normalized_lifetime_progress(started_at: Instant, expires_at: Instant, now: Instant) -> f32 {
+    let total = expires_at
+        .saturating_duration_since(started_at)
+        .as_secs_f32()
+        .max(0.001);
+    let elapsed = now.saturating_duration_since(started_at).as_secs_f32();
+    (elapsed / total).clamp(0.0, 1.0)
+}
+
+fn forward_basis(forward: Vec3) -> Option<(Vec3, Vec3)> {
+    let reference_up = if forward.dot(Vec3::Y).abs() > 0.95 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let axis_x = forward.cross(reference_up).normalize_or_zero();
+    let axis_y = axis_x.cross(forward).normalize_or_zero();
+    (axis_x.length_squared() > f32::EPSILON && axis_y.length_squared() > f32::EPSILON)
+        .then_some((axis_x, axis_y))
+}
+
+fn add_pet_weapon_laser(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
     origin: Vec3,
     target: Vec3,
-    color: [f32; 3],
 ) {
     let delta = target - origin;
     let length = delta.length();
@@ -8715,25 +8800,159 @@ fn add_pet_weapon_tracer(
     }
 
     let forward = delta / length;
-    let reference_up = if forward.dot(Vec3::Y).abs() > 0.95 {
-        Vec3::X
-    } else {
-        Vec3::Y
-    };
-    let axis_x = forward.cross(reference_up).normalize_or_zero() * PET_WEAPON_SHOT_HALF_WIDTH;
-    let axis_y = axis_x.cross(forward).normalize_or_zero() * PET_WEAPON_SHOT_HALF_DEPTH;
-    if axis_x.length_squared() <= f32::EPSILON || axis_y.length_squared() <= f32::EPSILON {
+    let Some((axis_x, axis_y)) = forward_basis(forward) else {
         return;
-    }
+    };
 
     add_box_oriented(
         vertices,
         indices,
         (origin + target) * 0.5,
-        axis_x,
-        axis_y,
+        axis_x * PET_WEAPON_SHOT_HALF_WIDTH,
+        axis_y * PET_WEAPON_SHOT_HALF_DEPTH,
         forward * (length * 0.5),
-        color,
+        [1.0, 0.82, 0.32],
+        (3, 1),
+    );
+}
+
+fn add_pet_weapon_projectile(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    origin: Vec3,
+    target: Vec3,
+    progress: f32,
+) {
+    let delta = target - origin;
+    let length = delta.length();
+    if length <= f32::EPSILON {
+        return;
+    }
+    let forward = delta / length;
+    let Some((axis_x, axis_y)) = forward_basis(forward) else {
+        return;
+    };
+
+    let projectile_center = origin + delta * progress;
+    add_box_oriented(
+        vertices,
+        indices,
+        projectile_center,
+        axis_x * PET_WEAPON_GUN_PROJECTILE_HALF_EXTENT,
+        axis_y * PET_WEAPON_GUN_PROJECTILE_HALF_EXTENT,
+        forward * PET_WEAPON_GUN_PROJECTILE_HALF_EXTENT,
+        [1.0, 0.92, 0.52],
+        (3, 1),
+    );
+
+    let trail_length = PET_WEAPON_GUN_TRAIL_HALF_LENGTH * (1.0 - progress * 0.35);
+    add_box_oriented(
+        vertices,
+        indices,
+        projectile_center - forward * trail_length * 0.65,
+        axis_x * (PET_WEAPON_GUN_PROJECTILE_HALF_EXTENT * 0.38),
+        axis_y * (PET_WEAPON_GUN_PROJECTILE_HALF_EXTENT * 0.38),
+        forward * trail_length,
+        [1.0, 0.72, 0.24],
+        (3, 1),
+    );
+}
+
+fn add_pet_weapon_flame_burst(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    origin: Vec3,
+    target: Vec3,
+    progress: f32,
+) {
+    let delta = target - origin;
+    let length = delta.length();
+    if length <= f32::EPSILON {
+        return;
+    }
+    let forward = delta / length;
+    let Some((axis_x, axis_y)) = forward_basis(forward) else {
+        return;
+    };
+
+    let flame_distance = PET_WEAPON_FLAME_BURST_RANGE.min(length * 0.45).max(0.8);
+    let center = origin + forward * flame_distance * (0.35 + progress * 0.35);
+    let stretch = 0.28 + progress * 0.4;
+    add_box_oriented(
+        vertices,
+        indices,
+        center,
+        axis_x * (0.16 + progress * 0.08),
+        axis_y * (0.12 + progress * 0.07),
+        forward * stretch,
+        [1.0, 0.58, 0.14],
+        (3, 1),
+    );
+    add_box_oriented(
+        vertices,
+        indices,
+        center + axis_x * 0.18 + axis_y * 0.05,
+        axis_x * 0.11,
+        axis_y * 0.08,
+        forward * (stretch * 0.62),
+        [1.0, 0.84, 0.34],
+        (3, 1),
+    );
+    add_box_oriented(
+        vertices,
+        indices,
+        center - axis_x * 0.15 - axis_y * 0.03,
+        axis_x * 0.1,
+        axis_y * 0.07,
+        forward * (stretch * 0.54),
+        [0.96, 0.34, 0.08],
+        (3, 1),
+    );
+}
+
+fn add_pet_weapon_sword_throw(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    origin: Vec3,
+    target: Vec3,
+    progress: f32,
+) {
+    let delta = target - origin;
+    let length = delta.length();
+    if length <= f32::EPSILON {
+        return;
+    }
+    let forward = delta / length;
+    let Some((axis_x, axis_y)) = forward_basis(forward) else {
+        return;
+    };
+
+    let out_and_back = if progress <= 0.5 {
+        progress * 2.0
+    } else {
+        (1.0 - progress) * 2.0
+    };
+    let center = origin
+        + delta * out_and_back
+        + axis_y * ((1.0 - (out_and_back * 2.0 - 1.0).abs()) * 0.42);
+    add_box_oriented(
+        vertices,
+        indices,
+        center,
+        axis_x * PET_WEAPON_SWORD_HALF_WIDTH,
+        axis_y * PET_WEAPON_SWORD_HALF_DEPTH,
+        forward * PET_WEAPON_SWORD_HALF_LENGTH,
+        [0.86, 0.88, 0.96],
+        (3, 1),
+    );
+    add_box_oriented(
+        vertices,
+        indices,
+        center - forward * (PET_WEAPON_SWORD_HALF_LENGTH + 0.08),
+        axis_x * 0.03,
+        axis_y * 0.03,
+        forward * 0.09,
+        [0.58, 0.42, 0.16],
         (3, 1),
     );
 }

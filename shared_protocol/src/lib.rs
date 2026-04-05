@@ -3,7 +3,7 @@ use shared_math::{ChunkPos, WorldPos};
 use shared_world::{BlockId, ChunkData, ChunkDelta};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -163,6 +163,7 @@ pub struct WorldWeaponSnapshot {
 pub struct PetWeaponShot {
     pub tick: u64,
     pub shooter_player_id: u64,
+    pub weapon_kind: String,
     pub origin: [f32; 3],
     pub target: [f32; 3],
 }
@@ -468,6 +469,7 @@ mod tests {
         let response = ServerMessage::PetWeaponShot(PetWeaponShot {
             tick: 99,
             shooter_player_id: 7,
+            weapon_kind: "laser".to_string(),
             origin: [1.0, 2.0, 3.0],
             target: [4.0, 5.0, 6.0],
         });
@@ -477,6 +479,7 @@ mod tests {
             ServerMessage::PetWeaponShot(shot) => {
                 assert_eq!(shot.tick, 99);
                 assert_eq!(shot.shooter_player_id, 7);
+                assert_eq!(shot.weapon_kind, "laser");
                 assert_eq!(shot.origin, [1.0, 2.0, 3.0]);
                 assert_eq!(shot.target, [4.0, 5.0, 6.0]);
             }

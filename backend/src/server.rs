@@ -4043,7 +4043,7 @@ async fn landing_scene(State(server): State<VoxelServer>) -> Response {
     let generated_at_ms = unix_timestamp_ms();
     let pets = match server
         .pet_registry
-        .sample_ready_pets(LANDING_SCENE_SAMPLE_LIMIT)
+        .sample_landing_pets(LANDING_SCENE_SAMPLE_LIMIT)
         .await
     {
         Ok(pets) => pets,
@@ -4057,7 +4057,7 @@ async fn landing_scene(State(server): State<VoxelServer>) -> Response {
     };
     let weapons = match server
         .weapon_registry
-        .sample_ready_weapons(LANDING_SCENE_SAMPLE_LIMIT)
+        .sample_landing_weapons(LANDING_SCENE_SAMPLE_LIMIT)
         .await
     {
         Ok(weapons) => weapons,
@@ -5745,6 +5745,56 @@ mod tests {
                     .iter()
                     .any(|weapon| weapon.id == pairing.weapon_id)
         }));
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
+    }
+
+    #[tokio::test]
+    async fn landing_scene_endpoint_falls_back_when_ready_pool_is_depleted() {
+        let (server, pool, base_database_url, schema_name) = landing_test_server().await;
+        let mut pet_ids = Vec::new();
+        for index in 0..3 {
+            let pet_id = Uuid::new_v4();
+            insert_landing_pet(&pool, pet_id, &format!("Fallback Pet {index}")).await;
+            pet_ids.push(pet_id);
+        }
+        let mut weapon_ids = Vec::new();
+        for (index, kind) in ["laser", "gun", "sword"].into_iter().enumerate() {
+            let weapon_id = Uuid::new_v4();
+            insert_landing_weapon(&pool, weapon_id, kind, &format!("Fallback Weapon {index}"))
+                .await;
+            weapon_ids.push(weapon_id);
+        }
+
+        for pet_id in &pet_ids {
+            sqlx::query("UPDATE pets SET status = 'SPAWNED' WHERE id = $1")
+                .bind(pet_id)
+                .execute(&pool)
+                .await
+                .expect("deplete ready pet pool");
+        }
+        for weapon_id in &weapon_ids {
+            sqlx::query("UPDATE weapons SET status = 'COLLECTED' WHERE id = $1")
+                .bind(weapon_id)
+                .execute(&pool)
+                .await
+                .expect("deplete ready weapon pool");
+        }
+
+        let response = landing_scene(State(server)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read landing scene body");
+        let payload: LandingSceneResponse =
+            serde_json::from_slice(&bytes).expect("decode landing scene payload");
+
+        assert_eq!(payload.pets.len(), 3);
+        assert_eq!(payload.weapons.len(), 3);
+        assert_eq!(payload.pairings.len(), 3);
 
         db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
             .await

@@ -475,6 +475,42 @@ impl PetRegistryClient {
             .collect()
     }
 
+    pub async fn sample_landing_pets(&self, limit: i64) -> Result<Vec<PetIdentity>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query(
+            "SELECT id, display_name, model_url, model_storage_key
+             FROM pets
+             WHERE model_storage_key IS NOT NULL
+               AND status IN ('READY', 'SPAWNED', 'CAPTURED')
+             ORDER BY
+                 CASE status
+                     WHEN 'READY' THEN 0
+                     WHEN 'SPAWNED' THEN 1
+                     WHEN 'CAPTURED' THEN 2
+                     ELSE 3
+                 END,
+                 RANDOM()
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("sample modeled pets for landing preview")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let pet_id: Uuid = row.try_get("id")?;
+                let display_name: String = row.try_get("display_name")?;
+                let model_url: Option<String> = row.try_get("model_url")?;
+                let model_storage_key: Option<String> = row.try_get("model_storage_key")?;
+                Ok(self.map_pet_identity(pet_id, display_name, model_url, model_storage_key))
+            })
+            .collect()
+    }
+
     pub async fn load_user_pet_collection(&self, user_id: &str) -> Result<PlayerPetCollection> {
         let user_id = parse_uuid(user_id, "user id")?;
         let rows = sqlx::query(
@@ -2505,6 +2541,131 @@ mod tests {
 
         assert_eq!(ready_status, "READY");
         assert_eq!(spawned_status, "SPAWNED");
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
+    }
+
+    #[tokio::test]
+    async fn sample_landing_pets_prefers_ready_and_falls_back_without_mutating_status() {
+        let config = ServerConfig::default();
+        let base_database_url = config.database_url.clone();
+        let (pool, schema_name) = db::connect_isolated_test_pool(&base_database_url)
+            .await
+            .expect("create isolated schema");
+        let storage_root =
+            std::env::temp_dir().join(format!("augmego-pet-landing-sample-{schema_name}"));
+        let storage = StorageService::new(StorageConfig {
+            provider: StorageProvider::Local,
+            root: storage_root,
+            namespace: "test-assets".to_string(),
+            spaces_bucket: String::new(),
+            spaces_endpoint: String::new(),
+            spaces_custom_domain: String::new(),
+            spaces_access_key_id: String::new(),
+            spaces_secret_access_key: String::new(),
+            spaces_region: String::new(),
+        })
+        .await
+        .expect("create storage service");
+        let client = PetRegistryClient::new(
+            pool.clone(),
+            storage,
+            PetRegistryConfig {
+                auth_secret: "test-secret".to_string(),
+                generated_pet_cache_control: config.generated_pet_cache_control.clone(),
+                generated_pet_texture_max_dimension: config.generated_pet_texture_max_dimension,
+                generated_pet_texture_jpeg_quality: config.generated_pet_texture_jpeg_quality,
+                meshy_api_base_url: config.meshy_api_base_url.clone(),
+                meshy_api_key: config.meshy_api_key.clone(),
+                meshy_text_to_3d_model: config.meshy_text_to_3d_model.clone(),
+                meshy_text_to_3d_model_type: config.meshy_text_to_3d_model_type.clone(),
+                meshy_text_to_3d_enable_refine: config.meshy_text_to_3d_enable_refine,
+                meshy_text_to_3d_refine_model: config.meshy_text_to_3d_refine_model.clone(),
+                meshy_text_to_3d_enable_pbr: config.meshy_text_to_3d_enable_pbr,
+                meshy_text_to_3d_topology: config.meshy_text_to_3d_topology.clone(),
+                meshy_text_to_3d_target_polycount: config.meshy_text_to_3d_target_polycount,
+                pet_pool_target: config.pet_pool_target,
+                pet_generation_max_in_flight: config.pet_generation_max_in_flight,
+                pet_generation_worker_interval: config.pet_generation_worker_interval,
+                pet_generation_poll_interval: config.pet_generation_poll_interval,
+                pet_generation_max_attempts: config.pet_generation_max_attempts,
+            },
+        );
+
+        let ready_pet_id = Uuid::new_v4();
+        let spawned_pet_id = Uuid::new_v4();
+        let captured_pet_id = Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO pets (id, display_name, base_prompt, effective_prompt, variation_key, status, model_storage_key)
+             VALUES ($1, $2, 'base', 'effective', $3, 'READY', $4)",
+        )
+        .bind(ready_pet_id)
+        .bind("Ready Landing Pet")
+        .bind(format!("variation-{ready_pet_id}"))
+        .bind(format!("pets/{ready_pet_id}.glb"))
+        .execute(&pool)
+        .await
+        .expect("insert ready pet");
+        sqlx::query(
+            "INSERT INTO pets (id, display_name, base_prompt, effective_prompt, variation_key, status, model_storage_key)
+             VALUES ($1, $2, 'base', 'effective', $3, 'SPAWNED', $4)",
+        )
+        .bind(spawned_pet_id)
+        .bind("Spawned Landing Pet")
+        .bind(format!("variation-{spawned_pet_id}"))
+        .bind(format!("pets/{spawned_pet_id}.glb"))
+        .execute(&pool)
+        .await
+        .expect("insert spawned pet");
+        sqlx::query(
+            "INSERT INTO pets (id, display_name, base_prompt, effective_prompt, variation_key, status, model_storage_key)
+             VALUES ($1, $2, 'base', 'effective', $3, 'CAPTURED', $4)",
+        )
+        .bind(captured_pet_id)
+        .bind("Captured Landing Pet")
+        .bind(format!("variation-{captured_pet_id}"))
+        .bind(format!("pets/{captured_pet_id}.glb"))
+        .execute(&pool)
+        .await
+        .expect("insert captured pet");
+
+        let sampled = client
+            .sample_landing_pets(6)
+            .await
+            .expect("sample landing pets");
+
+        assert_eq!(sampled.len(), 3);
+        assert_eq!(sampled[0].id, ready_pet_id.to_string());
+        let sampled_ids = sampled
+            .iter()
+            .map(|pet| pet.id.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            sampled_ids,
+            HashSet::from([
+                ready_pet_id.to_string(),
+                spawned_pet_id.to_string(),
+                captured_pet_id.to_string(),
+            ])
+        );
+
+        for (pet_id, expected_status) in [
+            (ready_pet_id, "READY"),
+            (spawned_pet_id, "SPAWNED"),
+            (captured_pet_id, "CAPTURED"),
+        ] {
+            let actual_status: String = sqlx::query("SELECT status FROM pets WHERE id = $1")
+                .bind(pet_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load landing pet status")
+                .try_get("status")
+                .expect("status column");
+            assert_eq!(actual_status, expected_status);
+        }
 
         db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
             .await

@@ -2,18 +2,18 @@ use crate::pet_registry::{
     downscale_glb_embedded_images, maybe_gzip_bytes, parse_uuid, should_retry_with_meshy_6,
 };
 use crate::storage::{StorageObject, StorageService};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use shared_protocol::{CollectedWeapon, WeaponIdentity};
-use sqlx::{postgres::PgRow, PgPool, Row};
+use sqlx::{PgPool, Row, postgres::PgRow};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 use tokio::time::interval;
@@ -391,6 +391,41 @@ impl WeaponRegistryClient {
             model_url,
             model_storage_key,
         )))
+    }
+
+    pub async fn sample_ready_weapons(&self, limit: i64) -> Result<Vec<WeaponIdentity>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query(
+            "SELECT id, kind, display_name, model_url, model_storage_key
+             FROM weapons
+             WHERE status = 'READY' AND model_storage_key IS NOT NULL
+             ORDER BY RANDOM()
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("sample ready weapons for landing preview")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let weapon_id: Uuid = row.try_get("id")?;
+                let kind: String = row.try_get("kind")?;
+                let display_name: String = row.try_get("display_name")?;
+                let model_url: Option<String> = row.try_get("model_url")?;
+                let model_storage_key: Option<String> = row.try_get("model_storage_key")?;
+                Ok(self.map_weapon_identity(
+                    weapon_id,
+                    kind,
+                    display_name,
+                    model_url,
+                    model_storage_key,
+                ))
+            })
+            .collect()
     }
 
     pub async fn load_user_weapon_collection(
@@ -1410,6 +1445,9 @@ fn extract_meshy_glb_url(task: &MeshyTextTo3dTaskResponse) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db;
+    use crate::server::ServerConfig;
+    use crate::storage::{StorageConfig, StorageProvider};
 
     #[test]
     fn round_robin_kind_sequence_stays_balanced() {
@@ -1448,5 +1486,123 @@ mod tests {
         let second = build_weapon_variation(WEAPON_KINDS[2], 7007);
         assert_ne!(first.variation_key, second.variation_key);
         assert_ne!(first.effective_prompt, second.effective_prompt);
+    }
+
+    #[tokio::test]
+    async fn sample_ready_weapons_returns_ready_modeled_rows_without_mutating_status() {
+        let config = ServerConfig::default();
+        let base_database_url = config.database_url.clone();
+        let (pool, schema_name) = db::connect_isolated_test_pool(&base_database_url)
+            .await
+            .expect("create isolated schema");
+        let storage_root =
+            std::env::temp_dir().join(format!("augmego-weapon-sample-{schema_name}"));
+        let storage = StorageService::new(StorageConfig {
+            provider: StorageProvider::Local,
+            root: storage_root,
+            namespace: "test-assets".to_string(),
+            spaces_bucket: String::new(),
+            spaces_endpoint: String::new(),
+            spaces_custom_domain: String::new(),
+            spaces_access_key_id: String::new(),
+            spaces_secret_access_key: String::new(),
+            spaces_region: String::new(),
+        })
+        .await
+        .expect("create storage service");
+        let client = WeaponRegistryClient::new(
+            pool.clone(),
+            storage,
+            WeaponRegistryConfig {
+                generated_cache_control: config.generated_pet_cache_control.clone(),
+                generated_texture_max_dimension: config.generated_pet_texture_max_dimension,
+                generated_texture_jpeg_quality: config.generated_pet_texture_jpeg_quality,
+                meshy_api_base_url: config.meshy_api_base_url.clone(),
+                meshy_api_key: config.meshy_api_key.clone(),
+                meshy_text_to_3d_model: config.meshy_text_to_3d_model.clone(),
+                meshy_text_to_3d_model_type: config.meshy_text_to_3d_model_type.clone(),
+                meshy_text_to_3d_enable_refine: config.meshy_text_to_3d_enable_refine,
+                meshy_text_to_3d_refine_model: config.meshy_text_to_3d_refine_model.clone(),
+                meshy_text_to_3d_enable_pbr: config.meshy_text_to_3d_enable_pbr,
+                meshy_text_to_3d_topology: config.meshy_text_to_3d_topology.clone(),
+                meshy_text_to_3d_target_polycount: config.meshy_text_to_3d_target_polycount,
+                weapon_pool_target: config.weapon_pool_target,
+                weapon_generation_max_in_flight: config.weapon_generation_max_in_flight,
+                weapon_generation_worker_interval: config.pet_generation_worker_interval,
+                weapon_generation_poll_interval: config.pet_generation_poll_interval,
+                weapon_generation_max_attempts: config.pet_generation_max_attempts,
+            },
+        );
+
+        let ready_weapon_id = Uuid::new_v4();
+        let ready_without_model_id = Uuid::new_v4();
+        let collected_weapon_id = Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO weapons (id, kind, display_name, base_prompt, effective_prompt, variation_key, status, model_storage_key)
+             VALUES ($1, 'laser', $2, 'base', 'effective', $3, 'READY', $4)",
+        )
+        .bind(ready_weapon_id)
+        .bind("Landing Weapon")
+        .bind(format!("variation-{ready_weapon_id}"))
+        .bind(format!("weapons/{ready_weapon_id}.glb"))
+        .execute(&pool)
+        .await
+        .expect("insert ready weapon");
+        sqlx::query(
+            "INSERT INTO weapons (id, kind, display_name, base_prompt, effective_prompt, variation_key, status)
+             VALUES ($1, 'gun', $2, 'base', 'effective', $3, 'READY')",
+        )
+        .bind(ready_without_model_id)
+        .bind("Missing Weapon Model")
+        .bind(format!("variation-{ready_without_model_id}"))
+        .execute(&pool)
+        .await
+        .expect("insert ready weapon without model");
+        sqlx::query(
+            "INSERT INTO weapons (id, kind, display_name, base_prompt, effective_prompt, variation_key, status, model_storage_key)
+             VALUES ($1, 'sword', $2, 'base', 'effective', $3, 'COLLECTED', $4)",
+        )
+        .bind(collected_weapon_id)
+        .bind("Collected Weapon")
+        .bind(format!("variation-{collected_weapon_id}"))
+        .bind(format!("weapons/{collected_weapon_id}.glb"))
+        .execute(&pool)
+        .await
+        .expect("insert collected weapon");
+
+        let sampled = client
+            .sample_ready_weapons(6)
+            .await
+            .expect("sample ready weapons");
+
+        assert_eq!(sampled.len(), 1);
+        assert_eq!(sampled[0].id, ready_weapon_id.to_string());
+        assert_eq!(
+            sampled[0].model_url.as_deref(),
+            Some(format!("/api/v1/weapons/{ready_weapon_id}/file").as_str())
+        );
+
+        let ready_status: String = sqlx::query("SELECT status FROM weapons WHERE id = $1")
+            .bind(ready_weapon_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load ready weapon status")
+            .try_get("status")
+            .expect("status column");
+        let collected_status: String = sqlx::query("SELECT status FROM weapons WHERE id = $1")
+            .bind(collected_weapon_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load collected weapon status")
+            .try_get("status")
+            .expect("status column");
+
+        assert_eq!(ready_status, "READY");
+        assert_eq!(collected_status, "COLLECTED");
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
     }
 }

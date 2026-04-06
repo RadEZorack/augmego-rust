@@ -2,26 +2,26 @@
 
 use anyhow::Result;
 use glam::{Mat4, Quat, Vec3, Vec4};
-use shared_math::{ChunkPos, LocalVoxelPos, WorldPos, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH};
+use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
-    decode, encode, BreakBlockRequest, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
+    BreakBlockRequest, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
     CapturedPetsSnapshot, ClientHello, ClientMessage, ClientWebRtcSignal, CollectedWeapon,
-    CollectedWeaponsSnapshot, InventorySnapshot, LoginRequest, PeerRealtimeState, PetIdentity,
-    PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
+    CollectedWeaponsSnapshot, InventorySnapshot, LoginRequest, PROTOCOL_VERSION, PeerRealtimeState,
+    PetIdentity, PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
     PlaceBlockRequest, PlayerInputTick, PlayerLeft, ServerMessage, ServerWebRtcSignal,
     SubscribeChunks, UpdatePetPartyRequest, UpdatePetPartyResult, WeaponIdentity,
     WebRtcSignalPayload, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload,
-    WorldWeaponSnapshot, WorldWeaponUnload, PROTOCOL_VERSION,
+    WorldWeaponSnapshot, WorldWeaponUnload, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
+use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     BinaryType, CanvasRenderingContext2d, CloseEvent, Document, Element, ErrorEvent,
     Event as WebEvent, FormData, HtmlCanvasElement, HtmlInputElement, HtmlVideoElement,
@@ -32,8 +32,8 @@ use web_sys::{
 };
 use web_time::Instant;
 use wgpu_lite::{
-    AnimatedMesh, AnimatedMeshDraw, AnimatedVertex, DynamicTexture, Mesh, Renderer, TexturedMesh,
-    TexturedMeshDraw, Vertex, MAX_SKIN_JOINTS,
+    AnimatedMesh, AnimatedMeshDraw, AnimatedVertex, DynamicTexture, MAX_SKIN_JOINTS, Mesh,
+    Renderer, TexturedMesh, TexturedMeshDraw, Vertex,
 };
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, WindowEvent};

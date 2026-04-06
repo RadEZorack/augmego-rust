@@ -3,39 +3,40 @@ use crate::auth::{SameSitePolicy, SessionCookieConfig};
 use crate::db;
 use crate::persistence::{ChunkStore, ChunkStoreConfig, PostgresValkeyChunkStore};
 use crate::pet_registry::{
-    validate_active_pet_selection, validate_pet_weapon_assignments, CapturePetOutcome,
-    PetModelFileResponse, PetPartySelectionError, PetRegistryClient, PetRegistryConfig,
-    PlayerPetCollection, UpdatePetPartyOutcome, PET_ACTIVE_FOLLOWER_LIMIT,
+    CapturePetOutcome, PET_ACTIVE_FOLLOWER_LIMIT, PetModelFileResponse, PetPartySelectionError,
+    PetRegistryClient, PetRegistryConfig, PlayerPetCollection, UpdatePetPartyOutcome,
+    validate_active_pet_selection, validate_pet_weapon_assignments,
 };
 use crate::storage::{StorageConfig, StorageProvider, StorageService};
 use crate::weapon_registry::{
     CollectWeaponOutcome, GuestCollectWeaponOutcome, PlayerWeaponCollection,
     WeaponModelFileResponse, WeaponRegistryClient, WeaponRegistryConfig,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Form, Multipart, Path as AxumPath, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use glam::Vec3;
 use reqwest::Url;
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use shared_content::block_definitions;
-use shared_math::{ChunkPos, WorldPos, CHUNK_HEIGHT};
+use shared_math::{CHUNK_HEIGHT, ChunkPos, WorldPos};
 use shared_protocol::{
-    decode, encode, BlockActionResult, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
+    BlockActionResult, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
     CapturedPetsSnapshot, ChunkUnload, ClientHello, ClientMessage, CollectedWeapon,
-    CollectedWeaponsSnapshot, InventorySnapshot, InventoryStack, LoginResponse, PetIdentity,
-    PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
+    CollectedWeaponsSnapshot, InventorySnapshot, InventoryStack, LoginResponse, PROTOCOL_VERSION,
+    PetIdentity, PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
     PickupWorldWeaponStatus, PlayerLeft, PlayerStateSnapshot, ServerHello, ServerMessage,
     ServerWebRtcSignal, SubscribeChunks, UpdatePetPartyResult, WeaponIdentity,
     WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, WorldWeaponSnapshot, WorldWeaponUnload,
-    PROTOCOL_VERSION,
+    decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
 use std::collections::{HashMap, HashSet};
@@ -44,7 +45,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::yield_now;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -74,6 +75,66 @@ const PET_WEAPON_LOS_STEP: f32 = 0.25;
 const PET_WEAPON_ORIGIN_HEIGHT: f32 = 1.55;
 const PET_WEAPON_FORWARD_OFFSET: f32 = 0.45;
 const PET_WEAPON_TARGET_HEIGHT: f32 = 0.7;
+const LANDING_SCENE_SAMPLE_LIMIT: i64 = 6;
+const LANDING_SCENE_MIN_COUNT: usize = 3;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LandingSceneResponse {
+    generated_at_ms: u64,
+    pets: Vec<LandingPetPreview>,
+    weapons: Vec<LandingWeaponPreview>,
+    pairings: Vec<LandingPairing>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LandingPetPreview {
+    id: String,
+    display_name: String,
+    model_url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LandingWeaponPreview {
+    id: String,
+    kind: String,
+    display_name: String,
+    model_url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LandingPairing {
+    pet_id: String,
+    weapon_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LandingEventRequest {
+    event: LandingEventName,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LandingEventName {
+    PageView,
+    SceneLoaded,
+    PrimaryCtaClick,
+    SecondaryCtaClick,
+}
+
+impl LandingEventName {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PageView => "page_view",
+            Self::SceneLoaded => "scene_loaded",
+            Self::PrimaryCtaClick => "primary_cta_click",
+            Self::SecondaryCtaClick => "secondary_cta_click",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -504,9 +565,9 @@ fn login_welcome_message(
         (Some(pet_name), None, _) => {
             format!("Welcome, {player_name}! Your starter pet {pet_name} is ready.")
         }
-        (None, Some(weapon_name), _) => format!(
-            "Welcome, {player_name}! Your starter weapon {weapon_name} is ready."
-        ),
+        (None, Some(weapon_name), _) => {
+            format!("Welcome, {player_name}! Your starter weapon {weapon_name} is ready.")
+        }
         (None, None, _) => format!("Welcome, {player_name}! Ready to explore?"),
     }
 }
@@ -2281,12 +2342,15 @@ impl VoxelServer {
         Router::new()
             .route("/", get(root_page))
             .route("/learn", get(learn_page))
+            .route("/landing/{*path}", get(landing_asset))
             .route("/play", get(play_redirect))
             .route("/play/", get(play_index))
             .route("/play/{*path}", get(play_asset))
             .route("/mesh-worker.js", get(play_mesh_worker_compat))
             .route("/ws", get(websocket_upgrade))
             .route("/api/v1/health", get(api_health))
+            .route("/api/v1/landing/scene", get(landing_scene))
+            .route("/api/v1/landing/event", post(landing_event))
             .route("/api/v1/auth/apple", get(auth_apple))
             .route("/api/v1/auth/apple/callback", post(auth_apple_callback))
             .route("/api/v1/auth/google", get(auth_google))
@@ -3552,38 +3616,427 @@ impl VoxelServer {
     }
 }
 
-async fn root_page() -> Html<&'static str> {
+async fn root_page() -> Html<String> {
     Html(
         r#"<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Augmego</title>
+    <title>Augmego | Collect Pets, Arm Them, Enter The World</title>
+    <meta
+      name="description"
+      content="Jump into Augmego as a guest, discover procedurally generated pets and weapons, and keep your best finds when you're ready to sign in."
+    />
     <style>
-      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at top, #1d3349, #091018 65%); color: #f4f8fb; font-family: Georgia, "Times New Roman", serif; }
-      main { width: min(92vw, 720px); padding: 40px; border-radius: 28px; background: rgba(7, 12, 18, 0.76); border: 1px solid rgba(255,255,255,0.10); box-shadow: 0 24px 80px rgba(0,0,0,0.45); }
-      h1 { margin: 0 0 16px 0; font-size: clamp(2.6rem, 6vw, 4.8rem); line-height: 0.95; }
-      p { margin: 0 0 18px 0; font: 500 18px/1.6 ui-sans-serif, system-ui, sans-serif; color: rgba(241,245,249,0.82); }
-      nav { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 28px; }
-      a { text-decoration: none; padding: 14px 18px; border-radius: 999px; font: 700 14px/1 ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.04em; }
-      .primary { background: #f4d58d; color: #1a2230; }
-      .secondary { border: 1px solid rgba(255,255,255,0.18); color: #f4f8fb; }
+      :root {
+        color-scheme: dark;
+        --bg-top: #17334e;
+        --bg-bottom: #050b12;
+        --panel: rgba(7, 14, 22, 0.72);
+        --panel-border: rgba(171, 214, 247, 0.18);
+        --text: #f5f6f3;
+        --muted: rgba(229, 237, 245, 0.78);
+        --accent: #ffd76b;
+        --accent-2: #84d8ff;
+        --accent-3: #ff9d7a;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+        background:
+          radial-gradient(circle at top, rgba(132, 216, 255, 0.20), transparent 28%),
+          radial-gradient(circle at 80% 18%, rgba(255, 157, 122, 0.18), transparent 26%),
+          linear-gradient(180deg, var(--bg-top), var(--bg-bottom) 72%);
+        color: var(--text);
+        font-family: "Avenir Next", "Segoe UI", sans-serif;
+      }
+
+      body {
+        overflow-x: hidden;
+      }
+
+      body::before,
+      body::after {
+        content: "";
+        position: fixed;
+        inset: auto;
+        width: 42rem;
+        height: 42rem;
+        border-radius: 999px;
+        filter: blur(80px);
+        pointer-events: none;
+        opacity: 0.28;
+        z-index: 0;
+      }
+
+      body::before {
+        top: -10rem;
+        left: -12rem;
+        background: rgba(132, 216, 255, 0.42);
+      }
+
+      body::after {
+        right: -10rem;
+        bottom: -14rem;
+        background: rgba(255, 157, 122, 0.34);
+      }
+
+      .hero {
+        position: relative;
+        min-height: 100vh;
+        isolation: isolate;
+        overflow: clip;
+      }
+
+      .scene-shell {
+        position: absolute;
+        inset: 0;
+        z-index: 0;
+      }
+
+      .scene-shell::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+          linear-gradient(90deg, rgba(5, 11, 18, 0.78) 0%, rgba(5, 11, 18, 0.46) 30%, rgba(5, 11, 18, 0.28) 55%, rgba(5, 11, 18, 0.66) 100%),
+          radial-gradient(circle at center, rgba(132, 216, 255, 0.10), transparent 44%);
+        z-index: 2;
+        pointer-events: none;
+      }
+
+      #landing-scene {
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+      }
+
+      .scene-fallback {
+        position: absolute;
+        inset: auto 2rem 2rem auto;
+        z-index: 3;
+        padding: 0.85rem 1rem;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(7, 14, 22, 0.58);
+        color: rgba(245, 246, 243, 0.72);
+        font-size: 0.78rem;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .content {
+        position: relative;
+        z-index: 4;
+        width: min(1180px, calc(100vw - 2.5rem));
+        margin: 0 auto;
+        padding: clamp(1.5rem, 3vw, 2.5rem) 0 3rem;
+      }
+
+      .nav {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 1rem;
+        margin-bottom: clamp(2rem, 5vw, 4rem);
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.9rem;
+        color: var(--text);
+        text-decoration: none;
+        font: 700 0.95rem/1 "Avenir Next", "Segoe UI", sans-serif;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+      }
+
+      .brand-mark {
+        width: 2.5rem;
+        height: 2.5rem;
+        border-radius: 1rem;
+        background:
+          linear-gradient(145deg, rgba(255, 215, 107, 0.98), rgba(255, 157, 122, 0.92)),
+          #fff;
+        box-shadow: 0 12px 30px rgba(255, 157, 122, 0.25);
+      }
+
+      .hero-grid {
+        display: grid;
+        min-height: calc(100vh - 8rem);
+        align-items: center;
+      }
+
+      .hero-card {
+        width: min(42rem, 100%);
+        padding: clamp(1.4rem, 3vw, 2rem);
+        border-radius: 2rem;
+        background: linear-gradient(180deg, rgba(10, 18, 28, 0.86), rgba(10, 18, 28, 0.62));
+        border: 1px solid var(--panel-border);
+        box-shadow: 0 24px 90px rgba(0, 0, 0, 0.34);
+        backdrop-filter: blur(18px);
+      }
+
+      .eyebrow {
+        margin: 0 0 1rem;
+        color: rgba(132, 216, 255, 0.84);
+        font: 700 0.8rem/1 "Avenir Next", "Segoe UI", sans-serif;
+        letter-spacing: 0.22em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0;
+        font: 700 clamp(3rem, 7vw, 6rem)/0.92 Georgia, "Times New Roman", serif;
+        letter-spacing: -0.04em;
+        text-wrap: balance;
+      }
+
+      .lede {
+        margin: 1.3rem 0 0;
+        max-width: 35rem;
+        color: var(--muted);
+        font: 500 clamp(1.08rem, 2.1vw, 1.22rem)/1.7 "Avenir Next", "Segoe UI", sans-serif;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.9rem;
+        margin: 2rem 0 1rem;
+      }
+
+      .cta {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 3.4rem;
+        padding: 0.95rem 1.35rem;
+        border-radius: 999px;
+        border: 1px solid transparent;
+        text-decoration: none;
+        font: 700 0.95rem/1 "Avenir Next", "Segoe UI", sans-serif;
+        letter-spacing: 0.04em;
+        transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+      }
+
+      .cta:hover,
+      .cta:focus-visible {
+        transform: translateY(-1px);
+      }
+
+      .cta-primary {
+        background: linear-gradient(135deg, var(--accent), #ffad68);
+        color: #142234;
+        box-shadow: 0 16px 30px rgba(255, 215, 107, 0.18);
+      }
+
+      .cta-secondary {
+        border-color: rgba(255, 255, 255, 0.16);
+        background: rgba(255, 255, 255, 0.02);
+        color: var(--text);
+      }
+
+      .supporting {
+        margin: 0;
+        color: rgba(245, 246, 243, 0.9);
+        font: 600 0.98rem/1.55 "Avenir Next", "Segoe UI", sans-serif;
+      }
+
+      .highlights {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 0.9rem;
+        padding: 0;
+        margin: 1.6rem 0 0;
+        list-style: none;
+      }
+
+      .highlights li {
+        padding: 1rem;
+        border-radius: 1.2rem;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .highlights strong {
+        display: block;
+        margin-bottom: 0.35rem;
+        font: 700 0.9rem/1.2 "Avenir Next", "Segoe UI", sans-serif;
+      }
+
+      .highlights span {
+        color: var(--muted);
+        font: 500 0.85rem/1.5 "Avenir Next", "Segoe UI", sans-serif;
+      }
+
+      .scene-disabled .scene-fallback,
+      [data-scene-state="unavailable"] .scene-fallback,
+      [data-scene-state="failed"] .scene-fallback {
+        display: inline-flex;
+      }
+
+      [data-scene-state="ready"] .scene-fallback {
+        opacity: 0;
+        transform: translateY(0.35rem);
+        transition: opacity 240ms ease, transform 240ms ease;
+      }
+
+      @media (max-width: 900px) {
+        .content {
+          width: min(100vw - 1.2rem, 42rem);
+          padding-top: 1rem;
+          padding-bottom: 2rem;
+        }
+
+        .hero-card {
+          margin-top: 1.5rem;
+        }
+
+        .highlights {
+          grid-template-columns: 1fr;
+        }
+
+        .scene-shell::before {
+          background:
+            linear-gradient(180deg, rgba(5, 11, 18, 0.55) 0%, rgba(5, 11, 18, 0.35) 28%, rgba(5, 11, 18, 0.72) 100%);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .cta {
+          transition: none;
+        }
+      }
     </style>
   </head>
-  <body>
-    <main>
-      <div style="font: 700 12px/1 ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.18em; text-transform: uppercase; color: rgba(180, 225, 255, 0.72); margin-bottom: 14px;">Single Rust Runtime</div>
-      <h1>Augmego lives here now.</h1>
-      <p>The product shell, auth flow, world simulation, pet reservoir, and WebSocket gameplay all run from one Rust server.</p>
-      <nav>
-        <a class="primary" href="/play/">Enter The World</a>
-        <a class="secondary" href="/learn">Learn More</a>
-      </nav>
+  <body data-scene-state="idle">
+    <main class="hero">
+      <div class="scene-shell" aria-hidden="true">
+        <div id="landing-scene"></div>
+        <div class="scene-fallback">ambient pet battle loading</div>
+      </div>
+      <div class="content">
+        <div class="nav">
+          <a class="brand" href="/">
+            <span class="brand-mark"></span>
+            <span>Augmego</span>
+          </a>
+        </div>
+        <section class="hero-grid">
+          <div class="hero-card">
+            <p class="eyebrow">Guest-first voxel adventures</p>
+            <h1>Collect strange pets. Arm them. Enter the world in seconds.</h1>
+            <p class="lede">
+              Augmego is a shared voxel sandbox where you can drop in as a guest,
+              discover procedurally generated pets and weapons, and keep the best
+              finds when you decide to sign in.
+            </p>
+            <div class="actions">
+              <a class="cta cta-primary" id="landing-primary-cta" href="/play/">Enter The World</a>
+              <a class="cta cta-secondary" id="landing-secondary-cta" href="/learn">Learn More</a>
+            </div>
+            <p class="supporting">Play as a guest now. Sign in later to keep pets and avatars.</p>
+            <ul class="highlights">
+              <li>
+                <strong>Instant entry</strong>
+                <span>Launch straight into the playable world without creating an account first.</span>
+              </li>
+              <li>
+                <strong>Procedural companions</strong>
+                <span>Every pet and weapon in the hero scene is sampled from the live generation pool.</span>
+              </li>
+              <li>
+                <strong>Persistence when ready</strong>
+                <span>Use Google, Apple, or Microsoft later when you want saved pets, avatars, and parties.</span>
+              </li>
+            </ul>
+          </div>
+        </section>
+      </div>
     </main>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/landing/vendor/three.module.js"
+        }
+      }
+    </script>
+    <script type="module" src="/landing/app.js"></script>
   </body>
-</html>"#,
+</html>"#
+            .to_string(),
     )
+}
+
+async fn landing_scene(State(server): State<VoxelServer>) -> Response {
+    let generated_at_ms = unix_timestamp_ms();
+    let pets = match server
+        .pet_registry
+        .sample_ready_pets(LANDING_SCENE_SAMPLE_LIMIT)
+        .await
+    {
+        Ok(pets) => pets,
+        Err(error) => {
+            tracing::warn!(?error, "failed to sample landing pets");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "LANDING_SCENE_UNAVAILABLE",
+            );
+        }
+    };
+    let weapons = match server
+        .weapon_registry
+        .sample_ready_weapons(LANDING_SCENE_SAMPLE_LIMIT)
+        .await
+    {
+        Ok(weapons) => weapons,
+        Err(error) => {
+            tracing::warn!(?error, "failed to sample landing weapons");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "LANDING_SCENE_UNAVAILABLE",
+            );
+        }
+    };
+
+    Json(build_landing_scene_response(generated_at_ms, pets, weapons)).into_response()
+}
+
+async fn landing_event(
+    headers: HeaderMap,
+    payload: std::result::Result<Json<LandingEventRequest>, JsonRejection>,
+) -> Response {
+    let Json(body) = match payload {
+        Ok(body) => body,
+        Err(_) => return api_error(StatusCode::BAD_REQUEST, "INVALID_LANDING_EVENT"),
+    };
+
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+    let referer = headers
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+
+    tracing::info!(
+        event = body.event.as_str(),
+        user_agent,
+        referer,
+        "landing event"
+    );
+
+    Json(json!({ "ok": true })).into_response()
 }
 
 async fn learn_page() -> Html<&'static str> {
@@ -3616,6 +4069,18 @@ async fn learn_page() -> Html<&'static str> {
 
 async fn play_redirect() -> Redirect {
     Redirect::temporary("/play/")
+}
+
+async fn landing_asset(
+    State(server): State<VoxelServer>,
+    AxumPath(path): AxumPath<String>,
+) -> Response {
+    let normalized = path.trim_start_matches('/');
+    let Some(resolved_path) = safe_static_path(&server.static_root.join("landing"), normalized)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    static_file_response(resolved_path).await
 }
 
 async fn play_index(State(server): State<VoxelServer>) -> Response {
@@ -4332,6 +4797,78 @@ fn api_error(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({ "error": code }))).into_response()
 }
 
+fn build_landing_scene_response(
+    generated_at_ms: u64,
+    pets: Vec<PetIdentity>,
+    weapons: Vec<WeaponIdentity>,
+) -> LandingSceneResponse {
+    let scene_count = pets
+        .len()
+        .min(weapons.len())
+        .min(LANDING_SCENE_SAMPLE_LIMIT as usize);
+    if scene_count < LANDING_SCENE_MIN_COUNT {
+        return LandingSceneResponse {
+            generated_at_ms,
+            pets: Vec::new(),
+            weapons: Vec::new(),
+            pairings: Vec::new(),
+        };
+    }
+
+    let pets = pets
+        .into_iter()
+        .take(scene_count)
+        .filter_map(|pet| {
+            Some(LandingPetPreview {
+                id: pet.id,
+                display_name: pet.display_name,
+                model_url: pet.model_url?,
+            })
+        })
+        .collect::<Vec<_>>();
+    let weapons = weapons
+        .into_iter()
+        .take(scene_count)
+        .filter_map(|weapon| {
+            Some(LandingWeaponPreview {
+                id: weapon.id,
+                kind: weapon.kind,
+                display_name: weapon.display_name,
+                model_url: weapon.model_url?,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let paired_count = pets.len().min(weapons.len());
+    if paired_count < LANDING_SCENE_MIN_COUNT {
+        return LandingSceneResponse {
+            generated_at_ms,
+            pets: Vec::new(),
+            weapons: Vec::new(),
+            pairings: Vec::new(),
+        };
+    }
+
+    let pets = pets.into_iter().take(paired_count).collect::<Vec<_>>();
+    let weapons = weapons.into_iter().take(paired_count).collect::<Vec<_>>();
+    let shuffled_weapon_indices = shuffled_indices(paired_count, generated_at_ms ^ 0xA66D_E601);
+    let pairings = pets
+        .iter()
+        .enumerate()
+        .map(|(index, pet)| LandingPairing {
+            pet_id: pet.id.clone(),
+            weapon_id: weapons[shuffled_weapon_indices[index]].id.clone(),
+        })
+        .collect();
+
+    LandingSceneResponse {
+        generated_at_ms,
+        pets,
+        weapons,
+        pairings,
+    }
+}
+
 fn storage_object_response(object: crate::storage::StorageObject) -> Response {
     let mut response = Response::new(Body::from(object.bytes));
     response.headers_mut().insert(
@@ -4388,6 +4925,22 @@ fn is_immutable_static_asset(path: &std::path::Path) -> bool {
         path.file_name().and_then(|value| value.to_str()),
         Some("index.html")
     )
+}
+
+fn shuffled_indices(len: usize, seed: u64) -> Vec<usize> {
+    let mut indices = (0..len).collect::<Vec<_>>();
+    for current in (1..len).rev() {
+        let random = (pseudo_unit(seed ^ current as u64) * (current + 1) as f32).floor() as usize;
+        indices.swap(current, random.min(current));
+    }
+    indices
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn parse_optional_text_field(
@@ -4707,9 +5260,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db;
     use crate::persistence::InMemoryChunkStore;
+    use serde_json::json;
     use shared_math::LocalVoxelPos;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     fn test_pet_identity(id: &str, equipped_weapon_id: Option<&str>) -> PetIdentity {
         PetIdentity {
@@ -4759,6 +5315,52 @@ mod tests {
         PlayerWeaponCollection {
             weapons: Vec::new(),
         }
+    }
+
+    async fn landing_test_server() -> (VoxelServer, sqlx::PgPool, String, String) {
+        let config = ServerConfig::default();
+        let base_database_url = config.database_url.clone();
+        let (pool, schema_name) = db::connect_isolated_test_pool(&base_database_url)
+            .await
+            .expect("create isolated schema");
+        let mut server_config = config.clone();
+        server_config.database_url =
+            db::isolated_test_schema_database_url(&base_database_url, &schema_name);
+        server_config.storage_root =
+            std::env::temp_dir().join(format!("augmego-landing-server-{schema_name}"));
+        let server = VoxelServer::new(server_config)
+            .await
+            .expect("create landing test server");
+        (server, pool, base_database_url, schema_name)
+    }
+
+    async fn insert_landing_pet(pool: &sqlx::PgPool, pet_id: Uuid, label: &str) {
+        sqlx::query(
+            "INSERT INTO pets (id, display_name, base_prompt, effective_prompt, variation_key, status, model_storage_key)
+             VALUES ($1, $2, 'base', 'effective', $3, 'READY', $4)",
+        )
+        .bind(pet_id)
+        .bind(label)
+        .bind(format!("landing-pet-{pet_id}"))
+        .bind(format!("pets/{pet_id}.glb"))
+        .execute(pool)
+        .await
+        .expect("insert landing pet");
+    }
+
+    async fn insert_landing_weapon(pool: &sqlx::PgPool, weapon_id: Uuid, kind: &str, label: &str) {
+        sqlx::query(
+            "INSERT INTO weapons (id, kind, display_name, base_prompt, effective_prompt, variation_key, status, model_storage_key)
+             VALUES ($1, $2, $3, 'base', 'effective', $4, 'READY', $5)",
+        )
+        .bind(weapon_id)
+        .bind(kind)
+        .bind(label)
+        .bind(format!("landing-weapon-{weapon_id}"))
+        .bind(format!("weapons/{weapon_id}.glb"))
+        .execute(pool)
+        .await
+        .expect("insert landing weapon");
     }
 
     async fn insert_wild_pet(
@@ -4883,6 +5485,130 @@ mod tests {
         assert!(message.contains("Weapon A"));
         assert!(message.contains("already equipped"));
         assert!(message.contains("guest starter"));
+    }
+
+    #[test]
+    fn landing_scene_response_limits_pairs_and_falls_back_when_too_small() {
+        let pets = (0..8)
+            .map(|index| PetIdentity {
+                id: format!("pet-{index}"),
+                display_name: format!("Pet {index}"),
+                model_url: Some(format!("/api/v1/pets/pet-{index}/file")),
+                equipped_weapon: None,
+            })
+            .collect::<Vec<_>>();
+        let weapons = (0..8)
+            .map(|index| WeaponIdentity {
+                id: format!("weapon-{index}"),
+                kind: "laser".to_string(),
+                display_name: format!("Weapon {index}"),
+                model_url: Some(format!("/api/v1/weapons/weapon-{index}/file")),
+            })
+            .collect::<Vec<_>>();
+
+        let response = build_landing_scene_response(123, pets, weapons);
+
+        assert_eq!(response.pets.len(), 6);
+        assert_eq!(response.weapons.len(), 6);
+        assert_eq!(response.pairings.len(), 6);
+
+        let empty = build_landing_scene_response(
+            123,
+            vec![PetIdentity {
+                id: "pet-a".to_string(),
+                display_name: "Pet A".to_string(),
+                model_url: Some("/api/v1/pets/pet-a/file".to_string()),
+                equipped_weapon: None,
+            }],
+            vec![WeaponIdentity {
+                id: "weapon-a".to_string(),
+                kind: "laser".to_string(),
+                display_name: "Weapon A".to_string(),
+                model_url: Some("/api/v1/weapons/weapon-a/file".to_string()),
+            }],
+        );
+
+        assert!(empty.pets.is_empty());
+        assert!(empty.weapons.is_empty());
+        assert!(empty.pairings.is_empty());
+    }
+
+    #[test]
+    fn landing_event_request_only_accepts_known_event_names() {
+        let valid: LandingEventRequest =
+            serde_json::from_value(json!({ "event": "page_view" })).expect("valid event");
+        assert!(matches!(valid.event, LandingEventName::PageView));
+        assert!(
+            serde_json::from_value::<LandingEventRequest>(json!({ "event": "unknown" })).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn landing_scene_endpoint_returns_preview_json_with_valid_model_urls() {
+        let (server, pool, base_database_url, schema_name) = landing_test_server().await;
+        for index in 0..6 {
+            insert_landing_pet(&pool, Uuid::new_v4(), &format!("Pet {index}")).await;
+        }
+        for (index, kind) in ["laser", "gun", "flamethrower", "sword", "laser", "gun"]
+            .into_iter()
+            .enumerate()
+        {
+            insert_landing_weapon(&pool, Uuid::new_v4(), kind, &format!("Weapon {index}")).await;
+        }
+
+        let response = landing_scene(State(server)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read landing scene body");
+        let payload: LandingSceneResponse =
+            serde_json::from_slice(&bytes).expect("decode landing scene payload");
+
+        assert_eq!(payload.pets.len(), 6);
+        assert_eq!(payload.weapons.len(), 6);
+        assert_eq!(payload.pairings.len(), 6);
+        assert!(
+            payload
+                .pets
+                .iter()
+                .all(|pet| pet.model_url.starts_with("/api/v1/pets/"))
+        );
+        assert!(
+            payload
+                .weapons
+                .iter()
+                .all(|weapon| weapon.model_url.starts_with("/api/v1/weapons/"))
+        );
+        assert!(payload.pairings.iter().all(|pairing| {
+            payload.pets.iter().any(|pet| pet.id == pairing.pet_id)
+                && payload
+                    .weapons
+                    .iter()
+                    .any(|weapon| weapon.id == pairing.weapon_id)
+        }));
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
+    }
+
+    #[tokio::test]
+    async fn landing_event_endpoint_accepts_allowed_events() {
+        let response = landing_event(
+            HeaderMap::new(),
+            Ok(Json(LandingEventRequest {
+                event: LandingEventName::PrimaryCtaClick,
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read landing event body");
+        let payload: Value = serde_json::from_slice(&bytes).expect("decode landing event payload");
+        assert_eq!(payload, json!({ "ok": true }));
     }
 
     #[tokio::test]
@@ -5327,10 +6053,12 @@ mod tests {
                 .map(|pet| pet.id.as_str()),
             Some("wild-40")
         );
-        assert!(updated_player
-            .active_pet_models
-            .iter()
-            .any(|pet| pet.id == "wild-40"));
+        assert!(
+            updated_player
+                .active_pet_models
+                .iter()
+                .any(|pet| pet.id == "wild-40")
+        );
     }
 
     #[tokio::test]
@@ -5367,10 +6095,11 @@ mod tests {
             } else {
                 assert_eq!(pet.active_pet_models.len(), PET_ACTIVE_FOLLOWER_LIMIT);
                 assert_eq!(pet.captured_pets.first().map(|pet| pet.active), Some(false));
-                assert!(!pet
-                    .active_pet_models
-                    .iter()
-                    .any(|pet_model| pet_model.id == "pet-6"));
+                assert!(
+                    !pet.active_pet_models
+                        .iter()
+                        .any(|pet_model| pet_model.id == "pet-6")
+                );
             }
         }
     }

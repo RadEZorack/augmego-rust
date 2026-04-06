@@ -1,4 +1,7 @@
 {
   "name": "augmego-rust",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "three": "^0.183.2"
+  }
 }

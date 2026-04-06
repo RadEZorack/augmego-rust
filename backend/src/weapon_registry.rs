@@ -351,6 +351,48 @@ impl WeaponRegistryClient {
         )))
     }
 
+    pub async fn collect_random_weapon_for_guest(&self) -> Result<Option<WeaponIdentity>> {
+        let row = sqlx::query(
+            "WITH next_weapon AS (
+                 SELECT id
+                 FROM weapons
+                 WHERE status = 'READY' AND model_storage_key IS NOT NULL
+                 ORDER BY RANDOM()
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT 1
+             )
+             UPDATE weapons
+             SET status = 'COLLECTED',
+                 collected_by_user_id = NULL,
+                 collected_at = NOW(),
+                 spawned_at = NULL,
+                 updated_at = NOW()
+             FROM next_weapon
+             WHERE weapons.id = next_weapon.id
+             RETURNING weapons.id, weapons.kind, weapons.display_name, weapons.model_url, weapons.model_storage_key",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("collect random starter weapon for guest")?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let weapon_id: Uuid = row.try_get("id")?;
+        let kind: String = row.try_get("kind")?;
+        let display_name: String = row.try_get("display_name")?;
+        let model_url: Option<String> = row.try_get("model_url")?;
+        let model_storage_key: Option<String> = row.try_get("model_storage_key")?;
+        Ok(Some(self.map_weapon_identity(
+            weapon_id,
+            kind,
+            display_name,
+            model_url,
+            model_storage_key,
+        )))
+    }
+
     pub async fn load_user_weapon_collection(
         &self,
         user_id: &str,
@@ -432,6 +474,62 @@ impl WeaponRegistryClient {
             .context("commit collect weapon transaction")?;
 
         Ok(CollectWeaponOutcome::Collected(collection))
+    }
+
+    pub async fn collect_random_weapon_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<PlayerWeaponCollection>> {
+        let user_id = parse_uuid(user_id, "user id")?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin random starter weapon collection transaction")?;
+
+        let collected_row = sqlx::query(
+            "WITH next_weapon AS (
+                 SELECT id
+                 FROM weapons
+                 WHERE status = 'READY' AND model_storage_key IS NOT NULL
+                 ORDER BY RANDOM()
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT 1
+             )
+             UPDATE weapons
+             SET status = 'COLLECTED',
+                 collected_by_user_id = $1,
+                 collected_at = NOW(),
+                 spawned_at = NULL,
+                 updated_at = NOW()
+             FROM next_weapon
+             WHERE weapons.id = next_weapon.id
+             RETURNING weapons.id",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("collect random starter weapon")?;
+        if collected_row.is_none() {
+            return Ok(None);
+        }
+
+        let rows = sqlx::query(
+            "SELECT id, kind, display_name, model_url, model_storage_key, collected_at
+             FROM weapons
+             WHERE collected_by_user_id = $1 AND status = 'COLLECTED'
+             ORDER BY collected_at DESC NULLS LAST, created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("load collected weapons after random starter collection")?;
+        let collection = self.build_player_weapon_collection(rows)?;
+        tx.commit()
+            .await
+            .context("commit random starter weapon collection transaction")?;
+
+        Ok(Some(collection))
     }
 
     pub async fn collect_weapon_for_guest(

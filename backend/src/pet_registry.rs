@@ -409,6 +409,44 @@ impl PetRegistryClient {
         )))
     }
 
+    pub async fn reserve_random_pet(&self) -> Result<Option<PetIdentity>> {
+        let row = sqlx::query(
+            "WITH next_pet AS (
+                 SELECT id
+                 FROM pets
+                 WHERE status = 'READY' AND model_storage_key IS NOT NULL
+                 ORDER BY RANDOM()
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT 1
+             )
+             UPDATE pets
+             SET status = 'SPAWNED',
+                 spawned_at = NOW(),
+                 updated_at = NOW()
+             FROM next_pet
+             WHERE pets.id = next_pet.id
+             RETURNING pets.id, pets.display_name, pets.model_url, pets.model_storage_key",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("reserve random ready pet")?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let pet_id: Uuid = row.try_get("id")?;
+        let display_name: String = row.try_get("display_name")?;
+        let model_url: Option<String> = row.try_get("model_url")?;
+        let model_storage_key: Option<String> = row.try_get("model_storage_key")?;
+        Ok(Some(self.map_pet_identity(
+            pet_id,
+            display_name,
+            model_url,
+            model_storage_key,
+        )))
+    }
+
     pub async fn load_user_pet_collection(&self, user_id: &str) -> Result<PlayerPetCollection> {
         let user_id = parse_uuid(user_id, "user id")?;
         let rows = sqlx::query(
@@ -502,6 +540,81 @@ impl PetRegistryClient {
             .context("commit capture pet transaction")?;
 
         Ok(CapturePetOutcome::Captured(collection))
+    }
+
+    pub async fn capture_random_pet_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<PlayerPetCollection>> {
+        let user_id = parse_uuid(user_id, "user id")?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin random starter pet capture transaction")?;
+
+        let active_rows = sqlx::query(
+            "SELECT party_active
+             FROM pets
+             WHERE captured_by_user_id = $1 AND status = 'CAPTURED'
+             FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("lock active pet collection before random starter capture")?;
+        let active_count = active_rows
+            .iter()
+            .filter(|row| row.try_get::<bool, _>("party_active").unwrap_or(false))
+            .count();
+        let should_activate = active_count < PET_ACTIVE_FOLLOWER_LIMIT;
+
+        let captured_row = sqlx::query(
+            "WITH next_pet AS (
+                 SELECT id
+                 FROM pets
+                 WHERE status = 'READY' AND model_storage_key IS NOT NULL
+                 ORDER BY RANDOM()
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT 1
+             )
+             UPDATE pets
+             SET status = 'CAPTURED',
+                 captured_by_user_id = $1,
+                 captured_at = NOW(),
+                 party_active = $2,
+                 equipped_weapon_id = NULL,
+                 spawned_at = NULL,
+                 updated_at = NOW()
+             FROM next_pet
+             WHERE pets.id = next_pet.id
+             RETURNING pets.id",
+        )
+        .bind(user_id)
+        .bind(should_activate)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("capture random starter pet")?;
+        if captured_row.is_none() {
+            return Ok(None);
+        }
+
+        let rows = sqlx::query(
+            "SELECT id, display_name, model_url, model_storage_key, captured_at, party_active, equipped_weapon_id
+             FROM pets
+             WHERE captured_by_user_id = $1 AND status = 'CAPTURED'
+             ORDER BY captured_at DESC NULLS LAST, created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("load captured pets after random starter capture")?;
+        let collection = self.build_player_pet_collection(rows)?;
+        tx.commit()
+            .await
+            .context("commit random starter pet capture transaction")?;
+
+        Ok(Some(collection))
     }
 
     pub async fn update_pet_party(

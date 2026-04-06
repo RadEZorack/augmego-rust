@@ -31,8 +31,7 @@ use shared_protocol::{
     BlockActionResult, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
     CapturedPetsSnapshot, ChunkUnload, ClientHello, ClientMessage, CollectedWeapon,
     CollectedWeaponsSnapshot, InventorySnapshot, InventoryStack, LoginResponse, PROTOCOL_VERSION,
-    PetIdentity, PetStateSnapshot, PetWeaponAssignment, PetWeaponShot,
-    PickupWorldWeaponResult,
+    PetIdentity, PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
     PickupWorldWeaponStatus, PlayerLeft, PlayerStateSnapshot, ServerHello, ServerMessage,
     ServerWebRtcSignal, SubscribeChunks, UpdatePetPartyResult, WeaponIdentity,
     WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, WorldWeaponSnapshot, WorldWeaponUnload,
@@ -402,6 +401,56 @@ fn active_pet_models_from_captured_pets(
                 .map(|weapon| weapon_identity_from_collected_weapon(weapon)),
         })
         .collect()
+}
+
+fn pet_collection_is_empty(collection: Option<&PlayerPetCollection>) -> bool {
+    collection
+        .map(|collection| collection.pets.is_empty())
+        .unwrap_or(true)
+}
+
+fn weapon_collection_is_empty(collection: Option<&PlayerWeaponCollection>) -> bool {
+    collection
+        .map(|collection| collection.weapons.is_empty())
+        .unwrap_or(true)
+}
+
+fn authenticated_player_needs_starter_loadout(
+    pet_collection: Option<&PlayerPetCollection>,
+    pet_collection_loaded: bool,
+    weapon_collection: Option<&PlayerWeaponCollection>,
+    weapon_collection_loaded: bool,
+) -> bool {
+    pet_collection_loaded
+        && weapon_collection_loaded
+        && pet_collection_is_empty(pet_collection)
+        && weapon_collection_is_empty(weapon_collection)
+}
+
+fn starter_guest_pet_collection(pet_identity: PetIdentity) -> PlayerPetCollection {
+    PlayerPetCollection {
+        pets: vec![CapturedPet {
+            id: pet_identity.id.clone(),
+            display_name: pet_identity.display_name.clone(),
+            model_url: pet_identity.model_url.clone(),
+            captured_at_ms: current_time_millis(),
+            active: true,
+            equipped_weapon_id: None,
+        }],
+        active_pets: vec![pet_identity],
+    }
+}
+
+fn starter_guest_weapon_collection(weapon_identity: WeaponIdentity) -> PlayerWeaponCollection {
+    PlayerWeaponCollection {
+        weapons: vec![CollectedWeapon {
+            id: weapon_identity.id,
+            kind: weapon_identity.kind,
+            display_name: weapon_identity.display_name,
+            model_url: weapon_identity.model_url,
+            collected_at_ms: current_time_millis(),
+        }],
+    }
 }
 
 fn apply_active_pet_selection(captured_pets: &mut [CapturedPet], active_pet_ids: &HashSet<String>) {
@@ -1044,7 +1093,10 @@ impl WildPetService {
                     continue;
                 };
                 let target = pet_weapon_target(candidate_position);
-                if !world_service.segment_has_line_of_sight(origin, target).await? {
+                if !world_service
+                    .segment_has_line_of_sight(origin, target)
+                    .await?
+                {
                     continue;
                 }
                 eligible_candidates.push(candidate_pet_id);
@@ -1681,11 +1733,7 @@ impl WorldService {
         Ok((position.to_array(), velocity))
     }
 
-    pub async fn segment_has_line_of_sight(
-        &self,
-        start: [f32; 3],
-        end: [f32; 3],
-    ) -> Result<bool> {
+    pub async fn segment_has_line_of_sight(&self, start: [f32; 3], end: [f32; 3]) -> Result<bool> {
         let start = Vec3::from_array(start);
         let end = Vec3::from_array(end);
         let delta = end - start;
@@ -2318,30 +2366,39 @@ impl VoxelServer {
         } else {
             (None, "guest")
         };
-        let pet_collection = match user_id.as_deref() {
+        let (pet_collection, pet_collection_loaded) = match user_id.as_deref() {
             Some(user_id) => match self.pet_registry.load_user_pet_collection(user_id).await {
-                Ok(collection) => Some(collection),
+                Ok(collection) => (Some(collection), true),
                 Err(error) => {
                     tracing::warn!(?error, %user_id, "failed to load websocket player pet collection");
-                    None
+                    (None, false)
                 }
             },
-            None => None,
+            None => (None, true),
         };
-        let weapon_collection = match user_id.as_deref() {
+        let (weapon_collection, weapon_collection_loaded) = match user_id.as_deref() {
             Some(user_id) => match self
                 .weapon_registry
                 .load_user_weapon_collection(user_id)
                 .await
             {
-                Ok(collection) => Some(collection),
+                Ok(collection) => (Some(collection), true),
                 Err(error) => {
                     tracing::warn!(?error, %user_id, "failed to load websocket player weapon collection");
-                    None
+                    (None, false)
                 }
             },
-            None => None,
+            None => (None, true),
         };
+        let (pet_collection, weapon_collection) = self
+            .maybe_assign_starter_loadout(
+                user_id.as_deref(),
+                pet_collection,
+                pet_collection_loaded,
+                weapon_collection,
+                weapon_collection_loaded,
+            )
+            .await;
         let spawn_position = self.world_service.safe_spawn_position();
         let player = self
             .player_service
@@ -2423,6 +2480,82 @@ impl VoxelServer {
         drop(sender);
         let _ = writer.await;
         Ok(())
+    }
+
+    async fn maybe_assign_starter_loadout(
+        &self,
+        user_id: Option<&str>,
+        pet_collection: Option<PlayerPetCollection>,
+        pet_collection_loaded: bool,
+        weapon_collection: Option<PlayerWeaponCollection>,
+        weapon_collection_loaded: bool,
+    ) -> (Option<PlayerPetCollection>, Option<PlayerWeaponCollection>) {
+        let mut pet_collection = pet_collection;
+        let mut weapon_collection = weapon_collection;
+        let starter_eligible = match user_id {
+            Some(_) => authenticated_player_needs_starter_loadout(
+                pet_collection.as_ref(),
+                pet_collection_loaded,
+                weapon_collection.as_ref(),
+                weapon_collection_loaded,
+            ),
+            None => true,
+        };
+
+        if !starter_eligible {
+            return (pet_collection, weapon_collection);
+        }
+
+        if let Some(user_id) = user_id {
+            if pet_collection_is_empty(pet_collection.as_ref()) {
+                match self.pet_registry.capture_random_pet_for_user(user_id).await {
+                    Ok(Some(collection)) => pet_collection = Some(collection),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(?error, %user_id, "failed to grant starter pet");
+                    }
+                }
+            }
+            if weapon_collection_is_empty(weapon_collection.as_ref()) {
+                match self
+                    .weapon_registry
+                    .collect_random_weapon_for_user(user_id)
+                    .await
+                {
+                    Ok(Some(collection)) => weapon_collection = Some(collection),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(?error, %user_id, "failed to grant starter weapon");
+                    }
+                }
+            }
+            return (pet_collection, weapon_collection);
+        }
+
+        if pet_collection_is_empty(pet_collection.as_ref()) {
+            match self.pet_registry.reserve_random_pet().await {
+                Ok(Some(pet_identity)) => {
+                    pet_collection = Some(starter_guest_pet_collection(pet_identity));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(?error, "failed to grant guest starter pet");
+                }
+            }
+        }
+        if weapon_collection_is_empty(weapon_collection.as_ref()) {
+            match self.weapon_registry.collect_random_weapon_for_guest().await {
+                Ok(Some(weapon_identity)) => {
+                    weapon_collection = Some(starter_guest_weapon_collection(weapon_identity));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(?error, "failed to grant guest starter weapon");
+                }
+            }
+        }
+
+        (pet_collection, weapon_collection)
     }
 
     async fn release_guest_pet_captures_for_player(&self, player: &Player) {
@@ -2792,8 +2925,9 @@ impl VoxelServer {
             let _ = sender.send(ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
                 pet_id: captured_pet_id,
                 status: CaptureWildPetStatus::Captured,
-                message: "Pet captured for this guest session. It returns to the pool when you leave."
-                    .to_string(),
+                message:
+                    "Pet captured for this guest session. It returns to the pool when you leave."
+                        .to_string(),
             }));
         } else {
             self.release_guest_pet_captures(&[pet_identity.id.clone()])
@@ -2869,7 +3003,8 @@ impl VoxelServer {
             }
         };
 
-        self.finalize_wild_pet_capture(player_id, sender, capture).await
+        self.finalize_wild_pet_capture(player_id, sender, capture)
+            .await
     }
 
     async fn update_pet_party_for_websocket(
@@ -4442,6 +4577,19 @@ mod tests {
         }
     }
 
+    fn empty_pet_collection() -> PlayerPetCollection {
+        PlayerPetCollection {
+            pets: Vec::new(),
+            active_pets: Vec::new(),
+        }
+    }
+
+    fn empty_weapon_collection() -> PlayerWeaponCollection {
+        PlayerWeaponCollection {
+            weapons: Vec::new(),
+        }
+    }
+
     async fn insert_wild_pet(
         service: &WildPetService,
         pet_id: u64,
@@ -4470,6 +4618,80 @@ mod tests {
                 visible_viewers: viewers.iter().copied().collect(),
             },
         );
+    }
+
+    #[test]
+    fn authenticated_players_only_get_starter_loadout_when_both_collections_are_empty() {
+        let starter_pet = starter_guest_pet_collection(PetIdentity {
+            id: "pet-a".to_string(),
+            display_name: "Pet A".to_string(),
+            model_url: None,
+            equipped_weapon: None,
+        });
+        let starter_weapon = starter_guest_weapon_collection(WeaponIdentity {
+            id: "weapon-a".to_string(),
+            kind: "laser".to_string(),
+            display_name: "Weapon A".to_string(),
+            model_url: None,
+        });
+
+        assert!(authenticated_player_needs_starter_loadout(
+            Some(&empty_pet_collection()),
+            true,
+            Some(&empty_weapon_collection()),
+            true,
+        ));
+        assert!(!authenticated_player_needs_starter_loadout(
+            Some(&starter_pet),
+            true,
+            Some(&empty_weapon_collection()),
+            true,
+        ));
+        assert!(!authenticated_player_needs_starter_loadout(
+            Some(&empty_pet_collection()),
+            true,
+            Some(&starter_weapon),
+            true,
+        ));
+        assert!(!authenticated_player_needs_starter_loadout(
+            Some(&empty_pet_collection()),
+            false,
+            Some(&empty_weapon_collection()),
+            true,
+        ));
+    }
+
+    #[tokio::test]
+    async fn login_with_starter_loadout_keeps_the_starter_pet_active() {
+        let player_service = PlayerService::new();
+        let player = player_service
+            .login(
+                "starter".to_string(),
+                None,
+                Some(starter_guest_pet_collection(PetIdentity {
+                    id: "pet-a".to_string(),
+                    display_name: "Pet A".to_string(),
+                    model_url: None,
+                    equipped_weapon: None,
+                })),
+                Some(starter_guest_weapon_collection(WeaponIdentity {
+                    id: "weapon-a".to_string(),
+                    kind: "laser".to_string(),
+                    display_name: "Weapon A".to_string(),
+                    model_url: None,
+                })),
+                WorldPos { x: 0, y: 72, z: 0 },
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(player.captured_pets.len(), 1);
+        assert_eq!(player.collected_weapons.len(), 1);
+        assert_eq!(player.active_pet_models.len(), 1);
+        assert_eq!(player.active_pet_models[0].id, "pet-a");
+        assert!(player.active_pet_models[0].equipped_weapon.is_none());
     }
 
     #[tokio::test]
@@ -4605,7 +4827,14 @@ mod tests {
             }],
             vec![test_pet_identity("pet-a", None)],
         );
-        insert_wild_pet(&wild_pet_service, 10, [4.5, 88.0, 0.5], &[1], WILD_PET_MAX_HEALTH).await;
+        insert_wild_pet(
+            &wild_pet_service,
+            10,
+            [4.5, 88.0, 0.5],
+            &[1],
+            WILD_PET_MAX_HEALTH,
+        )
+        .await;
 
         let outcome = wild_pet_service
             .resolve_pet_weapon_fire(&world, &player, 1, 0, &HashSet::from([1]))
@@ -4629,7 +4858,8 @@ mod tests {
     async fn pet_weapon_fire_only_targets_valid_visible_candidates() {
         let store = Arc::new(InMemoryChunkStore::new(7));
         let world = WorldService::new(7, store);
-        world.apply_block_edit(WorldPos { x: 2, y: 89, z: 0 }, BlockId::Stone)
+        world
+            .apply_block_edit(WorldPos { x: 2, y: 89, z: 0 }, BlockId::Stone)
             .await
             .unwrap();
 
@@ -4642,9 +4872,30 @@ mod tests {
             }],
             vec![test_pet_identity("pet-a", Some("weapon-a"))],
         );
-        insert_wild_pet(&wild_pet_service, 2, [4.5, 88.0, 0.5], &[1], WILD_PET_MAX_HEALTH).await;
-        insert_wild_pet(&wild_pet_service, 3, [4.5, 88.0, 1.5], &[1], WILD_PET_MAX_HEALTH).await;
-        insert_wild_pet(&wild_pet_service, 4, [7.5, 88.0, 0.5], &[1], WILD_PET_MAX_HEALTH).await;
+        insert_wild_pet(
+            &wild_pet_service,
+            2,
+            [4.5, 88.0, 0.5],
+            &[1],
+            WILD_PET_MAX_HEALTH,
+        )
+        .await;
+        insert_wild_pet(
+            &wild_pet_service,
+            3,
+            [4.5, 88.0, 1.5],
+            &[1],
+            WILD_PET_MAX_HEALTH,
+        )
+        .await;
+        insert_wild_pet(
+            &wild_pet_service,
+            4,
+            [7.5, 88.0, 0.5],
+            &[1],
+            WILD_PET_MAX_HEALTH,
+        )
+        .await;
 
         let outcome = wild_pet_service
             .resolve_pet_weapon_fire(&world, &player, 11, 0, &HashSet::from([1]))
@@ -4658,9 +4909,18 @@ mod tests {
         assert_eq!(chosen_target, valid_target);
         assert_ne!(chosen_target, blocked_target);
         let pets = wild_pet_service.pets.lock().await;
-        assert_eq!(pets.get(&2).map(|pet| pet.health), Some(WILD_PET_MAX_HEALTH));
-        assert_eq!(pets.get(&3).map(|pet| pet.health), Some(WILD_PET_MAX_HEALTH - 1));
-        assert_eq!(pets.get(&4).map(|pet| pet.health), Some(WILD_PET_MAX_HEALTH));
+        assert_eq!(
+            pets.get(&2).map(|pet| pet.health),
+            Some(WILD_PET_MAX_HEALTH)
+        );
+        assert_eq!(
+            pets.get(&3).map(|pet| pet.health),
+            Some(WILD_PET_MAX_HEALTH - 1)
+        );
+        assert_eq!(
+            pets.get(&4).map(|pet| pet.health),
+            Some(WILD_PET_MAX_HEALTH)
+        );
     }
 
     #[tokio::test]
@@ -4675,7 +4935,14 @@ mod tests {
             }],
             vec![test_pet_identity("pet-a", Some("weapon-a"))],
         );
-        insert_wild_pet(&wild_pet_service, 20, [4.5, 88.0, 0.5], &[1], WILD_PET_MAX_HEALTH).await;
+        insert_wild_pet(
+            &wild_pet_service,
+            20,
+            [4.5, 88.0, 0.5],
+            &[1],
+            WILD_PET_MAX_HEALTH,
+        )
+        .await;
 
         let first = wild_pet_service
             .resolve_pet_weapon_fire(&world, &player, 1, 0, &HashSet::from([1]))
@@ -4716,8 +4983,14 @@ mod tests {
             }],
             vec![test_pet_identity("pet-a", Some("weapon-a"))],
         );
-        insert_wild_pet(&wild_pet_service, 30, [4.5, 88.0, 0.5], &[1, 2], WILD_PET_MAX_HEALTH)
-            .await;
+        insert_wild_pet(
+            &wild_pet_service,
+            30,
+            [4.5, 88.0, 0.5],
+            &[1, 2],
+            WILD_PET_MAX_HEALTH,
+        )
+        .await;
 
         for shot_index in 0..WILD_PET_MAX_HEALTH {
             let tick = u64::from(shot_index) + 1;
@@ -4812,7 +5085,10 @@ mod tests {
             .await
             .expect("guest auto-capture updates player");
         assert_eq!(
-            updated_player.captured_pets.first().map(|pet| pet.id.as_str()),
+            updated_player
+                .captured_pets
+                .first()
+                .map(|pet| pet.id.as_str()),
             Some("wild-40")
         );
         assert!(

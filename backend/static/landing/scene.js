@@ -92,7 +92,7 @@ class LandingSceneController {
 
   async init() {
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.FogExp2(0x08101a, 0.03);
+    this.scene.fog = new THREE.FogExp2(0x173149, 0.018);
 
     this.camera = new THREE.PerspectiveCamera(38, 1, 0.1, 100);
     this.camera.position.set(0, 6.7, 15.8);
@@ -106,6 +106,8 @@ class LandingSceneController {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO));
     this.renderer.setClearColor(0x000000, 0);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.18;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.container.replaceChildren(this.renderer.domElement);
@@ -143,11 +145,11 @@ class LandingSceneController {
   }
 
   buildEnvironment() {
-    const hemisphere = new THREE.HemisphereLight(0x8cd8ff, 0x0b1018, 1.8);
+    const hemisphere = new THREE.HemisphereLight(0xb2e6ff, 0x1b2634, 2.45);
     this.scene.add(hemisphere);
 
-    const keyLight = new THREE.DirectionalLight(0xfff3d8, 1.7);
-    keyLight.position.set(8, 12, 5);
+    const keyLight = new THREE.DirectionalLight(0xfff4dd, 2.25);
+    keyLight.position.set(8, 13, 6);
     keyLight.castShadow = true;
     keyLight.shadow.mapSize.set(1024, 1024);
     keyLight.shadow.camera.left = -14;
@@ -157,16 +159,20 @@ class LandingSceneController {
     keyLight.shadow.bias = -0.0002;
     this.scene.add(keyLight);
 
-    const rimLight = new THREE.DirectionalLight(0x84d8ff, 0.55);
+    const rimLight = new THREE.DirectionalLight(0x9fe3ff, 0.95);
     rimLight.position.set(-7, 6, -8);
     this.scene.add(rimLight);
+
+    const fillLight = new THREE.DirectionalLight(0xffd5ba, 0.75);
+    fillLight.position.set(-9, 5, 8);
+    this.scene.add(fillLight);
 
     const arenaFloor = new THREE.Mesh(
       new THREE.CircleGeometry(12.4, 80),
       new THREE.MeshStandardMaterial({
-        color: 0x101924,
-        roughness: 0.92,
-        metalness: 0.06,
+        color: 0x1a2a3a,
+        roughness: 0.88,
+        metalness: 0.08,
       }),
     );
     arenaFloor.rotation.x = -Math.PI / 2;
@@ -174,18 +180,18 @@ class LandingSceneController {
     arenaFloor.receiveShadow = true;
     this.scene.add(arenaFloor);
 
-    const arenaGrid = new THREE.GridHelper(22, 22, 0x1d4a66, 0x102739);
+    const arenaGrid = new THREE.GridHelper(22, 22, 0x3c84ae, 0x214760);
     arenaGrid.position.y = 0.01;
-    arenaGrid.material.opacity = 0.34;
+    arenaGrid.material.opacity = 0.48;
     arenaGrid.material.transparent = true;
     this.scene.add(arenaGrid);
 
     const ring = new THREE.Mesh(
       new THREE.RingGeometry(9.3, 9.75, 64),
       new THREE.MeshBasicMaterial({
-        color: 0x84d8ff,
+        color: 0xa8ebff,
         transparent: true,
-        opacity: 0.18,
+        opacity: 0.3,
         side: THREE.DoubleSide,
       }),
     );

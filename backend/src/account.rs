@@ -890,7 +890,7 @@ impl AccountService {
         .context("create session")?;
 
         Ok(OAuthCallbackResult {
-            redirect_url: self.config.public_base_url.clone(),
+            redirect_url: self.post_auth_redirect_url(),
             session_cookie: make_cookie(
                 &self.config.session_cookie.name,
                 &session_id.to_string(),
@@ -899,6 +899,19 @@ impl AccountService {
             ),
             clear_cookies,
         })
+    }
+
+    fn post_auth_redirect_url(&self) -> String {
+        Url::parse(&self.config.public_base_url)
+            .ok()
+            .and_then(|base| base.join("play/").ok())
+            .map(|url| url.to_string())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}/play/",
+                    self.config.public_base_url.trim_end_matches('/')
+                )
+            })
     }
 
     async fn validate_apple_id_token(

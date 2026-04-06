@@ -178,8 +178,6 @@ const REMOTE_AVATAR_RUN_SPEED_THRESHOLD: f32 = 0.15;
 const REMOTE_AVATAR_IDLE_DELAY_SECS: f32 = 0.35;
 const REMOTE_AVATAR_DANCE_DELAY_SECS: f32 = 5.0;
 const AUTH_STATUS_CHECKING: &str = "Checking your sign-in session...";
-const AUTH_STATUS_SIGNED_OUT: &str =
-    "Sign in with Google, Apple, or Microsoft, or continue as a guest for temporary pet captures.";
 
 #[derive(Clone, Debug)]
 struct AuthUser {
@@ -384,6 +382,7 @@ impl Default for RemoteAvatarPlaybackState {
 thread_local! {
     static AUTH_GUEST_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static CHUNK_QUALITY_CYCLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
+    static PERF_PANEL_TOGGLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
     static PET_PARTY_MODAL_OPEN_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static PET_PARTY_MODAL_CLOSE_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static PET_PARTY_SAVE_QUEUE: RefCell<bool> = const { RefCell::new(false) };
@@ -731,7 +730,9 @@ struct WebApp {
     remote_weapon_rx: Receiver<RemoteWeaponEvent>,
     auth_overlay: Element,
     auth_overlay_status: Element,
+    perf_panel_toggle_button: Element,
     perf_panel: Element,
+    perf_panel_visible: bool,
     chunk_quality_button: Element,
     captured_pets_panel: Element,
     weapons_panel: Element,
@@ -755,6 +756,7 @@ struct WebApp {
     workers: Vec<Worker>,
     next_worker_index: usize,
     last_perf_panel_update: Instant,
+    _perf_panel_toggle_onclick: Closure<dyn FnMut(WebEvent)>,
     _worker_onmessages: Vec<Closure<dyn FnMut(MessageEvent)>>,
     _chunk_quality_button_onclick: Closure<dyn FnMut(WebEvent)>,
 }
@@ -795,6 +797,8 @@ impl WebApp {
         let (remote_weapon_tx, remote_weapon_rx) = mpsc::channel();
         let (peer_realtime_tx, peer_realtime_rx) = mpsc::channel();
         let (auth_overlay, auth_overlay_status, auth_button_onclicks) = create_auth_overlay();
+        let (perf_panel_toggle_button, perf_panel_toggle_onclick) =
+            create_perf_panel_toggle_button();
         let perf_panel = create_perf_panel();
         let (chunk_quality_button, chunk_quality_button_onclick) =
             create_chunk_quality_button(chunk_quality_preset);
@@ -926,7 +930,9 @@ impl WebApp {
             remote_weapon_rx,
             auth_overlay,
             auth_overlay_status,
+            perf_panel_toggle_button,
             perf_panel,
+            perf_panel_visible: false,
             chunk_quality_button,
             captured_pets_panel,
             weapons_panel,
@@ -950,6 +956,7 @@ impl WebApp {
             workers,
             next_worker_index: 0,
             last_perf_panel_update: now,
+            _perf_panel_toggle_onclick: perf_panel_toggle_onclick,
             _worker_onmessages: worker_onmessages,
             _chunk_quality_button_onclick: chunk_quality_button_onclick,
         };
@@ -958,6 +965,7 @@ impl WebApp {
         app.update_weapon_collection_panel();
         app.update_pet_party_modal();
         app.update_perf_panel(0, 0);
+        app.sync_perf_panel_visibility();
         app
     }
 
@@ -1047,6 +1055,19 @@ impl WebApp {
         }
     }
 
+    fn process_perf_panel_toggle_requests(&mut self) {
+        let toggle_count = PERF_PANEL_TOGGLE_QUEUE.with(|queue| {
+            let mut value = queue.borrow_mut();
+            let count = *value;
+            *value = 0;
+            count
+        });
+        if toggle_count % 2 == 1 {
+            self.perf_panel_visible = !self.perf_panel_visible;
+            self.sync_perf_panel_visibility();
+        }
+    }
+
     fn update_perf_panel(&mut self, visible_chunks: usize, loaded_chunks: usize) {
         let now = Instant::now();
         if now.duration_since(self.last_perf_panel_update) < PERF_PANEL_UPDATE_INTERVAL {
@@ -1078,6 +1099,33 @@ impl WebApp {
             remote_players = self.remote_players.len(),
             net_queue = self.pending_network_events.len(),
         )));
+    }
+
+    fn sync_perf_panel_visibility(&self) {
+        let _ = self
+            .perf_panel
+            .set_attribute("style", perf_panel_style(self.perf_panel_visible));
+        let label = if self.perf_panel_visible {
+            "Hide performance stats"
+        } else {
+            "Show performance stats"
+        };
+        let _ = self.perf_panel_toggle_button.set_attribute(
+            "style",
+            perf_panel_toggle_button_style(self.perf_panel_visible),
+        );
+        let _ = self.perf_panel_toggle_button.set_attribute("title", label);
+        let _ = self
+            .perf_panel_toggle_button
+            .set_attribute("aria-label", label);
+        let _ = self.perf_panel_toggle_button.set_attribute(
+            "aria-pressed",
+            if self.perf_panel_visible {
+                "true"
+            } else {
+                "false"
+            },
+        );
     }
 
     fn sync_pointer_lock_state(&mut self) {
@@ -2456,6 +2504,9 @@ impl WebApp {
                 let _ = self
                     .auth_overlay
                     .set_attribute("style", auth_overlay_style());
+                let _ = self
+                    .auth_overlay_status
+                    .set_attribute("style", auth_overlay_status_style());
                 self.auth_overlay_status
                     .set_text_content(Some(AUTH_STATUS_CHECKING));
             }
@@ -2463,8 +2514,10 @@ impl WebApp {
                 let _ = self
                     .auth_overlay
                     .set_attribute("style", auth_overlay_style());
-                self.auth_overlay_status
-                    .set_text_content(Some(AUTH_STATUS_SIGNED_OUT));
+                let _ = self
+                    .auth_overlay_status
+                    .set_attribute("style", "display:none;");
+                self.auth_overlay_status.set_text_content(None);
             }
             AuthStatus::SignedIn => {
                 let _ = self.auth_overlay.set_attribute("style", "display:none;");
@@ -2473,51 +2526,21 @@ impl WebApp {
                 let _ = self
                     .auth_overlay
                     .set_attribute("style", auth_overlay_style());
+                let _ = self
+                    .auth_overlay_status
+                    .set_attribute("style", auth_overlay_status_style());
                 self.auth_overlay_status.set_text_content(Some(message));
             }
         }
     }
 
     fn sync_player_avatar_panel(&self) {
-        match &self.auth_status {
-            AuthStatus::SignedIn => {
-                let _ = self
-                    .player_avatar_panel
-                    .set_attribute("style", player_avatar_launcher_style());
-                if self.auth_user.as_ref().is_some_and(auth_user_is_guest) {
-                    self.player_avatar_panel_status.set_text_content(Some(
-                        "Sign in with SSO to save avatar animation uploads.",
-                    ));
-                } else {
-                    if let Some(user) = self.auth_user.as_ref() {
-                        let selection = user.avatar_selection.as_ref();
-                        let uploaded_count = [
-                            selection.and_then(|value| value.idle_model_url.as_ref()),
-                            selection.and_then(|value| value.run_model_url.as_ref()),
-                            selection.and_then(|value| value.dance_model_url.as_ref()),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .count();
-                        let message = if uploaded_count == 0 {
-                            "Choose three GLBs for idle, run, and dance."
-                        } else {
-                            "Avatar animations ready. Upload again to replace any slot."
-                        };
-                        self.player_avatar_panel_status
-                            .set_text_content(Some(message));
-                    }
-                }
-            }
-            _ => {
-                let _ = self
-                    .player_avatar_panel
-                    .set_attribute("style", "display:none;");
-                let _ = self
-                    .player_avatar_modal
-                    .set_attribute("style", "display:none;");
-            }
-        }
+        let _ = self
+            .player_avatar_panel
+            .set_attribute("style", "display:none;");
+        let _ = self
+            .player_avatar_modal
+            .set_attribute("style", "display:none;");
     }
 
     fn sync_logout_button(&self) {
@@ -2773,6 +2796,7 @@ impl WebApp {
     fn tick(&mut self) {
         self.sync_pointer_lock_state();
         self.process_chunk_quality_requests();
+        self.process_perf_panel_toggle_requests();
         self.process_auth_events();
         self.process_pet_party_requests();
         self.drain_network();
@@ -5976,6 +6000,38 @@ fn create_webcam_prompt() -> (Element, Closure<dyn FnMut(WebEvent)>) {
     (prompt, onclick)
 }
 
+fn create_perf_panel_toggle_button() -> (Element, Closure<dyn FnMut(WebEvent)>) {
+    let Some(document) = document() else {
+        let closure =
+            Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        return (fallback_element(), closure);
+    };
+    let Some(body) = document.body() else {
+        let closure =
+            Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        return (fallback_element(), closure);
+    };
+
+    let button = document
+        .create_element("button")
+        .expect("perf panel toggle button");
+    button.set_text_content(Some("FPS"));
+    let _ = button.set_attribute("type", "button");
+    let _ = button.set_attribute("style", perf_panel_toggle_button_style(false));
+    let _ = button.set_attribute("title", "Show performance stats");
+    let _ = button.set_attribute("aria-label", "Show performance stats");
+    let _ = button.set_attribute("aria-pressed", "false");
+    let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        PERF_PANEL_TOGGLE_QUEUE.with(|queue| {
+            let mut pending = queue.borrow_mut();
+            *pending = pending.saturating_add(1);
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = button.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+    let _ = body.append_child(&button);
+    (button, onclick)
+}
+
 fn create_captured_pets_panel() -> Element {
     let Some(document) = document() else {
         return fallback_element();
@@ -6261,12 +6317,25 @@ fn create_perf_panel() -> Element {
     };
 
     let panel = document.create_element("div").expect("perf panel");
-    let _ = panel.set_attribute(
-        "style",
-        "position:fixed;top:14px;right:14px;z-index:45;padding:10px 12px;border-radius:12px;background:rgba(7,10,14,0.74);border:1px solid rgba(255,255,255,0.10);color:rgba(233,239,245,0.92);font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-line;pointer-events:none;backdrop-filter:blur(8px);min-width:170px;",
-    );
+    let _ = panel.set_attribute("style", perf_panel_style(false));
     let _ = body.append_child(&panel);
     panel
+}
+
+fn perf_panel_style(visible: bool) -> &'static str {
+    if visible {
+        "position:fixed;top:72px;right:220px;z-index:45;padding:10px 12px;border-radius:12px;background:rgba(7,10,14,0.74);border:1px solid rgba(255,255,255,0.10);color:rgba(233,239,245,0.92);font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-line;pointer-events:none;backdrop-filter:blur(8px);min-width:170px;"
+    } else {
+        "display:none;"
+    }
+}
+
+fn perf_panel_toggle_button_style(active: bool) -> &'static str {
+    if active {
+        "position:fixed;top:16px;right:220px;width:52px;height:52px;border-radius:16px;border:1px solid rgba(183,230,255,0.34);background:linear-gradient(180deg,rgba(28,54,72,0.94),rgba(18,32,44,0.94));color:#f6f8fb;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:46;backdrop-filter:blur(10px);"
+    } else {
+        "position:fixed;top:16px;right:220px;width:52px;height:52px;border-radius:16px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:46;backdrop-filter:blur(10px);"
+    }
 }
 
 fn create_chunk_quality_button(
@@ -6318,13 +6387,13 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
     let card = document.create_element("div").expect("auth card");
     let _ = card.set_attribute(
         "style",
-        "width:min(92vw,460px);padding:28px;border-radius:24px;background:linear-gradient(180deg,rgba(18,24,32,0.92),rgba(8,12,18,0.96));border:1px solid rgba(255,255,255,0.12);box-shadow:0 30px 90px rgba(0,0,0,0.45);color:#f6f8fb;font-family:ui-sans-serif,system-ui,sans-serif;",
+        "width:min(92vw,460px);padding:28px;border-radius:24px;background:linear-gradient(180deg,rgba(18,24,32,0.92),rgba(8,12,18,0.96));border:1px solid rgba(255,255,255,0.12);box-shadow:0 30px 90px rgba(0,0,0,0.45);color:#f6f8fb;font-family:ui-sans-serif,system-ui,sans-serif;text-align:center;",
     );
 
     let eyebrow = document.create_element("div").expect("auth eyebrow");
     let _ = eyebrow.set_attribute(
         "style",
-        "font-size:11px;letter-spacing:0.22em;text-transform:uppercase;color:rgba(183,230,255,0.72);margin-bottom:10px;",
+        "font-size:11px;letter-spacing:0.22em;text-transform:uppercase;color:rgba(183,230,255,0.72);margin:0 0 10px 0;text-align:center;",
     );
     eyebrow.set_text_content(Some("Augmego Login"));
     let _ = card.append_child(&eyebrow);
@@ -6332,7 +6401,7 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
     let title = document.create_element("h1").expect("auth title");
     let _ = title.set_attribute(
         "style",
-        "margin:0 0 10px 0;font:700 34px/1.05 Georgia,'Times New Roman',serif;",
+        "margin:0 0 10px 0;font:700 34px/1.05 Georgia,'Times New Roman',serif;text-align:center;",
     );
     title.set_text_content(Some("Enter the shared world"));
     let _ = card.append_child(&title);
@@ -6340,7 +6409,7 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
     let body_copy = document.create_element("p").expect("auth body");
     let _ = body_copy.set_attribute(
         "style",
-        "margin:0 0 18px 0;color:rgba(230,237,243,0.78);font-size:15px;line-height:1.5;",
+        "margin:0 0 18px 0;color:rgba(230,237,243,0.78);font-size:15px;line-height:1.5;text-align:center;",
     );
     body_copy.set_text_content(Some(
         "Sign in with Google, Apple, or Microsoft for saved pets and avatars, or continue as a guest to explore and try temporary pet captures.",
@@ -6348,10 +6417,7 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
     let _ = card.append_child(&body_copy);
 
     let status = document.create_element("p").expect("auth status");
-    let _ = status.set_attribute(
-        "style",
-        "margin:0 0 18px 0;color:#f7d794;font-size:14px;line-height:1.4;",
-    );
+    let _ = status.set_attribute("style", auth_overlay_status_style());
     status.set_text_content(Some(AUTH_STATUS_CHECKING));
     let _ = card.append_child(&status);
 
@@ -6403,16 +6469,6 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
 
     let _ = card.append_child(&buttons);
 
-    let footnote = document.create_element("p").expect("auth footnote");
-    let _ = footnote.set_attribute(
-        "style",
-        "margin:18px 0 0 0;color:rgba(230,237,243,0.56);font-size:12px;line-height:1.45;",
-    );
-    footnote.set_text_content(Some(
-        "OAuth callbacks return to this page, then the game continues automatically.",
-    ));
-    let _ = card.append_child(&footnote);
-
     let _ = root.append_child(&card);
     let _ = body.append_child(&root);
     (root, status, onclicks)
@@ -6420,6 +6476,10 @@ fn create_auth_overlay() -> (Element, Element, Vec<Closure<dyn FnMut(WebEvent)>>
 
 fn auth_overlay_style() -> &'static str {
     "position:fixed;inset:0;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at top,rgba(62,118,158,0.24),transparent 45%),rgba(5,8,12,0.72);backdrop-filter:blur(10px);z-index:60;"
+}
+
+fn auth_overlay_status_style() -> &'static str {
+    "margin:0 0 18px 0;color:#f7d794;font-size:14px;line-height:1.4;text-align:center;"
 }
 
 fn player_avatar_launcher_style() -> &'static str {

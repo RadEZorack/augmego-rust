@@ -2342,6 +2342,8 @@ impl VoxelServer {
         Router::new()
             .route("/", get(root_page))
             .route("/learn", get(learn_page))
+            .route("/privacy", get(privacy_page))
+            .route("/terms", get(terms_page))
             .route("/landing/{*path}", get(landing_asset))
             .route("/play", get(play_redirect))
             .route("/play/", get(play_index))
@@ -3624,6 +3626,7 @@ async fn root_page() -> Html<String> {
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Augmego | Collect Pets, Arm Them, Enter The World</title>
+    <link rel="icon" type="image/png" href="/landing/logo.png" />
     <meta
       name="description"
       content="Jump into Augmego as a guest, discover procedurally generated pets and weapons, and keep your best finds when you're ready to sign in."
@@ -3706,8 +3709,8 @@ async fn root_page() -> Html<String> {
         position: absolute;
         inset: 0;
         background:
-          linear-gradient(90deg, rgba(5, 11, 18, 0.78) 0%, rgba(5, 11, 18, 0.46) 30%, rgba(5, 11, 18, 0.28) 55%, rgba(5, 11, 18, 0.66) 100%),
-          radial-gradient(circle at center, rgba(132, 216, 255, 0.10), transparent 44%);
+          linear-gradient(90deg, rgba(5, 11, 18, 0.58) 0%, rgba(5, 11, 18, 0.32) 30%, rgba(5, 11, 18, 0.14) 55%, rgba(5, 11, 18, 0.46) 100%),
+          radial-gradient(circle at center, rgba(132, 216, 255, 0.18), transparent 44%);
         z-index: 2;
         pointer-events: none;
       }
@@ -3742,10 +3745,10 @@ async fn root_page() -> Html<String> {
 
       .nav {
         display: flex;
-        justify-content: space-between;
+        justify-content: center;
         align-items: center;
         gap: 1rem;
-        margin-bottom: clamp(2rem, 5vw, 4rem);
+        margin-bottom: clamp(0.75rem, 1.8vw, 1.4rem);
       }
 
       .brand {
@@ -3760,29 +3763,29 @@ async fn root_page() -> Html<String> {
       }
 
       .brand-mark {
-        width: 2.5rem;
-        height: 2.5rem;
-        border-radius: 1rem;
-        background:
-          linear-gradient(145deg, rgba(255, 215, 107, 0.98), rgba(255, 157, 122, 0.92)),
-          #fff;
-        box-shadow: 0 12px 30px rgba(255, 157, 122, 0.25);
+        width: 2.85rem;
+        height: 2.85rem;
+        object-fit: contain;
+        filter: drop-shadow(0 12px 26px rgba(255, 157, 122, 0.18));
       }
 
       .hero-grid {
         display: grid;
         min-height: calc(100vh - 8rem);
         align-items: center;
+        justify-items: center;
       }
 
       .hero-card {
         width: min(42rem, 100%);
+        margin-inline: auto;
         padding: clamp(1.4rem, 3vw, 2rem);
         border-radius: 2rem;
         background: linear-gradient(180deg, rgba(10, 18, 28, 0.86), rgba(10, 18, 28, 0.62));
         border: 1px solid var(--panel-border);
         box-shadow: 0 24px 90px rgba(0, 0, 0, 0.34);
         backdrop-filter: blur(18px);
+        text-align: center;
       }
 
       .eyebrow {
@@ -3795,13 +3798,33 @@ async fn root_page() -> Html<String> {
 
       h1 {
         margin: 0;
-        font: 700 clamp(3rem, 7vw, 6rem)/0.92 Georgia, "Times New Roman", serif;
+        font: 700 clamp(2.4rem, 5.6vw, 4.7rem)/0.98 Georgia, "Times New Roman", serif;
         letter-spacing: -0.04em;
         text-wrap: balance;
       }
 
+      h1 span {
+        display: block;
+      }
+
+      .headline-divider {
+        display: grid;
+        gap: 0.4rem;
+        width: min(7.5rem, 28%);
+        margin: 0.9rem auto 0.95rem;
+      }
+
+      .headline-divider::before,
+      .headline-divider::after {
+        content: "";
+        display: block;
+        height: 1px;
+        border-radius: 999px;
+        background: linear-gradient(90deg, rgba(132, 216, 255, 0.18), rgba(255, 215, 107, 0.92), rgba(255, 157, 122, 0.18));
+      }
+
       .lede {
-        margin: 1.3rem 0 0;
+        margin: 1.3rem auto 0;
         max-width: 35rem;
         color: var(--muted);
         font: 500 clamp(1.08rem, 2.1vw, 1.22rem)/1.7 "Avenir Next", "Segoe UI", sans-serif;
@@ -3810,6 +3833,7 @@ async fn root_page() -> Html<String> {
       .actions {
         display: flex;
         flex-wrap: wrap;
+        justify-content: center;
         gap: 0.9rem;
         margin: 2rem 0 1rem;
       }
@@ -3846,7 +3870,8 @@ async fn root_page() -> Html<String> {
       }
 
       .supporting {
-        margin: 0;
+        margin: 0 auto;
+        max-width: 28rem;
         color: rgba(245, 246, 243, 0.9);
         font: 600 0.98rem/1.55 "Avenir Next", "Segoe UI", sans-serif;
       }
@@ -3878,6 +3903,27 @@ async fn root_page() -> Html<String> {
         font: 500 0.85rem/1.5 "Avenir Next", "Segoe UI", sans-serif;
       }
 
+      .hero-footer {
+        display: flex;
+        justify-content: center;
+        gap: 1rem;
+        flex-wrap: wrap;
+        margin-top: 1.5rem;
+        padding-top: 1rem;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .hero-footer a {
+        color: rgba(229, 237, 245, 0.82);
+        text-decoration: none;
+        font: 600 0.88rem/1.3 "Avenir Next", "Segoe UI", sans-serif;
+      }
+
+      .hero-footer a:hover,
+      .hero-footer a:focus-visible {
+        color: var(--accent-2);
+      }
+
       .scene-disabled .scene-fallback,
       [data-scene-state="unavailable"] .scene-fallback,
       [data-scene-state="failed"] .scene-fallback {
@@ -3907,7 +3953,7 @@ async fn root_page() -> Html<String> {
 
         .scene-shell::before {
           background:
-            linear-gradient(180deg, rgba(5, 11, 18, 0.55) 0%, rgba(5, 11, 18, 0.35) 28%, rgba(5, 11, 18, 0.72) 100%);
+            linear-gradient(180deg, rgba(5, 11, 18, 0.42) 0%, rgba(5, 11, 18, 0.24) 28%, rgba(5, 11, 18, 0.58) 100%);
         }
       }
 
@@ -3927,14 +3973,20 @@ async fn root_page() -> Html<String> {
       <div class="content">
         <div class="nav">
           <a class="brand" href="/">
-            <span class="brand-mark"></span>
+            <img class="brand-mark" src="/landing/logo.png" alt="Augmego logo" />
             <span>Augmego</span>
           </a>
         </div>
         <section class="hero-grid">
           <div class="hero-card">
-            <p class="eyebrow">Guest-first voxel adventures</p>
-            <h1>Collect strange pets. Arm them. Enter the world in seconds.</h1>
+            <p class="eyebrow">Pet-first voxel adventures</p>
+            <h1>
+              <span>Collect strange pets.</span>
+              <span class="headline-divider" aria-hidden="true"></span>
+              <span>Arm them.</span>
+              <span class="headline-divider" aria-hidden="true"></span>
+              <span>Enter the world in seconds.</span>
+            </h1>
             <p class="lede">
               Augmego is a shared voxel sandbox where you can drop in as a guest,
               discover procedurally generated pets and weapons, and keep the best
@@ -3942,7 +3994,13 @@ async fn root_page() -> Html<String> {
             </p>
             <div class="actions">
               <a class="cta cta-primary" id="landing-primary-cta" href="/play/">Enter The World</a>
-              <a class="cta cta-secondary" id="landing-secondary-cta" href="/learn">Learn More</a>
+              <a
+                class="cta cta-secondary"
+                id="landing-secondary-cta"
+                href="https://discord.gg/qpQfP6XDgP"
+                target="_blank"
+                rel="noreferrer"
+              >Join Discord</a>
             </div>
             <p class="supporting">Play as a guest now. Sign in later to keep pets and avatars.</p>
             <ul class="highlights">
@@ -3959,6 +4017,10 @@ async fn root_page() -> Html<String> {
                 <span>Use Google, Apple, or Microsoft later when you want saved pets, avatars, and parties.</span>
               </li>
             </ul>
+            <div class="hero-footer">
+              <a href="/privacy">Privacy Policy</a>
+              <a href="/terms">Terms of Use</a>
+            </div>
           </div>
         </section>
       </div>
@@ -4061,6 +4123,102 @@ async fn learn_page() -> Html<&'static str> {
       <h1>A shared voxel world with collectible creatures.</h1>
       <p>Players can drop in as guests, sign in with Google, Apple, or Microsoft when they want persistence, upload animated avatars, and collect procedurally generated pets. Signed-in captures stay tied to the account, while guest captures return to the shared pool when the session ends.</p>
       <p><a href="/play/">Launch the game client</a></p>
+    </main>
+  </body>
+</html>"#,
+    )
+}
+
+async fn privacy_page() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Privacy Policy | Augmego</title>
+    <link rel="icon" type="image/png" href="/landing/logo.png" />
+    <style>
+      body { margin: 0; min-height: 100vh; background: linear-gradient(180deg, #142b42, #08111a 72%); color: #f5f6f3; font-family: "Avenir Next", "Segoe UI", sans-serif; }
+      main { width: min(92vw, 760px); margin: 0 auto; padding: 56px 0 72px; }
+      a { color: #84d8ff; text-decoration: none; }
+      .eyebrow { margin-bottom: 14px; color: rgba(132, 216, 255, 0.84); font: 700 12px/1 "Avenir Next", "Segoe UI", sans-serif; letter-spacing: 0.18em; text-transform: uppercase; }
+      h1 { margin: 0 0 18px; font: 700 clamp(2.2rem, 5vw, 3.5rem)/1 Georgia, "Times New Roman", serif; }
+      p { margin: 0 0 16px; color: rgba(229, 237, 245, 0.84); font-size: 17px; line-height: 1.7; }
+      section { margin-top: 28px; padding-top: 24px; border-top: 1px solid rgba(255,255,255,0.08); }
+      h2 { margin: 0 0 12px; font-size: 1.05rem; letter-spacing: 0.04em; text-transform: uppercase; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="eyebrow">Augmego Legal</div>
+      <h1>Privacy Policy</h1>
+      <p>This page explains, at a high level, how Augmego handles account information, gameplay activity, and uploaded assets. It is a basic policy page and can be expanded as the product and compliance needs evolve.</p>
+      <section>
+        <h2>Information We Collect</h2>
+        <p>Augmego may collect information you provide directly, such as sign-in details, display names, avatar uploads, and account-linked profile data. The service may also store gameplay-related data such as captured pets, collected weapons, and saved customization choices.</p>
+      </section>
+      <section>
+        <h2>How We Use It</h2>
+        <p>We use this information to operate the game, save progress for signed-in players, improve reliability, prevent abuse, and understand how the landing page and product experience are being used.</p>
+      </section>
+      <section>
+        <h2>Guest Sessions</h2>
+        <p>Guest play is designed to let you try Augmego quickly. Some guest-session data may be temporary and may not persist after the session ends unless you sign in and save progress through an account-backed flow.</p>
+      </section>
+      <section>
+        <h2>Contact</h2>
+        <p>If you have questions about this policy, please reach out through the community channels linked from the site, including the official Discord.</p>
+      </section>
+      <p><a href="/">Return to Augmego</a></p>
+    </main>
+  </body>
+</html>"#,
+    )
+}
+
+async fn terms_page() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Terms of Use | Augmego</title>
+    <link rel="icon" type="image/png" href="/landing/logo.png" />
+    <style>
+      body { margin: 0; min-height: 100vh; background: linear-gradient(180deg, #142b42, #08111a 72%); color: #f5f6f3; font-family: "Avenir Next", "Segoe UI", sans-serif; }
+      main { width: min(92vw, 760px); margin: 0 auto; padding: 56px 0 72px; }
+      a { color: #84d8ff; text-decoration: none; }
+      .eyebrow { margin-bottom: 14px; color: rgba(132, 216, 255, 0.84); font: 700 12px/1 "Avenir Next", "Segoe UI", sans-serif; letter-spacing: 0.18em; text-transform: uppercase; }
+      h1 { margin: 0 0 18px; font: 700 clamp(2.2rem, 5vw, 3.5rem)/1 Georgia, "Times New Roman", serif; }
+      p { margin: 0 0 16px; color: rgba(229, 237, 245, 0.84); font-size: 17px; line-height: 1.7; }
+      section { margin-top: 28px; padding-top: 24px; border-top: 1px solid rgba(255,255,255,0.08); }
+      h2 { margin: 0 0 12px; font-size: 1.05rem; letter-spacing: 0.04em; text-transform: uppercase; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="eyebrow">Augmego Legal</div>
+      <h1>Terms of Use</h1>
+      <p>These terms are a simple baseline for using Augmego. By accessing the site or game, you agree to use the service responsibly and understand that these terms may be updated as the product grows.</p>
+      <section>
+        <h2>Use of the Service</h2>
+        <p>You may use Augmego for personal, non-abusive play. You agree not to interfere with the service, attempt unauthorized access, or use the game in a way that harms other players or the platform.</p>
+      </section>
+      <section>
+        <h2>Accounts and Content</h2>
+        <p>You are responsible for activity connected to your account and for any content you upload, including avatar assets. Content that is illegal, infringing, malicious, or abusive may be removed.</p>
+      </section>
+      <section>
+        <h2>Availability</h2>
+        <p>Augmego is provided on an evolving basis. Features may change, be interrupted, or be removed, especially while the product is still being actively developed.</p>
+      </section>
+      <section>
+        <h2>Contact</h2>
+        <p>If you have questions about these terms, please use the community links provided on the site, including the official Discord.</p>
+      </section>
+      <p><a href="/">Return to Augmego</a></p>
     </main>
   </body>
 </html>"#,

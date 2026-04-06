@@ -1,24 +1,24 @@
 use crate::auth::verify_game_auth_token;
 use crate::storage::{StorageObject, StorageService};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use flate2::{Compression, write::GzEncoder};
+use flate2::{write::GzEncoder, Compression};
 use gltf::binary::{Glb, Header as GlbHeader};
-use image::{DynamicImage, GenericImageView, ImageFormat, imageops::FilterType};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat};
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use shared_protocol::{CapturedPet, PetIdentity, PetWeaponAssignment};
-use sqlx::{PgPool, Row, postgres::PgRow};
+use sqlx::{postgres::PgRow, PgPool, Row};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::io::Write;
 use std::path::Path;
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
 };
 use std::time::Duration;
 use tokio::time::interval;

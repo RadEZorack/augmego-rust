@@ -2,26 +2,26 @@
 
 use anyhow::Result;
 use glam::{Mat4, Quat, Vec3, Vec4};
-use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
+use shared_math::{ChunkPos, LocalVoxelPos, WorldPos, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH};
 use shared_protocol::{
-    BreakBlockRequest, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
+    decode, encode, BreakBlockRequest, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
     CapturedPetsSnapshot, ClientHello, ClientMessage, ClientWebRtcSignal, CollectedWeapon,
-    CollectedWeaponsSnapshot, InventorySnapshot, LoginRequest, PROTOCOL_VERSION, PeerRealtimeState,
-    PetIdentity, PetStateSnapshot, PetWeaponAssignment, PetWeaponShot,
-    PickupWorldWeaponResult, PlaceBlockRequest, PlayerInputTick, PlayerLeft, ServerMessage,
-    ServerWebRtcSignal, SubscribeChunks, UpdatePetPartyRequest, UpdatePetPartyResult,
-    WeaponIdentity, WebRtcSignalPayload, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload,
-    WorldWeaponSnapshot, WorldWeaponUnload, decode, encode,
+    CollectedWeaponsSnapshot, InventorySnapshot, LoginRequest, PeerRealtimeState, PetIdentity,
+    PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
+    PlaceBlockRequest, PlayerInputTick, PlayerLeft, ServerMessage, ServerWebRtcSignal,
+    SubscribeChunks, UpdatePetPartyRequest, UpdatePetPartyResult, WeaponIdentity,
+    WebRtcSignalPayload, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload,
+    WorldWeaponSnapshot, WorldWeaponUnload, PROTOCOL_VERSION,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
-use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
     BinaryType, CanvasRenderingContext2d, CloseEvent, Document, Element, ErrorEvent,
     Event as WebEvent, FormData, HtmlCanvasElement, HtmlInputElement, HtmlVideoElement,
@@ -32,8 +32,8 @@ use web_sys::{
 };
 use web_time::Instant;
 use wgpu_lite::{
-    AnimatedMesh, AnimatedMeshDraw, AnimatedVertex, DynamicTexture, MAX_SKIN_JOINTS, Mesh,
-    Renderer, TexturedMesh, TexturedMeshDraw, Vertex,
+    AnimatedMesh, AnimatedMeshDraw, AnimatedVertex, DynamicTexture, Mesh, Renderer, TexturedMesh,
+    TexturedMeshDraw, Vertex, MAX_SKIN_JOINTS,
 };
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, WindowEvent};
@@ -113,6 +113,8 @@ const PET_IMPOSTOR_HALF_WIDTH: f32 = 0.24;
 const PET_IMPOSTOR_HALF_HEIGHT: f32 = 0.5;
 const PET_IMPOSTOR_TILE: (u32, u32) = (2, 0);
 const PET_FOLLOWER_COUNT: usize = 6;
+const PET_PARTY_DUPLICATE_WEAPON_MESSAGE: &str =
+    "Each equipped weapon can only be assigned to one pet.";
 const PET_FOLLOW_SPEED: f32 = 5.8;
 const PET_FOLLOW_ACCELERATION: f32 = 18.0;
 const PET_AIR_ACCELERATION: f32 = 8.0;
@@ -688,6 +690,8 @@ struct WebApp {
     collected_weapons: Vec<CollectedWeapon>,
     pet_notice: Option<String>,
     weapon_notice: Option<String>,
+    pending_pet_notice_after_login_snapshot: Option<String>,
+    pending_weapon_notice_after_login_snapshot: Option<String>,
     pet_party_selected_ids: HashSet<String>,
     pet_party_equipped_weapon_ids: HashMap<String, Option<String>>,
     pet_party_save_in_flight: bool,
@@ -881,6 +885,8 @@ impl WebApp {
             collected_weapons: Vec::new(),
             pet_notice: None,
             weapon_notice: None,
+            pending_pet_notice_after_login_snapshot: None,
+            pending_weapon_notice_after_login_snapshot: None,
             pet_party_selected_ids: HashSet::new(),
             pet_party_equipped_weapon_ids: HashMap::new(),
             pet_party_save_in_flight: false,
@@ -1485,6 +1491,28 @@ impl WebApp {
         self.update_weapon_collection_panel();
     }
 
+    fn clear_pending_login_notices(&mut self) {
+        self.pending_pet_notice_after_login_snapshot = None;
+        self.pending_weapon_notice_after_login_snapshot = None;
+    }
+
+    fn queue_login_notices(&mut self, message: String) {
+        self.pending_pet_notice_after_login_snapshot = Some(message.clone());
+        self.pending_weapon_notice_after_login_snapshot = Some(message);
+    }
+
+    fn apply_pending_pet_login_notice(&mut self) {
+        if let Some(message) = self.pending_pet_notice_after_login_snapshot.take() {
+            self.pet_notice = Some(message);
+        }
+    }
+
+    fn apply_pending_weapon_login_notice(&mut self) {
+        if let Some(message) = self.pending_weapon_notice_after_login_snapshot.take() {
+            self.weapon_notice = Some(message);
+        }
+    }
+
     fn sync_pet_party_draft_from_snapshot(&mut self) {
         self.pet_party_selected_ids = self
             .captured_pets
@@ -1547,6 +1575,39 @@ impl WebApp {
                         .and_then(|weapon_id| weapon_id.as_deref());
                     saved_weapon_id != draft_weapon_id
                 })
+    }
+
+    fn pet_party_weapon_is_assigned_to_other_selected_pet(
+        &self,
+        pet_id: &str,
+        weapon_id: &str,
+    ) -> bool {
+        self.captured_pets
+            .iter()
+            .filter(|pet| pet.id != pet_id && self.pet_party_selected_ids.contains(&pet.id))
+            .any(|pet| {
+                self.pet_party_equipped_weapon_ids
+                    .get(&pet.id)
+                    .and_then(|assigned_weapon_id| assigned_weapon_id.as_deref())
+                    == Some(weapon_id)
+            })
+    }
+
+    fn pet_party_duplicate_weapon_message(&self) -> Option<&'static str> {
+        self.captured_pets
+            .iter()
+            .filter(|pet| self.pet_party_selected_ids.contains(&pet.id))
+            .filter_map(|pet| {
+                self.pet_party_equipped_weapon_ids
+                    .get(&pet.id)
+                    .and_then(|weapon_id| weapon_id.as_deref())
+                    .filter(|weapon_id| !weapon_id.trim().is_empty())
+                    .map(|weapon_id| (pet.id.as_str(), weapon_id))
+            })
+            .find_map(|(pet_id, weapon_id)| {
+                self.pet_party_weapon_is_assigned_to_other_selected_pet(pet_id, weapon_id)
+                    .then_some(PET_PARTY_DUPLICATE_WEAPON_MESSAGE)
+            })
     }
 
     fn show_pet_party_modal(&self) {
@@ -1656,6 +1717,7 @@ impl WebApp {
 
     fn update_pet_party_modal(&self) {
         let selected_count = self.pet_party_selected_ids.len();
+        let duplicate_weapon_message = self.pet_party_duplicate_weapon_message();
         let copy = if self.guest_pet_captures_are_temporary() {
             "Choose up to 6 active followers for this guest session, then assign one collected weapon to each active pet if you want. Party choices reset when you leave."
         } else {
@@ -1716,10 +1778,25 @@ impl WebApp {
                                 } else {
                                     ""
                                 };
+                                let duplicate_attr = if self
+                                    .pet_party_weapon_is_assigned_to_other_selected_pet(
+                                        &pet.id,
+                                        &weapon.id,
+                                    ) && selected_weapon_id != Some(weapon.id.as_str())
+                                {
+                                    " disabled"
+                                } else {
+                                    ""
+                                };
+                                let weapon_label = if duplicate_attr.is_empty() {
+                                    weapon.display_name.clone()
+                                } else {
+                                    format!("{} (Assigned)", weapon.display_name)
+                                };
                                 format!(
-                                    "<option value=\"{}\"{selected_attr}>{} [{}]</option>",
+                                    "<option value=\"{}\"{selected_attr}{duplicate_attr}>{} [{}]</option>",
                                     weapon.id,
-                                    weapon.display_name,
+                                    weapon_label,
                                     format_weapon_kind_label(&weapon.kind),
                                 )
                             }))
@@ -1749,16 +1826,17 @@ impl WebApp {
 
         let save_disabled = self.pet_party_save_in_flight
             || !self.can_capture_generated_pets()
-            || !self.pet_party_has_unsaved_changes();
+            || !self.pet_party_has_unsaved_changes()
+            || duplicate_weapon_message.is_some();
         if save_disabled {
             let _ = self.pet_party_save_button.set_attribute("disabled", "true");
         } else {
             let _ = self.pet_party_save_button.remove_attribute("disabled");
         }
         let save_style = if save_disabled {
-            "margin-top:14px;width:100%;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.10);background:rgba(255,255,255,0.06);color:rgba(230,237,243,0.52);font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:not-allowed;"
+            "width:100%;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.10);background:rgba(255,255,255,0.06);color:rgba(230,237,243,0.52);font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:not-allowed;"
         } else {
-            "margin-top:14px;width:100%;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.18);background:linear-gradient(180deg,#f6c665,#e8a93c);color:#1b1206;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;"
+            "width:100%;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,0.18);background:linear-gradient(180deg,#f6c665,#e8a93c);color:#1b1206;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;cursor:pointer;"
         };
         let _ = self
             .pet_party_save_button
@@ -1772,6 +1850,8 @@ impl WebApp {
 
         let default_status = if self.captured_pets.is_empty() {
             "Capture pets to choose which ones follow you."
+        } else if let Some(message) = duplicate_weapon_message {
+            message
         } else if self.pet_party_has_unsaved_changes() {
             "Choose up to 6 pets, assign their weapons, then save your party."
         } else {
@@ -1854,6 +1934,14 @@ impl WebApp {
             if !self.captured_pets.iter().any(|pet| pet.id == pet_id) {
                 continue;
             }
+            if let Some(weapon_id) = weapon_id.as_deref() {
+                if self.pet_party_weapon_is_assigned_to_other_selected_pet(&pet_id, weapon_id) {
+                    self.pet_party_modal_message =
+                        Some(PET_PARTY_DUPLICATE_WEAPON_MESSAGE.to_string());
+                    self.update_pet_party_modal();
+                    continue;
+                }
+            }
             self.pet_party_equipped_weapon_ids.insert(pet_id, weapon_id);
             self.pet_party_modal_message = None;
             self.update_pet_party_modal();
@@ -1871,6 +1959,8 @@ impl WebApp {
                     Some("Sign in or continue as a guest to build a pet party.".to_string());
             } else if self.pet_party_save_in_flight {
                 return;
+            } else if let Some(message) = self.pet_party_duplicate_weapon_message() {
+                self.pet_party_modal_message = Some(message.to_string());
             } else {
                 self.pet_party_save_in_flight = true;
                 self.pet_party_modal_message = Some("Saving pet party...".to_string());
@@ -1888,6 +1978,7 @@ impl WebApp {
     fn reset_pet_party_state(&mut self) {
         self.captured_pets.clear();
         self.pet_notice = None;
+        self.pending_pet_notice_after_login_snapshot = None;
         self.pet_party_selected_ids.clear();
         self.pet_party_equipped_weapon_ids.clear();
         self.pet_party_save_in_flight = false;
@@ -1900,6 +1991,7 @@ impl WebApp {
     fn reset_weapon_collection_state(&mut self) {
         self.collected_weapons.clear();
         self.weapon_notice = None;
+        self.pending_weapon_notice_after_login_snapshot = None;
         self.update_weapon_collection_panel();
     }
 
@@ -1946,6 +2038,7 @@ impl WebApp {
                     self.transport_open = true;
                     self.server_ready_for_login = false;
                     self.login_request_sent = false;
+                    self.clear_pending_login_notices();
                     self.send_client_message(&ClientMessage::ClientHello(ClientHello {
                         protocol_version: PROTOCOL_VERSION,
                         client_name: "game-web".to_string(),
@@ -2043,6 +2136,9 @@ impl WebApp {
                                 self.last_peer_realtime_broadcast_at = None;
                                 self.reset_pet_party_state();
                                 self.reset_weapon_collection_state();
+                                if !response.message.trim().is_empty() {
+                                    self.queue_login_notices(response.message.clone());
+                                }
                                 self.camera.position = Vec3::new(
                                     response.spawn_position.x as f32 + 0.5,
                                     response.spawn_position.y as f32 + PLAYER_EYE_HEIGHT,
@@ -2189,6 +2285,7 @@ impl WebApp {
                         ServerMessage::CapturedPetsSnapshot(CapturedPetsSnapshot { pets }) => {
                             self.captured_pets = pets;
                             self.pet_notice = None;
+                            self.apply_pending_pet_login_notice();
                             self.pet_party_modal_message = None;
                             self.sync_pet_party_draft_from_snapshot();
                             self.pet_followers_need_reset = true;
@@ -2200,6 +2297,7 @@ impl WebApp {
                         }) => {
                             self.collected_weapons = weapons;
                             self.weapon_notice = None;
+                            self.apply_pending_weapon_login_notice();
                             self.update_weapon_collection_panel();
                         }
                         ServerMessage::CaptureWildPetResult(CaptureWildPetResult {
@@ -2294,6 +2392,7 @@ impl WebApp {
                         self.auth_status = AuthStatus::SignedIn;
                         self.pet_notice = None;
                         self.weapon_notice = None;
+                        self.clear_pending_login_notices();
                         self.pet_party_modal_message = None;
                         self.update_captured_pets_panel();
                         self.update_weapon_collection_panel();
@@ -2304,6 +2403,7 @@ impl WebApp {
                         self.auth_status = AuthStatus::SignedOut;
                         self.pet_notice = None;
                         self.weapon_notice = None;
+                        self.clear_pending_login_notices();
                         self.pet_party_modal_message = None;
                         self.hide_pet_party_modal();
                         self.update_captured_pets_panel();
@@ -2315,6 +2415,7 @@ impl WebApp {
                         self.auth_status = AuthStatus::Failed(message);
                         self.pet_notice = None;
                         self.weapon_notice = None;
+                        self.clear_pending_login_notices();
                         self.pet_party_modal_message = None;
                         self.hide_pet_party_modal();
                         self.update_captured_pets_panel();
@@ -2336,6 +2437,7 @@ impl WebApp {
             self.auth_status = AuthStatus::SignedIn;
             self.pet_notice = None;
             self.weapon_notice = None;
+            self.clear_pending_login_notices();
             self.pet_party_modal_message = None;
             self.update_captured_pets_panel();
             self.update_weapon_collection_panel();
@@ -3339,8 +3441,8 @@ impl WebApp {
             return None;
         }
 
-        let (viewport_width, viewport_height) = css_viewport_size()
-            .unwrap_or((self.size.width as f32, self.size.height as f32));
+        let (viewport_width, viewport_height) =
+            css_viewport_size().unwrap_or((self.size.width as f32, self.size.height as f32));
         let x = (ndc.x * 0.5 + 0.5) * viewport_width;
         let y = (1.0 - (ndc.y * 0.5 + 0.5)) * viewport_height;
         Some((x, y))
@@ -3584,8 +3686,7 @@ impl WebApp {
 
     fn build_pet_weapon_shot_mesh(&mut self, renderer: &Renderer<'_>) -> Option<Mesh> {
         let now = Instant::now();
-        self.pet_weapon_shots
-            .retain(|shot| shot.expires_at > now);
+        self.pet_weapon_shots.retain(|shot| shot.expires_at > now);
         if self.pet_weapon_shots.is_empty() {
             return None;
         }
@@ -3595,12 +3696,9 @@ impl WebApp {
         for shot in &self.pet_weapon_shots {
             let progress = normalized_lifetime_progress(shot.started_at, shot.expires_at, now);
             match shot.kind {
-                PetWeaponEffectKind::Laser => add_pet_weapon_laser(
-                    &mut vertices,
-                    &mut indices,
-                    shot.origin,
-                    shot.target,
-                ),
+                PetWeaponEffectKind::Laser => {
+                    add_pet_weapon_laser(&mut vertices, &mut indices, shot.origin, shot.target)
+                }
                 PetWeaponEffectKind::Gun => add_pet_weapon_projectile(
                     &mut vertices,
                     &mut indices,
@@ -5093,11 +5191,7 @@ fn build_weapon_mesh(renderer: &Renderer<'_>, bytes: &[u8]) -> Result<TexturedMe
     build_static_textured_model_mesh(renderer, bytes, WEAPON_MODEL_DESIRED_SIZE, false)
 }
 
-fn pet_model_matrix(
-    pet_feet_position: Vec3,
-    pet_yaw: f32,
-    attack_visual: PetAttackVisual,
-) -> Mat4 {
+fn pet_model_matrix(pet_feet_position: Vec3, pet_yaw: f32, attack_visual: PetAttackVisual) -> Mat4 {
     Mat4::from_translation(pet_feet_position + attack_visual.offset)
         * Mat4::from_rotation_y(pet_yaw)
         * Mat4::from_rotation_z(attack_visual.roll)
@@ -5218,8 +5312,7 @@ fn pet_attack_visual(
             .clamp(0.0, 1.0);
             let sway = (progress * std::f32::consts::TAU * 3.0).sin() * decay;
             PetAttackVisual {
-                offset: forward * (0.14 * lunge)
-                    - forward * (0.035 * (1.0 - lunge) * decay)
+                offset: forward * (0.14 * lunge) - forward * (0.035 * (1.0 - lunge) * decay)
                     + right * (0.02 * sway)
                     + Vec3::Y * (0.032 * pulse),
                 pitch: 0.12 * lunge - 0.04 * (1.0 - lunge) * decay,
@@ -6018,25 +6111,34 @@ fn create_pet_party_modal() -> (Element, Element, Element, Element, Element, Ele
     );
     let _ = card.append_child(&count);
 
-    let list = document.create_element("div").expect("pet party pet list");
-    let _ = list.set_attribute("style", "display:grid;gap:10px;");
-    let _ = card.append_child(&list);
+    let actions = document
+        .create_element("div")
+        .expect("pet party modal actions");
+    let _ = actions.set_attribute(
+        "style",
+        "position:sticky;top:-18px;z-index:2;margin:0 0 14px 0;padding:12px 0 14px 0;background:linear-gradient(180deg,rgba(10,16,24,0.99) 0%,rgba(10,16,24,0.96) 78%,rgba(10,16,24,0.00) 100%);",
+    );
+    let _ = card.append_child(&actions);
 
     let save_button = document
         .create_element("button")
         .expect("pet party save button");
     save_button.set_text_content(Some("Save Party"));
     let _ = save_button.set_attribute("type", "button");
-    let _ = card.append_child(&save_button);
+    let _ = actions.append_child(&save_button);
 
     let status = document
         .create_element("p")
         .expect("pet party modal status");
     let _ = status.set_attribute(
         "style",
-        "margin:12px 0 0 0;color:rgba(230,237,243,0.72);font-size:12px;line-height:1.45;",
+        "margin:8px 0 0 0;color:rgba(230,237,243,0.72);font-size:12px;line-height:1.45;",
     );
-    let _ = card.append_child(&status);
+    let _ = actions.append_child(&status);
+
+    let list = document.create_element("div").expect("pet party pet list");
+    let _ = list.set_attribute("style", "display:grid;gap:10px;");
+    let _ = card.append_child(&list);
 
     let close_onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
         PET_PARTY_MODAL_CLOSE_QUEUE.with(|queue| {
@@ -9086,9 +9188,8 @@ fn add_pet_weapon_sword_throw(
     } else {
         (1.0 - progress) * 2.0
     };
-    let center = origin
-        + delta * out_and_back
-        + axis_y * ((1.0 - (out_and_back * 2.0 - 1.0).abs()) * 0.42);
+    let center =
+        origin + delta * out_and_back + axis_y * ((1.0 - (out_and_back * 2.0 - 1.0).abs()) * 0.42);
     add_box_oriented(
         vertices,
         indices,

@@ -2,18 +2,18 @@ use crate::pet_registry::{
     downscale_glb_embedded_images, maybe_gzip_bytes, parse_uuid, should_retry_with_meshy_6,
 };
 use crate::storage::{StorageObject, StorageService};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use shared_protocol::{CollectedWeapon, WeaponIdentity};
-use sqlx::{PgPool, Row, postgres::PgRow};
+use sqlx::{postgres::PgRow, PgPool, Row};
 use std::path::Path;
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
 };
 use std::time::Duration;
 use tokio::time::interval;

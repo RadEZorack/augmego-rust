@@ -3,20 +3,20 @@ use crate::auth::{SameSitePolicy, SessionCookieConfig};
 use crate::db;
 use crate::persistence::{ChunkStore, ChunkStoreConfig, PostgresValkeyChunkStore};
 use crate::pet_registry::{
-    CapturePetOutcome, PET_ACTIVE_FOLLOWER_LIMIT, PetModelFileResponse, PetPartySelectionError,
-    PetRegistryClient, PetRegistryConfig, PlayerPetCollection, UpdatePetPartyOutcome,
-    validate_active_pet_selection, validate_pet_weapon_assignments,
+    validate_active_pet_selection, validate_pet_weapon_assignments, CapturePetOutcome,
+    PetModelFileResponse, PetPartySelectionError, PetRegistryClient, PetRegistryConfig,
+    PlayerPetCollection, UpdatePetPartyOutcome, PET_ACTIVE_FOLLOWER_LIMIT,
 };
 use crate::storage::{StorageConfig, StorageProvider, StorageService};
 use crate::weapon_registry::{
     CollectWeaponOutcome, GuestCollectWeaponOutcome, PlayerWeaponCollection,
     WeaponModelFileResponse, WeaponRegistryClient, WeaponRegistryConfig,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use axum::body::Body;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Form, Multipart, Path as AxumPath, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -24,18 +24,18 @@ use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use glam::Vec3;
 use reqwest::Url;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use shared_content::block_definitions;
-use shared_math::{CHUNK_HEIGHT, ChunkPos, WorldPos};
+use shared_math::{ChunkPos, WorldPos, CHUNK_HEIGHT};
 use shared_protocol::{
-    BlockActionResult, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
+    decode, encode, BlockActionResult, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
     CapturedPetsSnapshot, ChunkUnload, ClientHello, ClientMessage, CollectedWeapon,
-    CollectedWeaponsSnapshot, InventorySnapshot, InventoryStack, LoginResponse, PROTOCOL_VERSION,
-    PetIdentity, PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
+    CollectedWeaponsSnapshot, InventorySnapshot, InventoryStack, LoginResponse, PetIdentity,
+    PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
     PickupWorldWeaponStatus, PlayerLeft, PlayerStateSnapshot, ServerHello, ServerMessage,
     ServerWebRtcSignal, SubscribeChunks, UpdatePetPartyResult, WeaponIdentity,
     WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, WorldWeaponSnapshot, WorldWeaponUnload,
-    decode, encode,
+    PROTOCOL_VERSION,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
 use std::collections::{HashMap, HashSet};
@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::yield_now;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -370,6 +370,13 @@ enum GuestPetPartyUpdateOutcome {
     InvalidSelection(PetPartySelectionError),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StarterLoadoutSummary {
+    pet_name: Option<String>,
+    weapon_name: Option<String>,
+    auto_equipped_pet_name: Option<String>,
+}
+
 fn weapon_identity_from_collected_weapon(weapon: &CollectedWeapon) -> WeaponIdentity {
     WeaponIdentity {
         id: weapon.id.clone(),
@@ -450,6 +457,57 @@ fn starter_guest_weapon_collection(weapon_identity: WeaponIdentity) -> PlayerWea
             model_url: weapon_identity.model_url,
             collected_at_ms: current_time_millis(),
         }],
+    }
+}
+
+fn auto_equip_first_active_pet_with_first_weapon(
+    pet_collection: &mut PlayerPetCollection,
+    weapon_collection: &PlayerWeaponCollection,
+) -> Option<(String, String)> {
+    let first_weapon = weapon_collection.weapons.first()?;
+    let active_pet = pet_collection.pets.iter_mut().find(|pet| pet.active)?;
+    active_pet.equipped_weapon_id = Some(first_weapon.id.clone());
+
+    if let Some(active_identity) = pet_collection
+        .active_pets
+        .iter_mut()
+        .find(|pet| pet.id == active_pet.id)
+    {
+        active_identity.equipped_weapon = Some(weapon_identity_from_collected_weapon(first_weapon));
+    }
+
+    Some((
+        active_pet.display_name.clone(),
+        first_weapon.display_name.clone(),
+    ))
+}
+
+fn login_welcome_message(
+    player_name: &str,
+    is_guest_session: bool,
+    starter_loadout: &StarterLoadoutSummary,
+) -> String {
+    match (
+        starter_loadout.pet_name.as_deref(),
+        starter_loadout.weapon_name.as_deref(),
+        starter_loadout.auto_equipped_pet_name.as_deref(),
+    ) {
+        (Some(pet_name), Some(weapon_name), Some(_)) if is_guest_session => format!(
+            "Welcome, {player_name}! Your guest starter pet {pet_name} is ready, and {weapon_name} is already equipped for this session."
+        ),
+        (Some(pet_name), Some(weapon_name), Some(_)) => format!(
+            "Welcome, {player_name}! Your starter pet {pet_name} is ready, and {weapon_name} is already equipped."
+        ),
+        (Some(pet_name), Some(weapon_name), None) => format!(
+            "Welcome, {player_name}! Your starter pet {pet_name} and starter weapon {weapon_name} are ready."
+        ),
+        (Some(pet_name), None, _) => {
+            format!("Welcome, {player_name}! Your starter pet {pet_name} is ready.")
+        }
+        (None, Some(weapon_name), _) => format!(
+            "Welcome, {player_name}! Your starter weapon {weapon_name} is ready."
+        ),
+        (None, None, _) => format!("Welcome, {player_name}! Ready to explore?"),
     }
 }
 
@@ -2390,7 +2448,7 @@ impl VoxelServer {
             },
             None => (None, true),
         };
-        let (pet_collection, weapon_collection) = self
+        let (pet_collection, weapon_collection, starter_loadout) = self
             .maybe_assign_starter_loadout(
                 user_id.as_deref(),
                 pet_collection,
@@ -2428,7 +2486,11 @@ impl VoxelServer {
             accepted: true,
             player_id: player.id,
             spawn_position,
-            message: format!("Welcome, {}", player.name),
+            message: login_welcome_message(
+                &player.name,
+                player.user_id.is_none(),
+                &starter_loadout,
+            ),
         }));
         let _ = sender.send(ServerMessage::InventorySnapshot(
             default_inventory_snapshot(),
@@ -2489,9 +2551,14 @@ impl VoxelServer {
         pet_collection_loaded: bool,
         weapon_collection: Option<PlayerWeaponCollection>,
         weapon_collection_loaded: bool,
-    ) -> (Option<PlayerPetCollection>, Option<PlayerWeaponCollection>) {
+    ) -> (
+        Option<PlayerPetCollection>,
+        Option<PlayerWeaponCollection>,
+        StarterLoadoutSummary,
+    ) {
         let mut pet_collection = pet_collection;
         let mut weapon_collection = weapon_collection;
+        let mut starter_loadout = StarterLoadoutSummary::default();
         let starter_eligible = match user_id {
             Some(_) => authenticated_player_needs_starter_loadout(
                 pet_collection.as_ref(),
@@ -2503,13 +2570,17 @@ impl VoxelServer {
         };
 
         if !starter_eligible {
-            return (pet_collection, weapon_collection);
+            return (pet_collection, weapon_collection, starter_loadout);
         }
 
         if let Some(user_id) = user_id {
             if pet_collection_is_empty(pet_collection.as_ref()) {
                 match self.pet_registry.capture_random_pet_for_user(user_id).await {
-                    Ok(Some(collection)) => pet_collection = Some(collection),
+                    Ok(Some(collection)) => {
+                        starter_loadout.pet_name =
+                            collection.pets.first().map(|pet| pet.display_name.clone());
+                        pet_collection = Some(collection);
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         tracing::warn!(?error, %user_id, "failed to grant starter pet");
@@ -2522,19 +2593,48 @@ impl VoxelServer {
                     .collect_random_weapon_for_user(user_id)
                     .await
                 {
-                    Ok(Some(collection)) => weapon_collection = Some(collection),
+                    Ok(Some(collection)) => {
+                        starter_loadout.weapon_name = collection
+                            .weapons
+                            .first()
+                            .map(|weapon| weapon.display_name.clone());
+                        weapon_collection = Some(collection);
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         tracing::warn!(?error, %user_id, "failed to grant starter weapon");
                     }
                 }
             }
-            return (pet_collection, weapon_collection);
+            if let (Some(current_pet_collection), Some(current_weapon_collection)) =
+                (pet_collection.as_mut(), weapon_collection.as_ref())
+            {
+                if let Some((pet_name, weapon_name)) = auto_equip_first_active_pet_with_first_weapon(
+                    current_pet_collection,
+                    current_weapon_collection,
+                ) {
+                    starter_loadout.pet_name.get_or_insert(pet_name.clone());
+                    starter_loadout.weapon_name.get_or_insert(weapon_name);
+                    starter_loadout.auto_equipped_pet_name = Some(pet_name);
+
+                    if let Some(updated_collection) = self
+                        .persist_authenticated_starter_pet_weapon_assignment(
+                            user_id,
+                            current_pet_collection,
+                        )
+                        .await
+                    {
+                        pet_collection = Some(updated_collection);
+                    }
+                }
+            }
+            return (pet_collection, weapon_collection, starter_loadout);
         }
 
         if pet_collection_is_empty(pet_collection.as_ref()) {
             match self.pet_registry.reserve_random_pet().await {
                 Ok(Some(pet_identity)) => {
+                    starter_loadout.pet_name = Some(pet_identity.display_name.clone());
                     pet_collection = Some(starter_guest_pet_collection(pet_identity));
                 }
                 Ok(None) => {}
@@ -2546,6 +2646,7 @@ impl VoxelServer {
         if weapon_collection_is_empty(weapon_collection.as_ref()) {
             match self.weapon_registry.collect_random_weapon_for_guest().await {
                 Ok(Some(weapon_identity)) => {
+                    starter_loadout.weapon_name = Some(weapon_identity.display_name.clone());
                     weapon_collection = Some(starter_guest_weapon_collection(weapon_identity));
                 }
                 Ok(None) => {}
@@ -2555,7 +2656,77 @@ impl VoxelServer {
             }
         }
 
-        (pet_collection, weapon_collection)
+        if let (Some(current_pet_collection), Some(current_weapon_collection)) =
+            (pet_collection.as_mut(), weapon_collection.as_ref())
+        {
+            if let Some((pet_name, weapon_name)) = auto_equip_first_active_pet_with_first_weapon(
+                current_pet_collection,
+                current_weapon_collection,
+            ) {
+                starter_loadout.pet_name.get_or_insert(pet_name.clone());
+                starter_loadout.weapon_name.get_or_insert(weapon_name);
+                starter_loadout.auto_equipped_pet_name = Some(pet_name);
+            }
+        }
+
+        (pet_collection, weapon_collection, starter_loadout)
+    }
+
+    async fn persist_authenticated_starter_pet_weapon_assignment(
+        &self,
+        user_id: &str,
+        pet_collection: &PlayerPetCollection,
+    ) -> Option<PlayerPetCollection> {
+        let active_pet_ids = pet_collection
+            .pets
+            .iter()
+            .filter(|pet| pet.active)
+            .map(|pet| pet.id.clone())
+            .collect::<Vec<_>>();
+        let equipped_weapon_assignments = pet_collection
+            .pets
+            .iter()
+            .filter(|pet| pet.active)
+            .filter_map(|pet| {
+                pet.equipped_weapon_id
+                    .as_ref()
+                    .map(|weapon_id| PetWeaponAssignment {
+                        pet_id: pet.id.clone(),
+                        weapon_id: Some(weapon_id.clone()),
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        match self
+            .pet_registry
+            .update_pet_party(user_id, &active_pet_ids, &equipped_weapon_assignments)
+            .await
+        {
+            Ok(UpdatePetPartyOutcome::Updated(collection)) => Some(collection),
+            Ok(UpdatePetPartyOutcome::TooManySelected) => {
+                tracing::warn!(
+                    %user_id,
+                    "failed to persist starter weapon auto-equip because the pet party exceeded the active limit"
+                );
+                None
+            }
+            Ok(UpdatePetPartyOutcome::InvalidSelection(error)) => {
+                tracing::warn!(
+                    ?error,
+                    %user_id,
+                    "failed to persist starter weapon auto-equip"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    %user_id,
+                    "failed to update starter pet weapon assignment"
+                );
+                None
+            }
+        }
     }
 
     async fn release_guest_pet_captures_for_player(&self, player: &Player) {
@@ -4661,25 +4832,84 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn auto_equip_first_active_pet_assigns_the_first_weapon() {
+        let mut pet_collection = starter_guest_pet_collection(PetIdentity {
+            id: "pet-a".to_string(),
+            display_name: "Pet A".to_string(),
+            model_url: None,
+            equipped_weapon: None,
+        });
+        let weapon_collection = starter_guest_weapon_collection(WeaponIdentity {
+            id: "weapon-a".to_string(),
+            kind: "laser".to_string(),
+            display_name: "Weapon A".to_string(),
+            model_url: None,
+        });
+
+        let equipped =
+            auto_equip_first_active_pet_with_first_weapon(&mut pet_collection, &weapon_collection);
+
+        assert_eq!(
+            equipped,
+            Some(("Pet A".to_string(), "Weapon A".to_string()))
+        );
+        assert_eq!(
+            pet_collection.pets[0].equipped_weapon_id.as_deref(),
+            Some("weapon-a")
+        );
+        assert_eq!(
+            pet_collection.active_pets[0]
+                .equipped_weapon
+                .as_ref()
+                .map(|weapon| weapon.id.as_str()),
+            Some("weapon-a")
+        );
+    }
+
+    #[test]
+    fn login_welcome_message_highlights_auto_equipped_starter_loadout() {
+        let message = login_welcome_message(
+            "Guest 1234",
+            true,
+            &StarterLoadoutSummary {
+                pet_name: Some("Pet A".to_string()),
+                weapon_name: Some("Weapon A".to_string()),
+                auto_equipped_pet_name: Some("Pet A".to_string()),
+            },
+        );
+
+        assert!(message.contains("Pet A"));
+        assert!(message.contains("Weapon A"));
+        assert!(message.contains("already equipped"));
+        assert!(message.contains("guest starter"));
+    }
+
     #[tokio::test]
     async fn login_with_starter_loadout_keeps_the_starter_pet_active() {
         let player_service = PlayerService::new();
+        let mut starter_pet_collection = starter_guest_pet_collection(PetIdentity {
+            id: "pet-a".to_string(),
+            display_name: "Pet A".to_string(),
+            model_url: None,
+            equipped_weapon: None,
+        });
+        let starter_weapon_collection = starter_guest_weapon_collection(WeaponIdentity {
+            id: "weapon-a".to_string(),
+            kind: "laser".to_string(),
+            display_name: "Weapon A".to_string(),
+            model_url: None,
+        });
+        auto_equip_first_active_pet_with_first_weapon(
+            &mut starter_pet_collection,
+            &starter_weapon_collection,
+        );
         let player = player_service
             .login(
                 "starter".to_string(),
                 None,
-                Some(starter_guest_pet_collection(PetIdentity {
-                    id: "pet-a".to_string(),
-                    display_name: "Pet A".to_string(),
-                    model_url: None,
-                    equipped_weapon: None,
-                })),
-                Some(starter_guest_weapon_collection(WeaponIdentity {
-                    id: "weapon-a".to_string(),
-                    kind: "laser".to_string(),
-                    display_name: "Weapon A".to_string(),
-                    model_url: None,
-                })),
+                Some(starter_pet_collection),
+                Some(starter_weapon_collection),
                 WorldPos { x: 0, y: 72, z: 0 },
                 None,
                 None,
@@ -4691,7 +4921,13 @@ mod tests {
         assert_eq!(player.collected_weapons.len(), 1);
         assert_eq!(player.active_pet_models.len(), 1);
         assert_eq!(player.active_pet_models[0].id, "pet-a");
-        assert!(player.active_pet_models[0].equipped_weapon.is_none());
+        assert_eq!(
+            player.active_pet_models[0]
+                .equipped_weapon
+                .as_ref()
+                .map(|weapon| weapon.id.as_str()),
+            Some("weapon-a")
+        );
     }
 
     #[tokio::test]
@@ -5091,12 +5327,10 @@ mod tests {
                 .map(|pet| pet.id.as_str()),
             Some("wild-40")
         );
-        assert!(
-            updated_player
-                .active_pet_models
-                .iter()
-                .any(|pet| pet.id == "wild-40")
-        );
+        assert!(updated_player
+            .active_pet_models
+            .iter()
+            .any(|pet| pet.id == "wild-40"));
     }
 
     #[tokio::test]
@@ -5133,11 +5367,10 @@ mod tests {
             } else {
                 assert_eq!(pet.active_pet_models.len(), PET_ACTIVE_FOLLOWER_LIMIT);
                 assert_eq!(pet.captured_pets.first().map(|pet| pet.active), Some(false));
-                assert!(
-                    !pet.active_pet_models
-                        .iter()
-                        .any(|pet_model| pet_model.id == "pet-6")
-                );
+                assert!(!pet
+                    .active_pet_models
+                    .iter()
+                    .any(|pet_model| pet_model.id == "pet-6"));
             }
         }
     }

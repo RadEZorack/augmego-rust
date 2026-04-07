@@ -3,7 +3,7 @@ use shared_math::{ChunkPos, WorldPos};
 use shared_world::{BlockId, ChunkData, ChunkDelta};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -207,6 +207,13 @@ pub struct CaptureWildPetResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartPetCombatResult {
+    pub pet_id: u64,
+    pub accepted: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PetWeaponAssignment {
     pub pet_id: String,
@@ -313,6 +320,7 @@ pub enum ClientMessage {
     SubscribeChunks(SubscribeChunks),
     PlayerInputTick(PlayerInputTick),
     CaptureWildPetRequest { pet_id: u64 },
+    StartPetCombatRequest { pet_id: u64 },
     PickupWorldWeaponRequest { weapon_id: u64 },
     UpdatePetPartyRequest(UpdatePetPartyRequest),
     PlaceBlockRequest(PlaceBlockRequest),
@@ -338,6 +346,7 @@ pub enum ServerMessage {
     CapturedPetsSnapshot(CapturedPetsSnapshot),
     CollectedWeaponsSnapshot(CollectedWeaponsSnapshot),
     CaptureWildPetResult(CaptureWildPetResult),
+    StartPetCombatResult(StartPetCombatResult),
     PickupWorldWeaponResult(PickupWorldWeaponResult),
     UpdatePetPartyResult(UpdatePetPartyResult),
     InventorySnapshot(InventorySnapshot),
@@ -459,6 +468,35 @@ mod tests {
             ServerMessage::PickupWorldWeaponResult(result) => {
                 assert_eq!(result.weapon_id, 42);
                 assert!(matches!(result.status, PickupWorldWeaponStatus::Collected));
+            }
+            _ => panic!("unexpected server message variant"),
+        }
+    }
+
+    #[test]
+    fn pet_combat_message_round_trip() {
+        let request = ClientMessage::StartPetCombatRequest { pet_id: 42 };
+        let request_bytes = encode(&request).unwrap();
+        let decoded_request: ClientMessage = decode(&request_bytes).unwrap();
+        match decoded_request {
+            ClientMessage::StartPetCombatRequest { pet_id } => {
+                assert_eq!(pet_id, 42);
+            }
+            _ => panic!("unexpected client message variant"),
+        }
+
+        let response = ServerMessage::StartPetCombatResult(StartPetCombatResult {
+            pet_id: 42,
+            accepted: true,
+            message: "Target locked.".to_string(),
+        });
+        let response_bytes = encode(&response).unwrap();
+        let decoded_response: ServerMessage = decode(&response_bytes).unwrap();
+        match decoded_response {
+            ServerMessage::StartPetCombatResult(result) => {
+                assert_eq!(result.pet_id, 42);
+                assert!(result.accepted);
+                assert_eq!(result.message, "Target locked.");
             }
             _ => panic!("unexpected server message variant"),
         }

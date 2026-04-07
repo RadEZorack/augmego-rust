@@ -34,9 +34,9 @@ use shared_protocol::{
     CollectedWeaponsSnapshot, InventorySnapshot, InventoryStack, LoginResponse, PROTOCOL_VERSION,
     PetIdentity, PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
     PickupWorldWeaponStatus, PlayerLeft, PlayerStateSnapshot, ServerHello, ServerMessage,
-    ServerWebRtcSignal, SubscribeChunks, UpdatePetPartyResult, WeaponIdentity,
-    WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, WorldWeaponSnapshot, WorldWeaponUnload,
-    decode, encode,
+    ServerWebRtcSignal, StartPetCombatResult, SubscribeChunks, UpdatePetPartyResult,
+    WeaponIdentity, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, WorldWeaponSnapshot,
+    WorldWeaponUnload, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
 use std::collections::{HashMap, HashSet};
@@ -970,6 +970,7 @@ struct WildPetService {
     next_id: Arc<Mutex<u64>>,
     spawn_nonce: Arc<Mutex<u64>>,
     pet_weapon_cooldowns: Arc<Mutex<HashMap<(u64, String), u64>>>,
+    pet_combat_targets: Arc<Mutex<HashMap<u64, u64>>>,
 }
 
 impl WildPetService {
@@ -979,6 +980,7 @@ impl WildPetService {
             next_id: Arc::new(Mutex::new(1)),
             spawn_nonce: Arc::new(Mutex::new(1)),
             pet_weapon_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            pet_combat_targets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1024,6 +1026,46 @@ impl WildPetService {
             .lock()
             .await
             .retain(|(tracked_player_id, _), _| *tracked_player_id != player_id);
+        self.pet_combat_targets.lock().await.remove(&player_id);
+    }
+
+    async fn start_pet_combat(&self, player: &Player, pet_id: u64) -> StartPetCombatResult {
+        if !player
+            .active_pet_models
+            .iter()
+            .any(|pet| pet.equipped_weapon.is_some())
+        {
+            return StartPetCombatResult {
+                pet_id,
+                accepted: false,
+                message: "Equip a weapon on an active pet to start combat.".to_string(),
+            };
+        }
+
+        let target_exists = self
+            .pets
+            .lock()
+            .await
+            .get(&pet_id)
+            .filter(|pet| !pet.captured && pet.visible_viewers.contains(&player.id))
+            .is_some();
+        if !target_exists {
+            return StartPetCombatResult {
+                pet_id,
+                accepted: false,
+                message: "That enemy is no longer available.".to_string(),
+            };
+        }
+
+        self.pet_combat_targets
+            .lock()
+            .await
+            .insert(player.id, pet_id);
+        StartPetCombatResult {
+            pet_id,
+            accepted: true,
+            message: "Target locked. Your pets will attack when in range.".to_string(),
+        }
     }
 
     async fn forget_captured_pet_identities(&self, pet_identity_ids: &[String]) {
@@ -1156,20 +1198,40 @@ impl WildPetService {
         now_ms: u64,
         connected_player_ids: &HashSet<u64>,
     ) -> Result<PetWeaponCombatOutcome> {
+        let Some(target_pet_id) = self
+            .pet_combat_targets
+            .lock()
+            .await
+            .get(&player.id)
+            .copied()
+        else {
+            return Ok(PetWeaponCombatOutcome::default());
+        };
         if player.pet_states.is_empty() || player.active_pet_models.is_empty() {
             return Ok(PetWeaponCombatOutcome::default());
         }
 
         let mut outcome = PetWeaponCombatOutcome::default();
 
-        for (pet_slot, (pet_state, pet_identity)) in player
+        for (pet_state, pet_identity) in player
             .pet_states
             .iter()
             .zip(player.active_pet_models.iter())
-            .enumerate()
         {
             let Some(weapon_identity) = pet_identity.equipped_weapon.as_ref() else {
                 continue;
+            };
+
+            let Some(target_position) = self
+                .pets
+                .lock()
+                .await
+                .get(&target_pet_id)
+                .filter(|pet| !pet.captured && pet.visible_viewers.contains(&player.id))
+                .map(|pet| pet.position)
+            else {
+                self.pet_combat_targets.lock().await.remove(&player.id);
+                break;
             };
 
             let cooldown_key = (player.id, pet_identity.id.clone());
@@ -1185,60 +1247,35 @@ impl WildPetService {
             }
 
             let origin = pet_weapon_origin(pet_state.position, pet_state.yaw);
-            let mut candidate_pet_ids = {
-                let pets = self.pets.lock().await;
-                pets.values()
-                    .filter(|wild_pet| {
-                        !wild_pet.captured
-                            && wild_pet.visible_viewers.contains(&player.id)
-                            && pet_distance_squared(wild_pet.position, pet_state.position)
-                                <= PET_WEAPON_RANGE * PET_WEAPON_RANGE
-                    })
-                    .map(|wild_pet| wild_pet.id)
-                    .collect::<Vec<_>>()
-            };
-            candidate_pet_ids.sort_unstable();
-
-            let mut eligible_candidates = Vec::new();
-            for candidate_pet_id in candidate_pet_ids {
-                let Some(candidate_position) = self
-                    .pets
-                    .lock()
-                    .await
-                    .get(&candidate_pet_id)
-                    .filter(|candidate_pet| !candidate_pet.captured)
-                    .map(|candidate_pet| candidate_pet.position)
-                else {
-                    continue;
-                };
-                let target = pet_weapon_target(candidate_position);
-                if !world_service
-                    .segment_has_line_of_sight(origin, target)
-                    .await?
-                {
-                    continue;
-                }
-                eligible_candidates.push(candidate_pet_id);
-            }
-
-            if eligible_candidates.is_empty() {
-                continue;
-            }
-
-            let choice_seed = tick
-                ^ player.id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                ^ ((pet_slot as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03));
-            let chosen_index = deterministic_choice_index(eligible_candidates.len(), choice_seed);
-            let chosen_pet_id = eligible_candidates[chosen_index];
-            let mut pets = self.pets.lock().await;
-            let Some(chosen_pet) = pets.get_mut(&chosen_pet_id) else {
-                continue;
-            };
-            if chosen_pet.captured
-                || !chosen_pet.visible_viewers.contains(&player.id)
-                || pet_distance_squared(chosen_pet.position, pet_state.position)
-                    > PET_WEAPON_RANGE * PET_WEAPON_RANGE
+            if pet_distance_squared(target_position, pet_state.position)
+                > PET_WEAPON_RANGE * PET_WEAPON_RANGE
             {
+                continue;
+            }
+
+            let target = pet_weapon_target(target_position);
+            if !world_service
+                .segment_has_line_of_sight(origin, target)
+                .await?
+            {
+                continue;
+            }
+
+            let mut pets = self.pets.lock().await;
+            let Some(chosen_pet) = pets.get_mut(&target_pet_id) else {
+                drop(pets);
+                self.pet_combat_targets.lock().await.remove(&player.id);
+                break;
+            };
+            if chosen_pet.captured || !chosen_pet.visible_viewers.contains(&player.id) {
+                drop(pets);
+                self.pet_combat_targets.lock().await.remove(&player.id);
+                break;
+            }
+            if pet_distance_squared(chosen_pet.position, pet_state.position)
+                > PET_WEAPON_RANGE * PET_WEAPON_RANGE
+            {
+                drop(pets);
                 continue;
             }
 
@@ -1279,6 +1316,7 @@ impl WildPetService {
                 .insert(cooldown_key, now_ms.saturating_add(PET_WEAPON_COOLDOWN_MS));
 
             if let Some(completed_capture) = completed_capture {
+                self.pet_combat_targets.lock().await.remove(&player.id);
                 outcome.completed_captures.push(completed_capture);
             }
         }
@@ -2920,6 +2958,10 @@ impl VoxelServer {
                 self.capture_wild_pet_for_websocket(player_id, sender, pet_id)
                     .await?;
             }
+            ClientMessage::StartPetCombatRequest { pet_id } => {
+                self.start_pet_combat_for_websocket(player_id, sender, pet_id)
+                    .await?;
+            }
             ClientMessage::PickupWorldWeaponRequest { weapon_id } => {
                 self.pickup_world_weapon_for_websocket(player_id, sender, weapon_id)
                     .await?;
@@ -3242,6 +3284,23 @@ impl VoxelServer {
 
         self.finalize_wild_pet_capture(player_id, sender, capture)
             .await
+    }
+
+    async fn start_pet_combat_for_websocket(
+        &self,
+        player_id: u64,
+        sender: &mpsc::UnboundedSender<ServerMessage>,
+        pet_id: u64,
+    ) -> Result<()> {
+        let Some(player) = self.player_service.player(player_id).await else {
+            return Ok(());
+        };
+        let result = self
+            .wild_pet_service
+            .start_pet_combat(&player, pet_id)
+            .await;
+        let _ = sender.send(ServerMessage::StartPetCombatResult(result));
+        Ok(())
     }
 
     async fn update_pet_party_for_websocket(
@@ -5273,14 +5332,6 @@ fn pet_weapon_target(target_position: [f32; 3]) -> [f32; 3] {
     (Vec3::from_array(target_position) + Vec3::Y * PET_WEAPON_TARGET_HEIGHT).to_array()
 }
 
-fn deterministic_choice_index(candidate_count: usize, seed: u64) -> usize {
-    if candidate_count <= 1 {
-        return 0;
-    }
-    let index = (pseudo_unit(seed) * candidate_count as f32).floor() as usize;
-    index.min(candidate_count - 1)
-}
-
 fn reconcile_pet_visibility(
     pet: &mut WildPet,
     players: &[Player],
@@ -6005,6 +6056,8 @@ mod tests {
             WILD_PET_MAX_HEALTH,
         )
         .await;
+        let start = wild_pet_service.start_pet_combat(&player, 10).await;
+        assert!(!start.accepted);
 
         let outcome = wild_pet_service
             .resolve_pet_weapon_fire(&world, &player, 1, 0, &HashSet::from([1]))
@@ -6025,7 +6078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pet_weapon_fire_only_targets_valid_visible_candidates() {
+    async fn pet_weapon_fire_only_attacks_the_selected_target() {
         let store = Arc::new(InMemoryChunkStore::new(7));
         let world = WorldService::new(7, store);
         world
@@ -6066,6 +6119,8 @@ mod tests {
             WILD_PET_MAX_HEALTH,
         )
         .await;
+        let start = wild_pet_service.start_pet_combat(&player, 3).await;
+        assert!(start.accepted);
 
         let outcome = wild_pet_service
             .resolve_pet_weapon_fire(&world, &player, 11, 0, &HashSet::from([1]))
@@ -6074,10 +6129,8 @@ mod tests {
 
         assert_eq!(outcome.shot_dispatches.len(), 1);
         let chosen_target = outcome.shot_dispatches[0].shot.target;
-        let blocked_target = pet_weapon_target([4.5, 88.0, 0.5]);
         let valid_target = pet_weapon_target([4.5, 88.0, 1.5]);
         assert_eq!(chosen_target, valid_target);
-        assert_ne!(chosen_target, blocked_target);
         let pets = wild_pet_service.pets.lock().await;
         assert_eq!(
             pets.get(&2).map(|pet| pet.health),
@@ -6090,6 +6143,71 @@ mod tests {
         assert_eq!(
             pets.get(&4).map(|pet| pet.health),
             Some(WILD_PET_MAX_HEALTH)
+        );
+    }
+
+    #[tokio::test]
+    async fn pet_weapon_fire_does_not_retarget_when_the_selected_enemy_is_blocked() {
+        let store = Arc::new(InMemoryChunkStore::new(7));
+        let world = WorldService::new(7, store);
+        world
+            .apply_block_edit(WorldPos { x: 2, y: 89, z: 0 }, BlockId::Stone)
+            .await
+            .unwrap();
+
+        let wild_pet_service = WildPetService::new();
+        let player = test_player(
+            1,
+            vec![PetStateSnapshot {
+                position: [0.5, 88.0, 0.5],
+                yaw: 0.0,
+            }],
+            vec![test_pet_identity("pet-a", Some("weapon-a"))],
+        );
+        insert_wild_pet(
+            &wild_pet_service,
+            2,
+            [4.5, 88.0, 0.5],
+            &[1],
+            WILD_PET_MAX_HEALTH,
+        )
+        .await;
+        insert_wild_pet(
+            &wild_pet_service,
+            3,
+            [4.5, 88.0, 1.5],
+            &[1],
+            WILD_PET_MAX_HEALTH,
+        )
+        .await;
+
+        let start = wild_pet_service.start_pet_combat(&player, 2).await;
+        assert!(start.accepted);
+
+        let outcome = wild_pet_service
+            .resolve_pet_weapon_fire(&world, &player, 11, 0, &HashSet::from([1]))
+            .await
+            .unwrap();
+
+        assert!(outcome.shot_dispatches.is_empty());
+        let pets = wild_pet_service.pets.lock().await;
+        assert_eq!(
+            pets.get(&2).map(|pet| pet.health),
+            Some(WILD_PET_MAX_HEALTH)
+        );
+        assert_eq!(
+            pets.get(&3).map(|pet| pet.health),
+            Some(WILD_PET_MAX_HEALTH)
+        );
+        drop(pets);
+        assert_eq!(
+            wild_pet_service
+                .pet_combat_targets
+                .lock()
+                .await
+                .get(&player.id)
+                .copied(),
+            Some(2)
         );
     }
 
@@ -6113,6 +6231,8 @@ mod tests {
             WILD_PET_MAX_HEALTH,
         )
         .await;
+        let start = wild_pet_service.start_pet_combat(&player, 20).await;
+        assert!(start.accepted);
 
         let first = wild_pet_service
             .resolve_pet_weapon_fire(&world, &player, 1, 0, &HashSet::from([1]))
@@ -6161,6 +6281,8 @@ mod tests {
             WILD_PET_MAX_HEALTH,
         )
         .await;
+        let start = wild_pet_service.start_pet_combat(&player, 30).await;
+        assert!(start.accepted);
 
         for shot_index in 0..WILD_PET_MAX_HEALTH {
             let tick = u64::from(shot_index) + 1;
@@ -6187,6 +6309,15 @@ mod tests {
         assert!(captured_pet.captured);
         assert!(captured_pet.visible_viewers.is_empty());
         assert!(post_capture.shot_dispatches.is_empty());
+        drop(pets);
+        assert!(
+            wild_pet_service
+                .pet_combat_targets
+                .lock()
+                .await
+                .get(&player.id)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -6240,6 +6371,8 @@ mod tests {
         }];
 
         insert_wild_pet(&wild_pet_service, 40, [4.5, 88.0, 0.5], &[player.id], 1).await;
+        let start = wild_pet_service.start_pet_combat(&player, 40).await;
+        assert!(start.accepted);
 
         let outcome = wild_pet_service
             .resolve_pet_weapon_fire(&world, &player, 1, 0, &HashSet::from([player.id]))

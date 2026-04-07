@@ -36,7 +36,9 @@ use wgpu_lite::{
     Renderer, TexturedMesh, TexturedMeshDraw, Vertex,
 };
 use winit::dpi::PhysicalSize;
-use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{
+    DeviceEvent, ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::web::WindowExtWebSys;
@@ -89,6 +91,17 @@ const CROSSHAIR_DISTANCE: f32 = 0.6;
 const CROSSHAIR_LENGTH: f32 = 0.035;
 const CROSSHAIR_THICKNESS: f32 = 0.004;
 const TARGET_OUTLINE_THICKNESS: f32 = 0.035;
+const THIRD_PERSON_ENTRY_ZOOM: f32 = 3.25;
+const THIRD_PERSON_SCROLL_STEP: f32 = 0.75;
+const THIRD_PERSON_MAX_ZOOM: f32 = 6.0;
+const THIRD_PERSON_MIN_ACTIVE_ZOOM: f32 = 0.6;
+const THIRD_PERSON_ZOOM_SPEED: f32 = 16.0;
+const THIRD_PERSON_CAMERA_COLLISION_STEP: f32 = 0.1;
+const THIRD_PERSON_CAMERA_CLEARANCE: f32 = 0.15;
+const THIRD_PERSON_SHOULDER_RIGHT_OFFSET: f32 = 0.45;
+const THIRD_PERSON_SHOULDER_UP_OFFSET: f32 = 0.2;
+const LOCAL_AVATAR_TURN_SPEED: f32 = 10.0;
+const LOCAL_AVATAR_PLACEHOLDER_TINT: [f32; 3] = [0.82, 0.73, 0.44];
 const LINK_PANEL_OPEN_URL: &str = "https://www.google.com";
 const LINK_PANEL_LABEL_URL: &str = "google.com";
 const LINK_PANEL_HALF_WIDTH: f32 = 1.2;
@@ -379,6 +392,46 @@ impl Default for RemoteAvatarPlaybackState {
     }
 }
 
+#[derive(Clone, Debug)]
+struct LocalAvatarPlaybackState {
+    animation: RemoteAvatarAnimation,
+    playback_time: f32,
+    active_url: Option<String>,
+}
+
+impl Default for LocalAvatarPlaybackState {
+    fn default() -> Self {
+        Self {
+            animation: RemoteAvatarAnimation::Idle,
+            playback_time: 0.0,
+            active_url: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ThirdPersonCameraState {
+    current_zoom: f32,
+    target_zoom: f32,
+    shoulder_offset: Vec3,
+    render_eye: Vec3,
+}
+
+impl Default for ThirdPersonCameraState {
+    fn default() -> Self {
+        Self {
+            current_zoom: 0.0,
+            target_zoom: 0.0,
+            shoulder_offset: Vec3::new(
+                THIRD_PERSON_SHOULDER_RIGHT_OFFSET,
+                THIRD_PERSON_SHOULDER_UP_OFFSET,
+                0.0,
+            ),
+            render_eye: Vec3::ZERO,
+        }
+    }
+}
+
 thread_local! {
     static AUTH_GUEST_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static CHUNK_QUALITY_CYCLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
@@ -534,6 +587,7 @@ async fn run() -> Result<()> {
                     renderer.resize(app.scaled_render_size());
                 }
                 WindowEvent::KeyboardInput { event, .. } => app.handle_key(event),
+                WindowEvent::MouseWheel { delta, .. } => app.handle_mouse_wheel(delta),
                 WindowEvent::MouseInput {
                     state: ElementState::Pressed,
                     button,
@@ -574,6 +628,11 @@ async fn run() -> Result<()> {
                     if let Some(mesh) = &remote_media_placeholder_mesh {
                         visible_mesh_refs.push(mesh);
                     }
+                    let local_avatar_placeholder_mesh =
+                        app.build_local_avatar_placeholder_mesh(&renderer);
+                    if let Some(mesh) = &local_avatar_placeholder_mesh {
+                        visible_mesh_refs.push(mesh);
+                    }
                     app.prepare_pet_assets(&renderer);
                     app.prepare_weapon_assets(&renderer);
                     app.refresh_pet_impostor_mesh(&renderer);
@@ -592,7 +651,10 @@ async fn run() -> Result<()> {
                     let textured_mesh_refs = textured_meshes.iter().collect::<Vec<_>>();
                     let mut pet_mesh_draws = app.build_pet_mesh_draws(&renderer);
                     pet_mesh_draws.extend(app.build_weapon_mesh_draws(&renderer));
-                    let remote_avatar_meshes = app.build_remote_avatar_meshes(&renderer);
+                    let mut remote_avatar_meshes = app.build_remote_avatar_meshes(&renderer);
+                    if let Some(draw) = app.build_local_avatar_mesh_draw(&renderer) {
+                        remote_avatar_meshes.push(draw);
+                    }
                     let overlay_refs = overlay_meshes.iter().collect::<Vec<_>>();
                     if let Some(mesh) = app.pet_impostor_mesh.as_ref() {
                         visible_mesh_refs.push(mesh);
@@ -629,6 +691,9 @@ async fn run() -> Result<()> {
 struct WebApp {
     canvas: HtmlCanvasElement,
     camera: Camera,
+    third_person: ThirdPersonCameraState,
+    avatar_yaw: f32,
+    local_avatar_state: LocalAvatarPlaybackState,
     authoritative_chunks: HashMap<ChunkPos, ChunkData>,
     collision_voxels: HashMap<ChunkPos, Vec<u16>>,
     pressed: HashSet<KeyCode>,
@@ -825,10 +890,17 @@ impl WebApp {
         let desired_chunks = HashSet::new();
         let pending_generation = VecDeque::new();
         let last_reprioritize_forward = camera.forward();
+        let mut third_person = ThirdPersonCameraState::default();
+        third_person.current_zoom = THIRD_PERSON_MAX_ZOOM;
+        third_person.target_zoom = THIRD_PERSON_MAX_ZOOM;
+        third_person.render_eye = camera.position;
 
         let mut app = Self {
             canvas,
             camera,
+            third_person,
+            avatar_yaw: 0.0,
+            local_avatar_state: LocalAvatarPlaybackState::default(),
             authoritative_chunks: HashMap::new(),
             collision_voxels: HashMap::new(),
             pressed: HashSet::new(),
@@ -960,6 +1032,7 @@ impl WebApp {
             _worker_onmessages: worker_onmessages,
             _chunk_quality_button_onclick: chunk_quality_button_onclick,
         };
+        app.avatar_yaw = app.camera.yaw;
         app.update_chunk_quality_button();
         app.update_captured_pets_panel();
         app.update_weapon_collection_panel();
@@ -1137,6 +1210,19 @@ impl WebApp {
         );
     }
 
+    fn is_third_person_active(&self) -> bool {
+        self.third_person.target_zoom >= THIRD_PERSON_MIN_ACTIVE_ZOOM
+    }
+
+    fn should_render_local_avatar(&self) -> bool {
+        self.is_third_person_active()
+            || self.third_person.current_zoom >= THIRD_PERSON_MIN_ACTIVE_ZOOM
+    }
+
+    fn is_precision_interaction_mode(&self) -> bool {
+        !self.is_third_person_active()
+    }
+
     fn handle_key(&mut self, event: KeyEvent) {
         let code = match event.physical_key {
             PhysicalKey::Code(code) => code,
@@ -1200,6 +1286,28 @@ impl WebApp {
         self.camera.pitch = (self.camera.pitch - dy * 0.0025).clamp(-1.45, 1.45);
     }
 
+    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        let normalized = normalize_scroll_delta(delta);
+        if normalized.abs() <= f32::EPSILON {
+            return;
+        }
+
+        if normalized < 0.0 && self.third_person.target_zoom < THIRD_PERSON_MIN_ACTIVE_ZOOM {
+            self.third_person.target_zoom = THIRD_PERSON_ENTRY_ZOOM;
+            return;
+        }
+
+        let next_zoom = (self.third_person.target_zoom - normalized * THIRD_PERSON_SCROLL_STEP)
+            .clamp(0.0, THIRD_PERSON_MAX_ZOOM);
+        if next_zoom < THIRD_PERSON_MIN_ACTIVE_ZOOM {
+            self.third_person.current_zoom = 0.0;
+            self.third_person.target_zoom = 0.0;
+            self.third_person.render_eye = self.camera.position;
+        } else {
+            self.third_person.target_zoom = next_zoom;
+        }
+    }
+
     fn handle_mouse_button(&mut self, button: MouseButton) {
         if !self.mouse_captured {
             self.canvas.request_pointer_lock();
@@ -1208,6 +1316,10 @@ impl WebApp {
         }
 
         if !self.logged_in {
+            return;
+        }
+
+        if !self.is_precision_interaction_mode() {
             return;
         }
 
@@ -2793,6 +2905,153 @@ impl WebApp {
         delta.length_squared() <= PEER_REALTIME_RADIUS * PEER_REALTIME_RADIUS
     }
 
+    fn local_avatar_selection(&self) -> Option<&PlayerAvatarSelection> {
+        self.auth_user
+            .as_ref()
+            .and_then(|user| user.avatar_selection.as_ref())
+    }
+
+    fn ensure_local_avatar_assets_requested(&mut self) {
+        let selection = self.local_avatar_selection().cloned();
+        if let Some(selection) = selection.as_ref() {
+            self.ensure_remote_avatar_selection_requested(selection);
+        }
+    }
+
+    fn update_local_avatar_playback(
+        &mut self,
+        dt_secs: f32,
+        desired_movement: Vec3,
+        actual_velocity: Vec3,
+    ) {
+        if !self.is_third_person_active() {
+            self.avatar_yaw = self.camera.yaw;
+        } else {
+            let mut desired_facing = Vec3::new(actual_velocity.x, 0.0, actual_velocity.z);
+            if desired_facing.length_squared() <= 0.0001 {
+                desired_facing = Vec3::new(desired_movement.x, 0.0, desired_movement.z);
+            }
+            if desired_facing.length_squared() > 0.0001 {
+                let target_yaw = desired_facing.x.atan2(desired_facing.z);
+                self.avatar_yaw = rotate_angle_towards(
+                    self.avatar_yaw,
+                    target_yaw,
+                    LOCAL_AVATAR_TURN_SPEED * dt_secs.max(0.0),
+                );
+            }
+        }
+
+        let moving = self.movement_active
+            || Vec3::new(actual_velocity.x, 0.0, actual_velocity.z).length_squared() > 0.01;
+        let selection = self.local_avatar_selection().cloned().unwrap_or_default();
+        let desired_animation = if moving {
+            RemoteAvatarAnimation::Run
+        } else {
+            RemoteAvatarAnimation::Idle
+        };
+        let active_url = selection
+            .url_for_animation(desired_animation)
+            .or_else(|| selection.first_available_url())
+            .map(str::to_owned);
+
+        if self.local_avatar_state.animation != desired_animation
+            || self.local_avatar_state.active_url != active_url
+        {
+            self.local_avatar_state.animation = desired_animation;
+            self.local_avatar_state.active_url = active_url.clone();
+            self.local_avatar_state.playback_time = 0.0;
+        }
+
+        let maybe_duration = active_url
+            .as_deref()
+            .and_then(|url| self.remote_avatar_assets.get(url))
+            .map(|asset| asset.animation.duration_seconds);
+        if let Some(duration) = maybe_duration.filter(|duration| *duration > 0.0) {
+            self.local_avatar_state.playback_time =
+                (self.local_avatar_state.playback_time + dt_secs) % duration;
+        }
+    }
+
+    fn update_camera_view(&mut self, dt_secs: f32) {
+        if !self.is_third_person_active() {
+            self.third_person.current_zoom = 0.0;
+            self.third_person.render_eye = self.camera.position;
+            return;
+        }
+
+        self.third_person.current_zoom = move_towards_scalar(
+            self.third_person.current_zoom,
+            self.third_person.target_zoom,
+            THIRD_PERSON_ZOOM_SPEED * dt_secs.max(0.0),
+        );
+
+        if self.third_person.current_zoom < THIRD_PERSON_MIN_ACTIVE_ZOOM {
+            self.third_person.render_eye = self.camera.position;
+            return;
+        }
+
+        let pivot = self.render_camera_pivot();
+        let desired_eye = pivot - self.camera.forward() * self.third_person.current_zoom;
+        let travel = desired_eye - pivot;
+        let distance = travel.length();
+        let mut last_clear = if self.point_collides_with_world(pivot, THIRD_PERSON_CAMERA_CLEARANCE)
+        {
+            self.camera.position
+        } else {
+            pivot
+        };
+
+        if distance <= f32::EPSILON {
+            self.third_person.render_eye = last_clear;
+            return;
+        }
+
+        let direction = travel / distance;
+        let steps = (distance / THIRD_PERSON_CAMERA_COLLISION_STEP)
+            .ceil()
+            .max(1.0) as usize;
+        for step_index in 1..=steps {
+            let step_distance =
+                (step_index as f32 * THIRD_PERSON_CAMERA_COLLISION_STEP).min(distance);
+            let candidate = pivot + direction * step_distance;
+            if self.point_collides_with_world(candidate, THIRD_PERSON_CAMERA_CLEARANCE) {
+                break;
+            }
+            last_clear = candidate;
+        }
+
+        self.third_person.render_eye = last_clear;
+    }
+
+    fn render_camera_eye(&self) -> Vec3 {
+        if self.is_third_person_active() {
+            self.third_person.render_eye
+        } else {
+            self.camera.position
+        }
+    }
+
+    fn render_camera_pivot(&self) -> Vec3 {
+        let (_, right) = horizontal_basis_from_yaw(self.camera.yaw);
+        self.camera.position
+            + right * self.third_person.shoulder_offset.x
+            + Vec3::Y * self.third_person.shoulder_offset.y
+    }
+
+    fn local_avatar_active_url(&self) -> Option<&str> {
+        self.local_avatar_state.active_url.as_deref()
+    }
+
+    fn local_avatar_asset_ready(&self) -> bool {
+        self.local_avatar_active_url()
+            .or_else(|| {
+                self.local_avatar_selection()
+                    .and_then(|selection| selection.first_available_url())
+            })
+            .and_then(|url| self.remote_avatar_assets.get(url))
+            .is_some()
+    }
+
     fn tick(&mut self) {
         self.sync_pointer_lock_state();
         self.process_chunk_quality_requests();
@@ -2801,6 +3060,7 @@ impl WebApp {
         self.process_pet_party_requests();
         self.drain_network();
         self.process_peer_realtime_events();
+        self.ensure_local_avatar_assets_requested();
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
@@ -2831,6 +3091,8 @@ impl WebApp {
             if self.ensure_clear_spawn_space() {
                 self.spawn_settled = true;
             } else {
+                self.update_local_avatar_playback(dt_secs, Vec3::ZERO, Vec3::ZERO);
+                self.update_camera_view(dt_secs);
                 return;
             }
         }
@@ -2846,19 +3108,21 @@ impl WebApp {
 
         let previous_position = self.camera.position;
         self.update_camera_physics(dt, movement, jump, sprint);
-        if self.logged_in {
-            self.ensure_pet_followers_initialized();
-            self.update_pet_followers(dt);
-            self.update_hosted_wild_pets(dt);
-        }
-        if !self.logged_in {
-            return;
-        }
         let actual_velocity = if dt_secs > 0.0 {
             (self.camera.position - previous_position) / dt_secs
         } else {
             Vec3::ZERO
         };
+        self.update_local_avatar_playback(dt_secs, world_movement, actual_velocity);
+        if self.logged_in {
+            self.ensure_pet_followers_initialized();
+            self.update_pet_followers(dt);
+            self.update_hosted_wild_pets(dt);
+        }
+        self.update_camera_view(dt_secs);
+        if !self.logged_in {
+            return;
+        }
         let position = self.camera.position.to_array();
         let velocity = [
             actual_velocity.x,
@@ -2887,7 +3151,7 @@ impl WebApp {
             .unwrap_or(true);
         let yaw_changed = self
             .last_sent_yaw
-            .map(|last| (self.camera.yaw - last).abs() > 0.0025)
+            .map(|last| angle_delta(self.avatar_yaw, last).abs() > 0.0025)
             .unwrap_or(true);
         let always_broadcast_motion = true;
         let websocket_send_due = self
@@ -2923,7 +3187,7 @@ impl WebApp {
                     tick: state_tick,
                     position,
                     velocity,
-                    yaw: self.camera.yaw,
+                    yaw: self.avatar_yaw,
                     pet_states: pet_states.clone(),
                     wild_pet_states: wild_pet_states.clone(),
                 }) {
@@ -2945,14 +3209,14 @@ impl WebApp {
                     movement: [world_movement.x, 0.0, world_movement.z],
                     position: Some(position),
                     velocity: Some(velocity),
-                    yaw: Some(self.camera.yaw),
+                    yaw: Some(self.avatar_yaw),
                     jump,
                     pet_states,
                     wild_pet_states,
                 }));
                 self.last_sent_position = Some(position);
                 self.last_sent_velocity = Some(velocity);
-                self.last_sent_yaw = Some(self.camera.yaw);
+                self.last_sent_yaw = Some(self.avatar_yaw);
                 self.last_input_broadcast_at = Some(now);
             }
         }
@@ -3451,7 +3715,7 @@ impl WebApp {
 
     fn camera_matrix(&self) -> Mat4 {
         let aspect = self.size.width as f32 / self.size.height.max(1) as f32;
-        self.camera.matrix(aspect)
+        self.camera.matrix(aspect, self.render_camera_eye())
     }
 
     fn world_to_screen_point(&self, position: Vec3) -> Option<(f32, f32)> {
@@ -3495,10 +3759,16 @@ impl WebApp {
     }
 
     fn current_target(&mut self) -> Option<RaycastHit> {
+        if !self.is_precision_interaction_mode() {
+            return None;
+        }
         self.raycast_world(6.0)
     }
 
     fn current_interaction_target(&mut self) -> Option<InteractionTarget> {
+        if !self.is_precision_interaction_mode() {
+            return None;
+        }
         let block_hit = self.current_target();
         let link_hit = self.current_link_target();
         let wild_pet_hit = self.current_wild_pet_target();
@@ -3531,10 +3801,16 @@ impl WebApp {
     }
 
     fn current_link_target(&self) -> Option<LinkHit> {
+        if !self.is_precision_interaction_mode() {
+            return None;
+        }
         raycast_link_panel(self.camera.position, self.camera.forward(), self.link_panel)
     }
 
     fn current_wild_pet_target(&self) -> Option<WildPetHit> {
+        if !self.is_precision_interaction_mode() {
+            return None;
+        }
         let direction = self.camera.forward().normalize_or_zero();
         if direction == Vec3::ZERO {
             return None;
@@ -3577,6 +3853,9 @@ impl WebApp {
     }
 
     fn current_world_weapon_target(&self) -> Option<WorldWeaponHit> {
+        if !self.is_precision_interaction_mode() {
+            return None;
+        }
         let direction = self.camera.forward().normalize_or_zero();
         if direction == Vec3::ZERO {
             return None;
@@ -3622,6 +3901,9 @@ impl WebApp {
     }
 
     fn nearby_wild_pet_capture_target(&self) -> Option<WildPetHit> {
+        if !self.is_precision_interaction_mode() {
+            return None;
+        }
         let player_feet = self.player_feet_position();
         let max_distance_sq = WILD_PET_CAPTURE_PLAYER_RADIUS * WILD_PET_CAPTURE_PLAYER_RADIUS;
         let mut best_hit = None;
@@ -3661,7 +3943,12 @@ impl WebApp {
         let forward = self.camera.forward();
         let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
         let up = right.cross(forward).normalize_or_zero();
-        let center = self.camera.position + forward * CROSSHAIR_DISTANCE;
+        let scale = if self.is_third_person_active() {
+            0.7
+        } else {
+            1.0
+        };
+        let center = self.render_camera_eye() + forward * CROSSHAIR_DISTANCE;
 
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
@@ -3669,9 +3956,9 @@ impl WebApp {
             &mut vertices,
             &mut indices,
             center,
-            right * CROSSHAIR_LENGTH,
-            up * CROSSHAIR_THICKNESS,
-            forward * CROSSHAIR_THICKNESS,
+            right * (CROSSHAIR_LENGTH * scale),
+            up * (CROSSHAIR_THICKNESS * scale),
+            forward * (CROSSHAIR_THICKNESS * scale),
             [1.0, 1.0, 1.0],
             (3, 1),
         );
@@ -3679,9 +3966,9 @@ impl WebApp {
             &mut vertices,
             &mut indices,
             center,
-            right * CROSSHAIR_THICKNESS,
-            up * CROSSHAIR_LENGTH,
-            forward * CROSSHAIR_THICKNESS,
+            right * (CROSSHAIR_THICKNESS * scale),
+            up * (CROSSHAIR_LENGTH * scale),
+            forward * (CROSSHAIR_THICKNESS * scale),
             [1.0, 1.0, 1.0],
             (3, 1),
         );
@@ -3820,6 +4107,48 @@ impl WebApp {
         meshes
     }
 
+    fn build_local_avatar_mesh_draw(
+        &self,
+        renderer: &Renderer<'_>,
+    ) -> Option<AnimatedMeshDraw<'_>> {
+        if !self.should_render_local_avatar() {
+            return None;
+        }
+
+        let url = self
+            .local_avatar_active_url()
+            .or_else(|| self.local_avatar_selection()?.first_available_url())?;
+        let asset = self.remote_avatar_assets.get(url)?;
+        let anchor = player_anchor_from_eye(self.camera.position);
+        let model = Mat4::from_translation(anchor.body)
+            * Mat4::from_rotation_y(self.avatar_yaw)
+            * asset.model_normalization;
+        let joints = evaluate_avatar_skin_matrices(asset, self.local_avatar_state.playback_time);
+        Some(renderer.create_animated_draw(&asset.mesh, model, &joints))
+    }
+
+    fn build_local_avatar_placeholder_mesh(&self, renderer: &Renderer<'_>) -> Option<Mesh> {
+        if !self.should_render_local_avatar() || self.local_avatar_asset_ready() {
+            return None;
+        }
+
+        let anchor = player_anchor_from_eye(self.camera.position);
+        let center = (anchor.body + anchor.head) * 0.5;
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        add_box_oriented(
+            &mut vertices,
+            &mut indices,
+            center,
+            Vec3::new(REMOTE_PLAYER_HALF_WIDTH, 0.0, 0.0),
+            Vec3::new(0.0, REMOTE_PLAYER_HALF_HEIGHT, 0.0),
+            Vec3::new(0.0, 0.0, REMOTE_PLAYER_HALF_WIDTH),
+            LOCAL_AVATAR_PLACEHOLDER_TINT,
+            (2, 0),
+        );
+        Some(renderer.create_mesh(&vertices, &indices))
+    }
+
     fn current_remote_avatar_url(&self, player_id: u64) -> Option<&str> {
         let selection = self.remote_player_avatar_selections.get(&player_id)?;
         let animation = self
@@ -3934,7 +4263,7 @@ impl WebApp {
                 &mut vertices,
                 &mut indices,
                 anchor.media,
-                self.camera.position,
+                self.render_camera_eye(),
                 [0.14, 0.14, 0.16],
                 atlas_quad_raw(REMOTE_MEDIA_PLACEHOLDER_TILE),
             );
@@ -3960,7 +4289,7 @@ impl WebApp {
                 &mut vertices,
                 &mut indices,
                 anchor.media,
-                self.camera.position,
+                self.render_camera_eye(),
                 [1.0, 1.0, 1.0],
                 full_uv_quad(),
             );
@@ -4254,8 +4583,9 @@ impl WebApp {
     }
 
     fn chunk_is_visible(&self, position: ChunkPos) -> bool {
-        let center = chunk_center(position, self.camera.position.y);
-        let to_chunk = center - self.camera.position;
+        let render_eye = self.render_camera_eye();
+        let center = chunk_center(position, render_eye.y);
+        let to_chunk = center - render_eye;
         let horizontal = Vec3::new(to_chunk.x, 0.0, to_chunk.z);
         let distance = horizontal.length();
         let max_distance = self.chunk_quality_preset.draw_distance_chunks() * CHUNK_WIDTH as f32;
@@ -4290,6 +4620,7 @@ impl WebApp {
         &self,
         chunk_meshes: &'a HashMap<ChunkPos, Mesh>,
     ) -> Vec<&'a Mesh> {
+        let render_eye = self.render_camera_eye();
         let forward = horizontal_forward(self.camera.forward());
         let mut visible = chunk_meshes
             .iter()
@@ -4297,8 +4628,8 @@ impl WebApp {
             .collect::<Vec<_>>();
 
         visible.sort_by(|(a, _), (b, _)| {
-            chunk_render_priority(**a, self.camera.position, forward)
-                .total_cmp(&chunk_render_priority(**b, self.camera.position, forward))
+            chunk_render_priority(**a, render_eye, forward)
+                .total_cmp(&chunk_render_priority(**b, render_eye, forward))
         });
 
         let max_visible = self.chunk_quality_preset.max_visible_chunk_meshes();
@@ -4310,7 +4641,8 @@ impl WebApp {
     }
 
     fn world_position_is_visible(&self, position: Vec3, max_distance: f32) -> bool {
-        let to_target = position - self.camera.position;
+        let render_eye = self.render_camera_eye();
+        let to_target = position - render_eye;
         let distance = to_target.length();
         if distance > max_distance {
             return false;
@@ -4803,10 +5135,14 @@ impl WebApp {
         }
 
         let mut pending = self.pending_generation.drain(..).collect::<Vec<_>>();
+        let render_eye = self.render_camera_eye();
         pending.sort_by(|a, b| {
-            chunk_priority(*a, self.current_chunk, self.camera.position, forward).total_cmp(
-                &chunk_priority(*b, self.current_chunk, self.camera.position, forward),
-            )
+            chunk_priority(*a, self.current_chunk, render_eye, forward).total_cmp(&chunk_priority(
+                *b,
+                self.current_chunk,
+                render_eye,
+                forward,
+            ))
         });
         self.pending_generation = pending.into();
         self.last_reprioritize_chunk = self.current_chunk;
@@ -5060,6 +5396,30 @@ impl WebApp {
             PLAYER_COLLIDER,
             Some((position, block)),
         )
+    }
+
+    fn point_collides_with_world(&mut self, position: Vec3, clearance: f32) -> bool {
+        let min = Vec3::splat(-clearance) + position;
+        let max = Vec3::splat(clearance) + position;
+
+        let min_x = min.x.floor() as i32;
+        let max_x = (max.x - 0.001).floor() as i32;
+        let min_y = min.y.floor() as i32;
+        let max_y = (max.y - 0.001).floor() as i32;
+        let min_z = min.z.floor() as i32;
+        let max_z = (max.z - 0.001).floor() as i32;
+
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                for x in min_x..=max_x {
+                    if self.world_block_is_solid(x, y, z) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     fn raycast_world(&mut self, max_distance: f32) -> Option<RaycastHit> {
@@ -5606,9 +5966,9 @@ struct Camera {
 }
 
 impl Camera {
-    fn matrix(&self, aspect: f32) -> Mat4 {
+    fn matrix(&self, aspect: f32, eye_position: Vec3) -> Mat4 {
         let look = self.forward();
-        let view = Mat4::look_at_rh(self.position, self.position + look, Vec3::Y);
+        let view = Mat4::look_at_rh(eye_position, eye_position + look, Vec3::Y);
         let proj = Mat4::perspective_rh_gl(60.0_f32.to_radians(), aspect, 0.1, 1_500.0);
         proj * view
     }
@@ -5840,6 +6200,37 @@ fn move_towards_vec3(current: Vec3, target: Vec3, max_delta: f32) -> Vec3 {
         target
     } else {
         current + delta / distance * max_delta
+    }
+}
+
+fn move_towards_scalar(current: f32, target: f32, max_delta: f32) -> f32 {
+    let delta = target - current;
+    if delta.abs() <= max_delta || max_delta <= f32::EPSILON {
+        target
+    } else {
+        current + delta.signum() * max_delta
+    }
+}
+
+fn angle_delta(target: f32, current: f32) -> f32 {
+    let mut delta = target - current;
+    while delta > std::f32::consts::PI {
+        delta -= std::f32::consts::TAU;
+    }
+    while delta < -std::f32::consts::PI {
+        delta += std::f32::consts::TAU;
+    }
+    delta
+}
+
+fn rotate_angle_towards(current: f32, target: f32, max_delta: f32) -> f32 {
+    current + angle_delta(target, current).clamp(-max_delta, max_delta)
+}
+
+fn normalize_scroll_delta(delta: MouseScrollDelta) -> f32 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => y,
+        MouseScrollDelta::PixelDelta(position) => (position.y as f32 / 40.0).clamp(-4.0, 4.0),
     }
 }
 

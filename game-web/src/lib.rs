@@ -1221,6 +1221,15 @@ impl WebApp {
         !self.is_third_person_active()
     }
 
+    fn interaction_ray(&self) -> Option<(Vec3, Vec3)> {
+        let direction = self.camera.forward().normalize_or_zero();
+        if direction == Vec3::ZERO {
+            None
+        } else {
+            Some((self.render_camera_eye(), direction))
+        }
+    }
+
     fn handle_key(&mut self, event: KeyEvent) {
         let code = match event.physical_key {
             PhysicalKey::Code(code) => code,
@@ -1314,10 +1323,6 @@ impl WebApp {
         }
 
         if !self.logged_in {
-            return;
-        }
-
-        if !self.is_precision_interaction_mode() {
             return;
         }
 
@@ -3748,10 +3753,10 @@ impl WebApp {
     }
 
     fn current_interaction_target(&mut self) -> Option<InteractionTarget> {
-        if !self.is_precision_interaction_mode() {
-            return None;
-        }
-        let block_hit = self.current_target();
+        let block_hit = self
+            .is_precision_interaction_mode()
+            .then(|| self.current_target())
+            .flatten();
         let link_hit = self.current_link_target();
         let wild_pet_hit = self.current_wild_pet_target();
         let world_weapon_hit = self.current_world_weapon_target();
@@ -3783,24 +3788,17 @@ impl WebApp {
     }
 
     fn current_link_target(&self) -> Option<LinkHit> {
-        if !self.is_precision_interaction_mode() {
-            return None;
-        }
-        raycast_link_panel(self.camera.position, self.camera.forward(), self.link_panel)
+        let (origin, direction) = self.interaction_ray()?;
+        raycast_link_panel(origin, direction, self.link_panel)
     }
 
     fn current_wild_pet_target(&self) -> Option<WildPetHit> {
-        if !self.is_precision_interaction_mode() {
-            return None;
-        }
-        let direction = self.camera.forward().normalize_or_zero();
-        if direction == Vec3::ZERO {
-            return None;
-        }
+        let (origin, direction) = self.interaction_ray()?;
+        let range_origin = self.camera.position;
 
         let mut best_hit = None;
         for (&pet_id, pet) in &self.wild_pets {
-            let to_pet = pet.position - self.camera.position;
+            let to_pet = pet.position - range_origin;
             if to_pet.length_squared()
                 > WILD_PET_CAPTURE_TARGET_DISTANCE * WILD_PET_CAPTURE_TARGET_DISTANCE
             {
@@ -3816,13 +3814,9 @@ impl WebApp {
                 pet.position.y + WILD_PET_CAPTURE_BOX_HEIGHT,
                 pet.position.z + WILD_PET_CAPTURE_BOX_RADIUS,
             );
-            let Some(distance) = ray_aabb_distance(self.camera.position, direction, min, max)
-            else {
+            let Some(distance) = ray_aabb_distance(origin, direction, min, max) else {
                 continue;
             };
-            if distance > WILD_PET_CAPTURE_TARGET_DISTANCE {
-                continue;
-            }
             if best_hit
                 .map(|hit: WildPetHit| distance < hit.distance)
                 .unwrap_or(true)
@@ -3835,17 +3829,12 @@ impl WebApp {
     }
 
     fn current_world_weapon_target(&self) -> Option<WorldWeaponHit> {
-        if !self.is_precision_interaction_mode() {
-            return None;
-        }
-        let direction = self.camera.forward().normalize_or_zero();
-        if direction == Vec3::ZERO {
-            return None;
-        }
+        let (origin, direction) = self.interaction_ray()?;
+        let range_origin = self.camera.position;
 
         let mut best_hit = None;
         for (&weapon_id, weapon) in &self.world_weapons {
-            let to_weapon = weapon.position - self.camera.position;
+            let to_weapon = weapon.position - range_origin;
             if to_weapon.length_squared()
                 > WORLD_WEAPON_PICKUP_TARGET_DISTANCE * WORLD_WEAPON_PICKUP_TARGET_DISTANCE
             {
@@ -3861,13 +3850,9 @@ impl WebApp {
                 weapon.position.y + WORLD_WEAPON_PICKUP_BOX_HEIGHT,
                 weapon.position.z + WORLD_WEAPON_PICKUP_BOX_RADIUS,
             );
-            let Some(distance) = ray_aabb_distance(self.camera.position, direction, min, max)
-            else {
+            let Some(distance) = ray_aabb_distance(origin, direction, min, max) else {
                 continue;
             };
-            if distance > WORLD_WEAPON_PICKUP_TARGET_DISTANCE {
-                continue;
-            }
             if best_hit
                 .map(|hit: WorldWeaponHit| distance < hit.distance)
                 .unwrap_or(true)
@@ -5370,17 +5355,14 @@ impl WebApp {
     }
 
     fn raycast_world(&mut self, max_distance: f32) -> Option<RaycastHit> {
-        let direction = self.camera.forward().normalize_or_zero();
-        if direction == Vec3::ZERO {
-            return None;
-        }
+        let (origin, direction) = self.interaction_ray()?;
 
         let step = 0.1;
         let steps = (max_distance / step).ceil() as usize;
         let mut previous_empty = None;
 
         for index in 1..=steps {
-            let sample = self.camera.position + direction * (index as f32 * step);
+            let sample = origin + direction * (index as f32 * step);
             let world = WorldPos {
                 x: sample.x.floor() as i64,
                 y: sample.y.floor() as i32,

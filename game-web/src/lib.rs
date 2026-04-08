@@ -1221,10 +1221,6 @@ impl WebApp {
             || self.third_person.current_zoom >= THIRD_PERSON_MIN_ACTIVE_ZOOM
     }
 
-    fn is_precision_interaction_mode(&self) -> bool {
-        !self.is_third_person_active()
-    }
-
     fn interaction_ray(&self) -> Option<(Vec3, Vec3)> {
         let direction = self.camera.forward().normalize_or_zero();
         if direction == Vec3::ZERO {
@@ -3750,17 +3746,11 @@ impl WebApp {
     }
 
     fn current_target(&mut self) -> Option<RaycastHit> {
-        if !self.is_precision_interaction_mode() {
-            return None;
-        }
         self.raycast_world(6.0)
     }
 
     fn current_interaction_target(&mut self) -> Option<InteractionTarget> {
-        let block_hit = self
-            .is_precision_interaction_mode()
-            .then(|| self.current_target())
-            .flatten();
+        let block_hit = self.current_target();
         let link_hit = self.current_link_target();
         let wild_pet_hit = self.current_wild_pet_target();
         let world_weapon_hit = self.current_world_weapon_target();
@@ -5407,9 +5397,11 @@ impl WebApp {
 
     fn raycast_world(&mut self, max_distance: f32) -> Option<RaycastHit> {
         let (origin, direction) = self.interaction_ray()?;
+        let player_reach_offset = (self.camera.position - origin).dot(direction).max(0.0);
+        let max_ray_distance = max_distance + player_reach_offset;
 
         let step = 0.1;
-        let steps = (max_distance / step).ceil() as usize;
+        let steps = (max_ray_distance / step).ceil() as usize;
         let mut previous_empty = None;
 
         for index in 1..=steps {

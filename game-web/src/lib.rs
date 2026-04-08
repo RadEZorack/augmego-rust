@@ -16,6 +16,7 @@ use shared_protocol::{
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 use wasm_bindgen::JsCast;
@@ -23,12 +24,12 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    BinaryType, CanvasRenderingContext2d, CloseEvent, Document, Element, ErrorEvent,
+    BinaryType, Blob, CanvasRenderingContext2d, CloseEvent, Document, Element, ErrorEvent,
     Event as WebEvent, FormData, HtmlCanvasElement, HtmlInputElement, HtmlVideoElement,
-    MediaStream, MediaStreamConstraints, MessageEvent, Request, RequestCredentials, RequestInit,
-    RequestMode, Response, RtcDataChannel, RtcDataChannelEvent, RtcIceCandidateInit,
-    RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
-    RtcTrackEvent, WebSocket, Worker,
+    MediaStream, MediaStreamConstraints, MediaStreamTrack, MessageEvent, Request,
+    RequestCredentials, RequestInit, RequestMode, Response, RtcDataChannel, RtcDataChannelEvent,
+    RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType,
+    RtcSessionDescriptionInit, RtcTrackEvent, Url, WebSocket, Worker,
 };
 use web_time::Instant;
 use wgpu_lite::{
@@ -288,6 +289,28 @@ enum AuthEvent {
     Resolved(std::result::Result<Option<AuthUser>, String>),
 }
 
+#[derive(Clone, Debug)]
+struct AvatarGenerationTaskClient {
+    id: String,
+    status: String,
+    phase: String,
+    progress_percent: i32,
+    message: String,
+    selfie_url: Option<String>,
+    portrait_url: Option<String>,
+    failure_reason: Option<String>,
+    avatar_selection: Option<PlayerAvatarSelection>,
+}
+
+#[derive(Default)]
+struct AvatarGenerationModalState {
+    selfie_preview_url: Option<String>,
+    selfie_object_url: Option<String>,
+    selected_selfie_file: Option<web_sys::File>,
+    active_task_id: Option<String>,
+    polling: bool,
+}
+
 enum RemoteAvatarEvent {
     Loaded { url: String, bytes: Vec<u8> },
     Failed { url: String, message: String },
@@ -436,6 +459,7 @@ impl Default for ThirdPersonCameraState {
 
 thread_local! {
     static AUTH_GUEST_QUEUE: RefCell<bool> = const { RefCell::new(false) };
+    static AUTH_REFRESH_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static CHUNK_QUALITY_CYCLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
     static PERF_PANEL_TOGGLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
     static PET_PARTY_MODAL_OPEN_QUEUE: RefCell<bool> = const { RefCell::new(false) };
@@ -788,6 +812,7 @@ struct WebApp {
     _webcam_prompt_onclick: Closure<dyn FnMut(WebEvent)>,
     auth_status: AuthStatus,
     auth_user: Option<AuthUser>,
+    auth_tx: Sender<AuthEvent>,
     auth_rx: Receiver<AuthEvent>,
     remote_avatar_tx: Sender<RemoteAvatarEvent>,
     remote_avatar_rx: Receiver<RemoteAvatarEvent>,
@@ -858,7 +883,7 @@ impl WebApp {
         let hotbar_slots = create_hotbar(&hotbar_blocks);
         let (mouse_lock_prompt, mouse_lock_prompt_onclick) = create_mouse_lock_prompt(&canvas);
         let (webcam_prompt, webcam_prompt_onclick) = create_webcam_prompt();
-        let auth_rx = request_auth_session();
+        let (auth_tx, auth_rx) = request_auth_session();
         let (remote_avatar_tx, remote_avatar_rx) = mpsc::channel();
         let (remote_pet_tx, remote_pet_rx) = mpsc::channel();
         let (remote_weapon_tx, remote_weapon_rx) = mpsc::channel();
@@ -995,6 +1020,7 @@ impl WebApp {
             _webcam_prompt_onclick: webcam_prompt_onclick,
             auth_status: AuthStatus::Checking,
             auth_user: None,
+            auth_tx,
             auth_rx,
             remote_avatar_tx,
             remote_avatar_rx,
@@ -2531,6 +2557,16 @@ impl WebApp {
     }
 
     fn process_auth_events(&mut self) {
+        let should_refresh_auth = AUTH_REFRESH_QUEUE.with(|queue| {
+            let mut queued = queue.borrow_mut();
+            let should_refresh = *queued;
+            *queued = false;
+            should_refresh
+        });
+        if should_refresh_auth {
+            request_auth_session_refresh(self.auth_tx.clone());
+        }
+
         while let Ok(event) = self.auth_rx.try_recv() {
             match event {
                 AuthEvent::Resolved(result) => match result {
@@ -2634,12 +2670,26 @@ impl WebApp {
     }
 
     fn sync_player_avatar_panel(&self) {
-        let _ = self
-            .player_avatar_panel
-            .set_attribute("style", "display:none;");
-        let _ = self
-            .player_avatar_modal
-            .set_attribute("style", "display:none;");
+        let should_show = matches!(self.auth_status, AuthStatus::SignedIn)
+            && self
+                .auth_user
+                .as_ref()
+                .is_some_and(|user| !auth_user_is_guest(user));
+        if should_show {
+            let _ = self
+                .player_avatar_panel
+                .set_attribute("style", player_avatar_launcher_row_style());
+            let _ = self
+                .player_avatar_modal
+                .set_attribute("style", "display:block;");
+        } else {
+            let _ = self
+                .player_avatar_panel
+                .set_attribute("style", "display:none;");
+            let _ = self
+                .player_avatar_modal
+                .set_attribute("style", "display:none;");
+        }
     }
 
     fn sync_logout_button(&self) {
@@ -6849,6 +6899,26 @@ fn player_avatar_launcher_style() -> &'static str {
     "position:fixed;left:16px;top:16px;padding:12px 16px;border-radius:16px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:45;cursor:pointer;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;"
 }
 
+fn player_avatar_launcher_row_style() -> &'static str {
+    "position:fixed;left:16px;top:16px;display:flex;gap:10px;align-items:center;z-index:45;"
+}
+
+fn player_avatar_primary_button_style() -> &'static str {
+    "padding:12px 16px;border-radius:16px;border:1px solid rgba(12,36,40,0.14);background:linear-gradient(180deg,#f4d58a,#efb96a);color:#13212a;box-shadow:0 18px 44px rgba(0,0,0,0.24);backdrop-filter:blur(10px);cursor:pointer;font:700 14px/1.2 \"Avenir Next\",\"Segoe UI\",sans-serif;"
+}
+
+fn player_avatar_secondary_button_style() -> &'static str {
+    "padding:12px 16px;border-radius:16px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);cursor:pointer;font:700 14px/1.2 \"Avenir Next\",\"Segoe UI\",sans-serif;"
+}
+
+fn player_avatar_small_primary_button_style() -> &'static str {
+    "width:100%;padding:10px 12px;border-radius:14px;border:1px solid rgba(12,36,40,0.12);background:linear-gradient(180deg,#f4d58a,#efb96a);color:#13212a;font:700 13px/1.2 \"Avenir Next\",\"Segoe UI\",sans-serif;cursor:pointer;"
+}
+
+fn player_avatar_small_secondary_button_style() -> &'static str {
+    "width:100%;padding:10px 12px;border-radius:14px;border:1px solid rgba(19,33,42,0.12);background:rgba(19,33,42,0.08);color:#13212a;font:700 13px/1.2 \"Avenir Next\",\"Segoe UI\",sans-serif;cursor:pointer;"
+}
+
 fn logout_button_style() -> &'static str {
     "position:fixed;right:16px;top:16px;padding:12px 16px;border-radius:16px;border:1px solid rgba(247,215,148,0.28);background:linear-gradient(180deg,rgba(77,27,19,0.94),rgba(45,15,11,0.94));color:#f9d9b6;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:45;cursor:pointer;font:700 14px/1.2 ui-sans-serif,system-ui,sans-serif;"
 }
@@ -6859,6 +6929,10 @@ fn player_avatar_modal_style() -> &'static str {
 
 fn player_avatar_modal_card_style() -> &'static str {
     "position:relative;width:min(420px,calc(100vw - 24px));max-height:min(82vh,760px);overflow:auto;padding:18px;border-radius:20px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.96),rgba(7,11,18,0.96));color:#e6edf3;box-shadow:0 24px 60px rgba(0,0,0,0.38);"
+}
+
+fn player_avatar_generation_card_style() -> &'static str {
+    "position:relative;width:min(560px,calc(100vw - 24px));max-height:min(88vh,860px);overflow:auto;padding:20px;border-radius:24px;border:1px solid rgba(19,33,42,0.10);background:linear-gradient(180deg,#faf4ea,#f2e4d2);color:#13212a;box-shadow:0 28px 70px rgba(20,12,6,0.24);"
 }
 
 fn auth_user_is_guest(user: &AuthUser) -> bool {
@@ -6872,15 +6946,19 @@ fn fallback_element() -> Element {
         .expect("fallback element")
 }
 
-fn request_auth_session() -> Receiver<AuthEvent> {
+fn request_auth_session() -> (Sender<AuthEvent>, Receiver<AuthEvent>) {
     let (tx, rx) = mpsc::channel();
+    request_auth_session_refresh(tx.clone());
+    (tx, rx)
+}
+
+fn request_auth_session_refresh(tx: Sender<AuthEvent>) {
     spawn_local(async move {
         let result = fetch_auth_user()
             .await
             .map_err(|error| format!("Unable to load login session: {error}"));
         let _ = tx.send(AuthEvent::Resolved(result));
     });
-    rx
 }
 
 fn create_logout_button() -> (Element, Closure<dyn FnMut(WebEvent)>) {
@@ -7177,6 +7255,471 @@ fn js_get_string(value: &JsValue, key: &str) -> Option<String> {
     js_get(value, key)?.as_string()
 }
 
+fn js_get_i32(value: &JsValue, key: &str) -> Option<i32> {
+    js_get(value, key)?
+        .as_f64()
+        .map(|value| value.round() as i32)
+}
+
+fn queue_auth_refresh() {
+    AUTH_REFRESH_QUEUE.with(|queue| {
+        *queue.borrow_mut() = true;
+    });
+}
+
+fn parse_avatar_generation_task_response(body: &JsValue) -> Option<AvatarGenerationTaskClient> {
+    let task = js_get(body, "task")?;
+    parse_avatar_generation_task(&task)
+}
+
+fn parse_avatar_generation_task(task: &JsValue) -> Option<AvatarGenerationTaskClient> {
+    Some(AvatarGenerationTaskClient {
+        id: js_get_string(task, "id")?,
+        status: js_get_string(task, "status")?,
+        phase: js_get_string(task, "phase")?,
+        progress_percent: js_get_i32(task, "progressPercent").unwrap_or_default(),
+        message: js_get_string(task, "message").unwrap_or_else(|| "Processing avatar...".into()),
+        selfie_url: js_get_string(task, "selfieUrl"),
+        portrait_url: js_get_string(task, "portraitUrl"),
+        failure_reason: js_get_string(task, "failureReason"),
+        avatar_selection: parse_avatar_selection(task),
+    })
+}
+
+fn avatar_generation_task_is_active(task: &AvatarGenerationTaskClient) -> bool {
+    matches!(task.status.as_str(), "QUEUED" | "PROCESSING")
+}
+
+fn avatar_generation_step_index(phase: &str) -> usize {
+    match phase {
+        "UPLOADED" => 0,
+        "PORTRAIT_GENERATING" => 1,
+        "MESH_GENERATING" => 2,
+        "RIGGING_GENERATING" => 3,
+        "IDLE_ANIMATING" => 4,
+        "RUN_PREPARING" => 5,
+        "DANCE_ANIMATING" => 6,
+        "FINALIZING" | "READY" => 7,
+        "FAILED" => 0,
+        _ => 0,
+    }
+}
+
+fn avatar_generation_step_lines(task: Option<&AvatarGenerationTaskClient>) -> String {
+    let steps = [
+        "Upload selfie",
+        "Generate portrait",
+        "Build 3D mesh",
+        "Rig character",
+        "Create idle animation",
+        "Prepare run animation",
+        "Create dance animation",
+        "Finalize and activate",
+    ];
+    let current_step = task
+        .map(|task| avatar_generation_step_index(&task.phase))
+        .unwrap_or(0);
+    let is_ready = task.is_some_and(|task| task.status == "READY");
+    let is_failed = task.is_some_and(|task| task.status == "FAILED");
+
+    steps
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let marker = if is_ready || index < current_step {
+                "[x]"
+            } else if is_failed && index == current_step {
+                "[!]"
+            } else if index == current_step && task.is_some() {
+                "[>]"
+            } else {
+                "[ ]"
+            };
+            format!("{marker} {label}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn set_element_image_src(image: &Element, url: Option<&str>) {
+    match url {
+        Some(url) if !url.trim().is_empty() => {
+            let _ = image.set_attribute("src", url);
+            let _ = image.set_attribute(
+                "style",
+                "display:block;width:100%;max-height:240px;object-fit:contain;border-radius:16px;border:1px solid rgba(255,255,255,0.12);background:rgba(5,8,12,0.45);",
+            );
+        }
+        _ => {
+            let _ = image.remove_attribute("src");
+            let _ = image.set_attribute("style", "display:none;");
+        }
+    }
+}
+
+fn set_button_disabled(button: &Element, disabled: bool) {
+    if disabled {
+        let _ = button.set_attribute("disabled", "true");
+    } else {
+        let _ = button.remove_attribute("disabled");
+    }
+}
+
+fn reset_avatar_generation_selfie_state(state: &Rc<RefCell<AvatarGenerationModalState>>) {
+    let mut state = state.borrow_mut();
+    if let Some(object_url) = state.selfie_object_url.take() {
+        let _ = Url::revoke_object_url(&object_url);
+    }
+    state.selfie_preview_url = None;
+    state.selected_selfie_file = None;
+}
+
+fn stop_video_stream(video: &HtmlVideoElement) {
+    if let Some(stream) = video.src_object() {
+        let tracks = stream.get_tracks();
+        for index in 0..tracks.length() {
+            if let Ok(track) = tracks.get(index).dyn_into::<MediaStreamTrack>() {
+                track.stop();
+            }
+        }
+    }
+    video.set_src_object(None);
+}
+
+async fn start_avatar_generation_camera(video: HtmlVideoElement, status: Element) -> Result<()> {
+    stop_video_stream(&video);
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
+    let media_devices = window
+        .navigator()
+        .media_devices()
+        .map_err(|error| anyhow::anyhow!("media devices unavailable: {error:?}"))?;
+    let constraints = MediaStreamConstraints::new();
+    constraints.set_video(&JsValue::TRUE);
+    let stream_value = JsFuture::from(
+        media_devices
+            .get_user_media_with_constraints(&constraints)
+            .map_err(|error| anyhow::anyhow!("getUserMedia failed: {error:?}"))?,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("Camera access was denied: {error:?}"))?;
+    let stream: MediaStream = stream_value
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("camera stream conversion failed"))?;
+    video.set_muted(true);
+    video.set_autoplay(true);
+    let _ = video.set_attribute("playsinline", "true");
+    video.set_src_object(Some(&stream));
+    if let Ok(play_promise) = video.play() {
+        let _ = JsFuture::from(play_promise).await;
+    }
+    status.set_text_content(Some(
+        "Live camera ready. Capture a selfie or choose an image file.",
+    ));
+    Ok(())
+}
+
+fn capture_video_frame_to_data_url(
+    video: &HtmlVideoElement,
+    canvas: &HtmlCanvasElement,
+) -> Result<String> {
+    let width = video.video_width().max(1);
+    let height = video.video_height().max(1);
+    canvas.set_width(width);
+    canvas.set_height(height);
+    let context = canvas
+        .get_context("2d")
+        .map_err(|error| anyhow::anyhow!("load capture canvas context: {error:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("2d capture context unavailable"))?
+        .dyn_into::<CanvasRenderingContext2d>()
+        .map_err(|_| anyhow::anyhow!("capture canvas context conversion failed"))?;
+    context
+        .draw_image_with_html_video_element(video, 0.0, 0.0)
+        .map_err(|error| anyhow::anyhow!("draw selfie frame failed: {error:?}"))?;
+    canvas
+        .to_data_url_with_type("image/png")
+        .map_err(|error| anyhow::anyhow!("encode captured selfie: {error:?}"))
+}
+
+async fn blob_from_data_url(data_url: &str) -> Result<Blob> {
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
+    let response_value = JsFuture::from(window.fetch_with_str(data_url))
+        .await
+        .map_err(|error| anyhow::anyhow!("load selfie preview data: {error:?}"))?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("convert selfie preview response"))?;
+    let blob_value = JsFuture::from(
+        response
+            .blob()
+            .map_err(|error| anyhow::anyhow!("read selfie preview blob: {error:?}"))?,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("resolve selfie preview blob: {error:?}"))?;
+    blob_value
+        .dyn_into::<Blob>()
+        .map_err(|_| anyhow::anyhow!("convert selfie preview blob"))
+}
+
+async fn sleep_ms(ms: i32) -> Result<()> {
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        let Some(window) = web_sys::window() else {
+            let _ = reject.call1(
+                &JsValue::UNDEFINED,
+                &JsValue::from_str("window unavailable for timeout"),
+            );
+            return;
+        };
+        let resolve = resolve.clone();
+        let callback = Closure::once(move || {
+            let _ = resolve.call0(&JsValue::UNDEFINED);
+        });
+        if window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                callback.as_ref().unchecked_ref(),
+                ms,
+            )
+            .is_err()
+        {
+            let _ = reject.call1(&JsValue::UNDEFINED, &JsValue::from_str("setTimeout failed"));
+            return;
+        }
+        callback.forget();
+    });
+    JsFuture::from(promise)
+        .await
+        .map_err(|error| anyhow::anyhow!("sleep failed: {error:?}"))?;
+    Ok(())
+}
+
+async fn fetch_player_avatar_generation_task() -> Result<Option<AvatarGenerationTaskClient>> {
+    let init = RequestInit::new();
+    init.set_method("GET");
+    init.set_mode(RequestMode::Cors);
+    init.set_credentials(RequestCredentials::Include);
+
+    let request = Request::new_with_str_and_init(
+        &format!("{}/auth/player-avatar/generation", api_base_url()?),
+        &init,
+    )
+    .map_err(|error| anyhow::anyhow!("build avatar generation task request: {error:?}"))?;
+    request
+        .headers()
+        .set("Accept", "application/json")
+        .map_err(|error| anyhow::anyhow!("set avatar generation headers: {error:?}"))?;
+
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
+    let response_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| anyhow::anyhow!("load avatar generation task: {error:?}"))?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("convert avatar generation task response"))?;
+    if !response.ok() {
+        return Err(anyhow::anyhow!(
+            "avatar generation status request failed with HTTP {}",
+            response.status()
+        ));
+    }
+    let body = JsFuture::from(
+        response
+            .json()
+            .map_err(|error| anyhow::anyhow!("read avatar generation body: {error:?}"))?,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("parse avatar generation body: {error:?}"))?;
+    Ok(parse_avatar_generation_task_response(&body))
+}
+
+async fn create_player_avatar_generation_task(
+    selfie_blob: &Blob,
+    file_name: &str,
+) -> Result<AvatarGenerationTaskClient> {
+    let form_data = FormData::new()
+        .map_err(|error| anyhow::anyhow!("create generation form data: {error:?}"))?;
+    form_data
+        .append_with_blob_and_filename("selfie", selfie_blob, file_name)
+        .map_err(|error| anyhow::anyhow!("append selfie to generation form: {error:?}"))?;
+
+    let init = RequestInit::new();
+    init.set_method("POST");
+    init.set_mode(RequestMode::Cors);
+    init.set_credentials(RequestCredentials::Include);
+    init.set_body(&JsValue::from(form_data));
+
+    let request = Request::new_with_str_and_init(
+        &format!("{}/auth/player-avatar/generation", api_base_url()?),
+        &init,
+    )
+    .map_err(|error| anyhow::anyhow!("build avatar generation create request: {error:?}"))?;
+
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("window unavailable"))?;
+    let response_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| anyhow::anyhow!("submit avatar generation request: {error:?}"))?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("convert avatar generation create response"))?;
+    if !response.ok() {
+        return Err(anyhow::anyhow!(
+            "avatar generation request failed with HTTP {}",
+            response.status()
+        ));
+    }
+    let body = JsFuture::from(
+        response
+            .json()
+            .map_err(|error| anyhow::anyhow!("read avatar generation create body: {error:?}"))?,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("parse avatar generation create body: {error:?}"))?;
+    parse_avatar_generation_task_response(&body)
+        .ok_or_else(|| anyhow::anyhow!("avatar generation response was missing task details"))
+}
+
+fn render_avatar_generation_modal(
+    task: Option<&AvatarGenerationTaskClient>,
+    state: &Rc<RefCell<AvatarGenerationModalState>>,
+    video: &HtmlVideoElement,
+    selfie_preview: &Element,
+    portrait_preview: &Element,
+    progress_fill: &Element,
+    progress_label: &Element,
+    step_list: &Element,
+    status: &Element,
+    capture_button: &Element,
+    retake_button: &Element,
+    submit_button: &Element,
+) {
+    let (local_selfie_url, has_selected_selfie) = {
+        let state = state.borrow();
+        (
+            state.selfie_preview_url.clone(),
+            state.selfie_preview_url.is_some() || state.selected_selfie_file.is_some(),
+        )
+    };
+    let active_task = task.is_some_and(avatar_generation_task_is_active);
+    let progress = task
+        .map(|task| task.progress_percent.clamp(0, 100))
+        .unwrap_or(0);
+    let selfie_url = local_selfie_url
+        .as_deref()
+        .or_else(|| task.and_then(|task| task.selfie_url.as_deref()));
+    let portrait_url = task.and_then(|task| task.portrait_url.as_deref());
+    let status_text = task
+        .and_then(|task| {
+            task.failure_reason
+                .as_deref()
+                .filter(|reason| !reason.trim().is_empty())
+                .or(Some(task.message.as_str()))
+        })
+        .unwrap_or("Capture a selfie, then we’ll generate and activate your avatar set.");
+
+    set_element_image_src(selfie_preview, selfie_url);
+    set_element_image_src(portrait_preview, portrait_url);
+    let _ = progress_fill.set_attribute(
+        "style",
+        &format!(
+            "height:100%;width:{progress}%;border-radius:999px;background:linear-gradient(90deg,#f5d26b,#ff9c55);transition:width 180ms ease;"
+        ),
+    );
+    progress_label.set_text_content(Some(&format!("{progress}%")));
+    step_list.set_text_content(Some(&avatar_generation_step_lines(task)));
+    status.set_text_content(Some(status_text));
+
+    if active_task || has_selected_selfie {
+        let _ = video.set_attribute("style", "display:none;");
+    } else {
+        let _ = video.set_attribute(
+            "style",
+            "display:block;width:100%;min-height:240px;max-height:240px;object-fit:cover;border-radius:16px;border:1px solid rgba(255,255,255,0.12);background:rgba(5,8,12,0.45);",
+        );
+    }
+
+    set_button_disabled(capture_button, active_task || video.src_object().is_none());
+    set_button_disabled(retake_button, active_task || !has_selected_selfie);
+    set_button_disabled(submit_button, active_task || !has_selected_selfie);
+}
+
+fn start_avatar_generation_polling(
+    state: Rc<RefCell<AvatarGenerationModalState>>,
+    video: HtmlVideoElement,
+    selfie_preview: Element,
+    portrait_preview: Element,
+    progress_fill: Element,
+    progress_label: Element,
+    step_list: Element,
+    status: Element,
+    capture_button: Element,
+    retake_button: Element,
+    submit_button: Element,
+) {
+    if state.borrow().polling {
+        return;
+    }
+    state.borrow_mut().polling = true;
+
+    spawn_local(async move {
+        loop {
+            match fetch_player_avatar_generation_task().await {
+                Ok(task) => {
+                    if let Some(task) = task.as_ref() {
+                        state.borrow_mut().active_task_id = Some(task.id.clone());
+                        render_avatar_generation_modal(
+                            Some(task),
+                            &state,
+                            &video,
+                            &selfie_preview,
+                            &portrait_preview,
+                            &progress_fill,
+                            &progress_label,
+                            &step_list,
+                            &status,
+                            &capture_button,
+                            &retake_button,
+                            &submit_button,
+                        );
+                        if task.status == "READY" && task.avatar_selection.is_some() {
+                            queue_auth_refresh();
+                        }
+                        if !avatar_generation_task_is_active(task) {
+                            break;
+                        }
+                    } else {
+                        render_avatar_generation_modal(
+                            None,
+                            &state,
+                            &video,
+                            &selfie_preview,
+                            &portrait_preview,
+                            &progress_fill,
+                            &progress_label,
+                            &step_list,
+                            &status,
+                            &capture_button,
+                            &retake_button,
+                            &submit_button,
+                        );
+                        break;
+                    }
+                }
+                Err(error) => {
+                    status.set_text_content(Some(&format!(
+                        "Unable to refresh avatar progress: {error}"
+                    )));
+                    break;
+                }
+            }
+
+            if let Err(error) = sleep_ms(2000).await {
+                status.set_text_content(Some(&format!("Avatar polling stopped: {error}")));
+                break;
+            }
+        }
+
+        state.borrow_mut().polling = false;
+    });
+}
+
 fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut(WebEvent)>) {
     let Some(document) = document() else {
         let closure =
@@ -7200,11 +7743,266 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
     };
 
     let root = document
-        .create_element("button")
-        .expect("player avatar launcher");
-    root.set_text_content(Some("Player Avatar Animations"));
+        .create_element("div")
+        .expect("player avatar launcher row");
     let _ = root.set_attribute("style", "display:none;");
-    let _ = root.set_attribute("type", "button");
+    let generate_launcher = document
+        .create_element("button")
+        .expect("player avatar generator launcher");
+    generate_launcher.set_text_content(Some("Generate Avatar"));
+    let _ = generate_launcher.set_attribute("type", "button");
+    let _ = generate_launcher.set_attribute("style", player_avatar_primary_button_style());
+    let _ = root.append_child(&generate_launcher);
+
+    let manual_launcher = document
+        .create_element("button")
+        .expect("player avatar manual launcher");
+    manual_launcher.set_text_content(Some("Manual Upload"));
+    let _ = manual_launcher.set_attribute("type", "button");
+    let _ = manual_launcher.set_attribute("style", player_avatar_secondary_button_style());
+    let _ = root.append_child(&manual_launcher);
+
+    let modal_root = document
+        .create_element("div")
+        .expect("player avatar modal root");
+    let _ = modal_root.set_attribute("style", "display:block;");
+
+    let generation_modal = document
+        .create_element("div")
+        .expect("player avatar generation modal");
+    let _ = generation_modal.set_attribute("style", player_avatar_modal_style());
+
+    let generation_card = document
+        .create_element("div")
+        .expect("player avatar generation card");
+    let _ = generation_card.set_attribute("style", player_avatar_generation_card_style());
+
+    let generation_close_button = document
+        .create_element("button")
+        .expect("player avatar generation modal close button");
+    generation_close_button.set_text_content(Some("Close"));
+    let _ = generation_close_button.set_attribute(
+        "style",
+        "position:absolute;top:16px;right:16px;padding:8px 12px;border-radius:12px;border:1px solid rgba(16,32,42,0.12);background:rgba(16,32,42,0.08);color:#10202a;font:700 12px/1.2 Georgia,\"Times New Roman\",serif;cursor:pointer;",
+    );
+    let _ = generation_close_button.set_attribute("type", "button");
+    let _ = generation_card.append_child(&generation_close_button);
+
+    let generation_title = document
+        .create_element("h2")
+        .expect("player avatar generation title");
+    generation_title.set_text_content(Some("Camera-First Avatar Generator"));
+    let _ = generation_title.set_attribute(
+        "style",
+        "margin:0 56px 6px 0;color:#13212a;font:700 22px/1.1 Georgia,\"Times New Roman\",serif;",
+    );
+    let _ = generation_card.append_child(&generation_title);
+
+    let generation_copy = document
+        .create_element("p")
+        .expect("player avatar generation copy");
+    generation_copy.set_text_content(Some(
+        "Take a selfie or upload one image. We’ll turn it into a full-body portrait, build the mesh, animate it, optimize the GLBs, and activate the result on your player.",
+    ));
+    let _ = generation_copy.set_attribute(
+        "style",
+        "margin:0 0 16px 0;color:rgba(19,33,42,0.78);font:500 13px/1.5 \"Avenir Next\",\"Segoe UI\",sans-serif;",
+    );
+    let _ = generation_card.append_child(&generation_copy);
+
+    let live_label = document
+        .create_element("p")
+        .expect("player avatar generation live label");
+    live_label.set_text_content(Some("Live Selfie"));
+    let _ = live_label.set_attribute(
+        "style",
+        "margin:0 0 8px 0;color:#10202a;font:700 12px/1.2 \"Avenir Next\",\"Segoe UI\",sans-serif;letter-spacing:0.04em;text-transform:uppercase;",
+    );
+    let _ = generation_card.append_child(&live_label);
+
+    let live_video = document
+        .create_element("video")
+        .expect("player avatar generation video")
+        .dyn_into::<HtmlVideoElement>()
+        .expect("player avatar generation video cast");
+    let _ = live_video.set_attribute(
+        "style",
+        "display:block;width:100%;min-height:240px;max-height:240px;object-fit:cover;border-radius:16px;border:1px solid rgba(19,33,42,0.14);background:rgba(5,8,12,0.45);",
+    );
+    let _ = generation_card.append_child(&live_video);
+
+    let capture_canvas = document
+        .create_element("canvas")
+        .expect("player avatar generation canvas")
+        .dyn_into::<HtmlCanvasElement>()
+        .expect("player avatar generation canvas cast");
+    let _ = capture_canvas.set_attribute("style", "display:none;");
+    let _ = generation_card.append_child(&capture_canvas);
+
+    let controls_row = document
+        .create_element("div")
+        .expect("player avatar generation controls row");
+    let _ = controls_row.set_attribute(
+        "style",
+        "display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:12px;",
+    );
+
+    let capture_button = document
+        .create_element("button")
+        .expect("player avatar capture button");
+    capture_button.set_text_content(Some("Capture"));
+    let _ = capture_button.set_attribute("type", "button");
+    let _ = capture_button.set_attribute("style", player_avatar_small_primary_button_style());
+    let _ = controls_row.append_child(&capture_button);
+
+    let retake_button = document
+        .create_element("button")
+        .expect("player avatar retake button");
+    retake_button.set_text_content(Some("Retake"));
+    let _ = retake_button.set_attribute("type", "button");
+    let _ = retake_button.set_attribute("style", player_avatar_small_secondary_button_style());
+    let _ = controls_row.append_child(&retake_button);
+
+    let submit_button = document
+        .create_element("button")
+        .expect("player avatar submit button");
+    submit_button.set_text_content(Some("Use Photo"));
+    let _ = submit_button.set_attribute("type", "button");
+    let _ = submit_button.set_attribute("style", player_avatar_small_primary_button_style());
+    let _ = controls_row.append_child(&submit_button);
+    let _ = generation_card.append_child(&controls_row);
+
+    let upload_wrapper = document
+        .create_element("label")
+        .expect("player avatar generation upload wrapper");
+    upload_wrapper.set_text_content(Some("Upload Fallback"));
+    let _ = upload_wrapper.set_attribute(
+        "style",
+        "display:grid;gap:6px;margin-top:14px;color:#10202a;font:700 12px/1.2 \"Avenir Next\",\"Segoe UI\",sans-serif;letter-spacing:0.04em;text-transform:uppercase;",
+    );
+    let selfie_input = document
+        .create_element("input")
+        .expect("player avatar selfie input")
+        .dyn_into::<HtmlInputElement>()
+        .expect("player avatar selfie input cast");
+    selfie_input.set_type("file");
+    selfie_input.set_accept("image/png,image/jpeg,image/webp");
+    let _ = selfie_input.set_attribute(
+        "style",
+        "display:block;width:100%;padding:10px;border-radius:14px;border:1px solid rgba(19,33,42,0.14);background:rgba(255,255,255,0.7);color:#10202a;font:500 12px/1.3 \"Avenir Next\",\"Segoe UI\",sans-serif;",
+    );
+    let _ = upload_wrapper.append_child(&selfie_input);
+    let _ = generation_card.append_child(&upload_wrapper);
+
+    let preview_grid = document
+        .create_element("div")
+        .expect("player avatar preview grid");
+    let _ = preview_grid.set_attribute(
+        "style",
+        "display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:16px;",
+    );
+
+    let selfie_column = document
+        .create_element("div")
+        .expect("player avatar selfie preview column");
+    let _ = selfie_column.set_attribute("style", "display:grid;gap:8px;");
+    let selfie_heading = document
+        .create_element("p")
+        .expect("player avatar selfie preview heading");
+    selfie_heading.set_text_content(Some("Selfie"));
+    let _ = selfie_heading.set_attribute(
+        "style",
+        "margin:0;color:#10202a;font:700 12px/1.2 \"Avenir Next\",\"Segoe UI\",sans-serif;letter-spacing:0.04em;text-transform:uppercase;",
+    );
+    let _ = selfie_column.append_child(&selfie_heading);
+    let selfie_preview = document
+        .create_element("img")
+        .expect("player avatar selfie preview");
+    let _ = selfie_preview.set_attribute("alt", "Selected selfie preview");
+    let _ = selfie_preview.set_attribute("style", "display:none;");
+    let _ = selfie_column.append_child(&selfie_preview);
+    let _ = preview_grid.append_child(&selfie_column);
+
+    let portrait_column = document
+        .create_element("div")
+        .expect("player avatar portrait preview column");
+    let _ = portrait_column.set_attribute("style", "display:grid;gap:8px;");
+    let portrait_heading = document
+        .create_element("p")
+        .expect("player avatar portrait preview heading");
+    portrait_heading.set_text_content(Some("Generated Portrait"));
+    let _ = portrait_heading.set_attribute(
+        "style",
+        "margin:0;color:#10202a;font:700 12px/1.2 \"Avenir Next\",\"Segoe UI\",sans-serif;letter-spacing:0.04em;text-transform:uppercase;",
+    );
+    let _ = portrait_column.append_child(&portrait_heading);
+    let portrait_preview = document
+        .create_element("img")
+        .expect("player avatar portrait preview");
+    let _ = portrait_preview.set_attribute("alt", "Generated portrait preview");
+    let _ = portrait_preview.set_attribute("style", "display:none;");
+    let _ = portrait_column.append_child(&portrait_preview);
+    let _ = preview_grid.append_child(&portrait_column);
+    let _ = generation_card.append_child(&preview_grid);
+
+    let progress_row = document
+        .create_element("div")
+        .expect("player avatar progress row");
+    let _ = progress_row.set_attribute(
+        "style",
+        "display:flex;align-items:center;gap:12px;margin-top:16px;",
+    );
+    let progress_bar = document
+        .create_element("div")
+        .expect("player avatar progress bar");
+    let _ = progress_bar.set_attribute(
+        "style",
+        "flex:1;height:12px;border-radius:999px;border:1px solid rgba(19,33,42,0.10);background:rgba(19,33,42,0.08);overflow:hidden;",
+    );
+    let progress_fill = document
+        .create_element("div")
+        .expect("player avatar progress fill");
+    let _ = progress_fill.set_attribute(
+        "style",
+        "height:100%;width:0%;border-radius:999px;background:linear-gradient(90deg,#f5d26b,#ff9c55);transition:width 180ms ease;",
+    );
+    let _ = progress_bar.append_child(&progress_fill);
+    let _ = progress_row.append_child(&progress_bar);
+    let progress_label = document
+        .create_element("strong")
+        .expect("player avatar progress label");
+    progress_label.set_text_content(Some("0%"));
+    let _ = progress_label.set_attribute(
+        "style",
+        "min-width:46px;color:#10202a;font:700 14px/1 \"Avenir Next\",\"Segoe UI\",sans-serif;text-align:right;",
+    );
+    let _ = progress_row.append_child(&progress_label);
+    let _ = generation_card.append_child(&progress_row);
+
+    let step_list = document
+        .create_element("pre")
+        .expect("player avatar step list");
+    let _ = step_list.set_attribute(
+        "style",
+        "margin:14px 0 0 0;padding:14px 16px;border-radius:16px;border:1px solid rgba(19,33,42,0.10);background:rgba(255,255,255,0.72);color:#10202a;font:600 12px/1.7 \"Avenir Next\",\"Segoe UI\",sans-serif;white-space:pre-wrap;",
+    );
+    step_list.set_text_content(Some(&avatar_generation_step_lines(None)));
+    let _ = generation_card.append_child(&step_list);
+
+    let generation_status = document
+        .create_element("p")
+        .expect("player avatar generation status");
+    generation_status.set_text_content(Some(
+        "Capture a selfie, then we’ll generate and activate your avatar set.",
+    ));
+    let _ = generation_status.set_attribute(
+        "style",
+        "margin:14px 0 0 0;color:rgba(19,33,42,0.78);font:500 13px/1.5 \"Avenir Next\",\"Segoe UI\",sans-serif;",
+    );
+    let _ = generation_card.append_child(&generation_status);
+
+    let _ = generation_modal.append_child(&generation_card);
+    let _ = modal_root.append_child(&generation_modal);
 
     let modal = document.create_element("div").expect("player avatar modal");
     let _ = modal.set_attribute("style", player_avatar_modal_style());
@@ -7243,7 +8041,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
         "margin:0 0 14px 0;color:rgba(230,237,243,0.72);font-size:13px;line-height:1.45;",
     );
     copy.set_text_content(Some(
-        "Upload one GLB each for idle, run, and dance. Press Esc if the mouse is locked so you can use the form.",
+        "Manual / advanced path. Upload one GLB each for idle, run, and dance, or paste existing public GLB URLs. Press Esc if the mouse is locked so you can use the form.",
     ));
     let _ = card.append_child(&copy);
 
@@ -7367,6 +8165,133 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
         .add_event_listener_with_callback("click", save_urls_onclick.as_ref().unchecked_ref());
     save_urls_onclick.forget();
 
+    let generation_state = Rc::new(RefCell::new(AvatarGenerationModalState::default()));
+
+    let generation_modal_for_open = generation_modal.clone();
+    let generation_state_for_open = generation_state.clone();
+    let live_video_for_open = live_video.clone();
+    let selfie_preview_for_open = selfie_preview.clone();
+    let portrait_preview_for_open = portrait_preview.clone();
+    let progress_fill_for_open = progress_fill.clone();
+    let progress_label_for_open = progress_label.clone();
+    let step_list_for_open = step_list.clone();
+    let generation_status_for_open = generation_status.clone();
+    let capture_button_for_open = capture_button.clone();
+    let retake_button_for_open = retake_button.clone();
+    let submit_button_for_open = submit_button.clone();
+    let open_generate_modal = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let _ = generation_modal_for_open.set_attribute(
+            "style",
+            "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(245,239,225,0.72);backdrop-filter:blur(12px);z-index:65;",
+        );
+        render_avatar_generation_modal(
+            None,
+            &generation_state_for_open,
+            &live_video_for_open,
+            &selfie_preview_for_open,
+            &portrait_preview_for_open,
+            &progress_fill_for_open,
+            &progress_label_for_open,
+            &step_list_for_open,
+            &generation_status_for_open,
+            &capture_button_for_open,
+            &retake_button_for_open,
+            &submit_button_for_open,
+        );
+
+        let should_start_camera = {
+            let state = generation_state_for_open.borrow();
+            state.selfie_preview_url.is_none() && state.selected_selfie_file.is_none()
+        };
+        if should_start_camera {
+            let video = live_video_for_open.clone();
+            let status = generation_status_for_open.clone();
+            spawn_local(async move {
+                if let Err(error) = start_avatar_generation_camera(video, status.clone()).await {
+                    status.set_text_content(Some(&format!(
+                        "Camera unavailable. Upload a selfie file instead. {error}"
+                    )));
+                }
+            });
+        }
+
+        let state = generation_state_for_open.clone();
+        let video = live_video_for_open.clone();
+        let selfie_preview = selfie_preview_for_open.clone();
+        let portrait_preview = portrait_preview_for_open.clone();
+        let progress_fill = progress_fill_for_open.clone();
+        let progress_label = progress_label_for_open.clone();
+        let step_list = step_list_for_open.clone();
+        let status = generation_status_for_open.clone();
+        let capture_button = capture_button_for_open.clone();
+        let retake_button = retake_button_for_open.clone();
+        let submit_button = submit_button_for_open.clone();
+        spawn_local(async move {
+            match fetch_player_avatar_generation_task().await {
+                Ok(task) => {
+                    if let Some(task) = task.as_ref() {
+                        state.borrow_mut().active_task_id = Some(task.id.clone());
+                        if avatar_generation_task_is_active(task) {
+                            stop_video_stream(&video);
+                        }
+                        render_avatar_generation_modal(
+                            Some(task),
+                            &state,
+                            &video,
+                            &selfie_preview,
+                            &portrait_preview,
+                            &progress_fill,
+                            &progress_label,
+                            &step_list,
+                            &status,
+                            &capture_button,
+                            &retake_button,
+                            &submit_button,
+                        );
+                        if avatar_generation_task_is_active(task) {
+                            start_avatar_generation_polling(
+                                state,
+                                video,
+                                selfie_preview,
+                                portrait_preview,
+                                progress_fill,
+                                progress_label,
+                                step_list,
+                                status,
+                                capture_button,
+                                retake_button,
+                                submit_button,
+                            );
+                        }
+                    } else {
+                        render_avatar_generation_modal(
+                            None,
+                            &state,
+                            &video,
+                            &selfie_preview,
+                            &portrait_preview,
+                            &progress_fill,
+                            &progress_label,
+                            &step_list,
+                            &status,
+                            &capture_button,
+                            &retake_button,
+                            &submit_button,
+                        );
+                    }
+                }
+                Err(error) => {
+                    status.set_text_content(Some(&format!(
+                        "Unable to load avatar generation progress: {error}"
+                    )));
+                }
+            }
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = generate_launcher
+        .add_event_listener_with_callback("click", open_generate_modal.as_ref().unchecked_ref());
+    open_generate_modal.forget();
+
     let modal_for_open = modal.clone();
     let open_modal = Closure::wrap(Box::new(move |_event: WebEvent| {
         let _ = modal_for_open.set_attribute(
@@ -7374,7 +8299,8 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
             "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(5,8,12,0.72);backdrop-filter:blur(10px);z-index:65;",
         );
     }) as Box<dyn FnMut(WebEvent)>);
-    let _ = root.add_event_listener_with_callback("click", open_modal.as_ref().unchecked_ref());
+    let _ = manual_launcher
+        .add_event_listener_with_callback("click", open_modal.as_ref().unchecked_ref());
     open_modal.forget();
 
     let modal_for_close = modal.clone();
@@ -7385,9 +8311,273 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
         .add_event_listener_with_callback("click", close_modal.as_ref().unchecked_ref());
     close_modal.forget();
 
+    let generation_modal_for_close = generation_modal.clone();
+    let generation_video_for_close = live_video.clone();
+    let close_generate_modal = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let _ = generation_modal_for_close.set_attribute("style", player_avatar_modal_style());
+        stop_video_stream(&generation_video_for_close);
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = generation_close_button
+        .add_event_listener_with_callback("click", close_generate_modal.as_ref().unchecked_ref());
+    close_generate_modal.forget();
+
+    let capture_canvas_for_click = capture_canvas.clone();
+    let generation_state_for_capture = generation_state.clone();
+    let live_video_for_capture = live_video.clone();
+    let selfie_preview_for_capture = selfie_preview.clone();
+    let portrait_preview_for_capture = portrait_preview.clone();
+    let progress_fill_for_capture = progress_fill.clone();
+    let progress_label_for_capture = progress_label.clone();
+    let step_list_for_capture = step_list.clone();
+    let generation_status_for_capture = generation_status.clone();
+    let capture_button_for_capture = capture_button.clone();
+    let retake_button_for_capture = retake_button.clone();
+    let submit_button_for_capture = submit_button.clone();
+    let capture_onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        match capture_video_frame_to_data_url(&live_video_for_capture, &capture_canvas_for_click) {
+            Ok(data_url) => {
+                reset_avatar_generation_selfie_state(&generation_state_for_capture);
+                {
+                    let mut state = generation_state_for_capture.borrow_mut();
+                    state.active_task_id = None;
+                    state.selfie_preview_url = Some(data_url);
+                }
+                stop_video_stream(&live_video_for_capture);
+                render_avatar_generation_modal(
+                    None,
+                    &generation_state_for_capture,
+                    &live_video_for_capture,
+                    &selfie_preview_for_capture,
+                    &portrait_preview_for_capture,
+                    &progress_fill_for_capture,
+                    &progress_label_for_capture,
+                    &step_list_for_capture,
+                    &generation_status_for_capture,
+                    &capture_button_for_capture,
+                    &retake_button_for_capture,
+                    &submit_button_for_capture,
+                );
+                generation_status_for_capture
+                    .set_text_content(Some("Photo captured. Use Photo to start generation."));
+            }
+            Err(error) => {
+                generation_status_for_capture
+                    .set_text_content(Some(&format!("Capture failed: {error}")));
+            }
+        }
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = capture_button
+        .add_event_listener_with_callback("click", capture_onclick.as_ref().unchecked_ref());
+    capture_onclick.forget();
+
+    let generation_state_for_retake = generation_state.clone();
+    let selfie_input_for_retake = selfie_input.clone();
+    let live_video_for_retake = live_video.clone();
+    let selfie_preview_for_retake = selfie_preview.clone();
+    let portrait_preview_for_retake = portrait_preview.clone();
+    let progress_fill_for_retake = progress_fill.clone();
+    let progress_label_for_retake = progress_label.clone();
+    let step_list_for_retake = step_list.clone();
+    let generation_status_for_retake = generation_status.clone();
+    let capture_button_for_retake = capture_button.clone();
+    let retake_button_for_retake = retake_button.clone();
+    let submit_button_for_retake = submit_button.clone();
+    let retake_onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        reset_avatar_generation_selfie_state(&generation_state_for_retake);
+        generation_state_for_retake.borrow_mut().active_task_id = None;
+        selfie_input_for_retake.set_value("");
+        render_avatar_generation_modal(
+            None,
+            &generation_state_for_retake,
+            &live_video_for_retake,
+            &selfie_preview_for_retake,
+            &portrait_preview_for_retake,
+            &progress_fill_for_retake,
+            &progress_label_for_retake,
+            &step_list_for_retake,
+            &generation_status_for_retake,
+            &capture_button_for_retake,
+            &retake_button_for_retake,
+            &submit_button_for_retake,
+        );
+        let video = live_video_for_retake.clone();
+        let status = generation_status_for_retake.clone();
+        spawn_local(async move {
+            if let Err(error) = start_avatar_generation_camera(video, status.clone()).await {
+                status.set_text_content(Some(&format!(
+                    "Camera unavailable. Upload a selfie file instead. {error}"
+                )));
+            }
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = retake_button
+        .add_event_listener_with_callback("click", retake_onclick.as_ref().unchecked_ref());
+    retake_onclick.forget();
+
+    let generation_state_for_file = generation_state.clone();
+    let live_video_for_file = live_video.clone();
+    let selfie_preview_for_file = selfie_preview.clone();
+    let portrait_preview_for_file = portrait_preview.clone();
+    let progress_fill_for_file = progress_fill.clone();
+    let progress_label_for_file = progress_label.clone();
+    let step_list_for_file = step_list.clone();
+    let generation_status_for_file = generation_status.clone();
+    let capture_button_for_file = capture_button.clone();
+    let retake_button_for_file = retake_button.clone();
+    let submit_button_for_file = submit_button.clone();
+    let selfie_input_for_change = selfie_input.clone();
+    let file_onchange = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let Some(file) = input_selected_file(&selfie_input_for_change) else {
+            return;
+        };
+        reset_avatar_generation_selfie_state(&generation_state_for_file);
+        stop_video_stream(&live_video_for_file);
+        match Url::create_object_url_with_blob(&file) {
+            Ok(object_url) => {
+                {
+                    let mut state = generation_state_for_file.borrow_mut();
+                    state.active_task_id = None;
+                    state.selfie_object_url = Some(object_url.clone());
+                    state.selfie_preview_url = Some(object_url);
+                    state.selected_selfie_file = Some(file);
+                }
+                render_avatar_generation_modal(
+                    None,
+                    &generation_state_for_file,
+                    &live_video_for_file,
+                    &selfie_preview_for_file,
+                    &portrait_preview_for_file,
+                    &progress_fill_for_file,
+                    &progress_label_for_file,
+                    &step_list_for_file,
+                    &generation_status_for_file,
+                    &capture_button_for_file,
+                    &retake_button_for_file,
+                    &submit_button_for_file,
+                );
+                generation_status_for_file
+                    .set_text_content(Some("Selfie selected. Use Photo to start generation."));
+            }
+            Err(error) => {
+                generation_status_for_file
+                    .set_text_content(Some(&format!("Preview failed: {error:?}")));
+            }
+        }
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = selfie_input
+        .add_event_listener_with_callback("change", file_onchange.as_ref().unchecked_ref());
+    file_onchange.forget();
+
+    let generation_state_for_submit = generation_state.clone();
+    let live_video_for_submit = live_video.clone();
+    let selfie_preview_for_submit = selfie_preview.clone();
+    let portrait_preview_for_submit = portrait_preview.clone();
+    let progress_fill_for_submit = progress_fill.clone();
+    let progress_label_for_submit = progress_label.clone();
+    let step_list_for_submit = step_list.clone();
+    let generation_status_for_submit = generation_status.clone();
+    let capture_button_for_submit = capture_button.clone();
+    let retake_button_for_submit = retake_button.clone();
+    let submit_button_for_submit = submit_button.clone();
+    let submit_onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let state = generation_state_for_submit.clone();
+        let video = live_video_for_submit.clone();
+        let selfie_preview = selfie_preview_for_submit.clone();
+        let portrait_preview = portrait_preview_for_submit.clone();
+        let progress_fill = progress_fill_for_submit.clone();
+        let progress_label = progress_label_for_submit.clone();
+        let step_list = step_list_for_submit.clone();
+        let status = generation_status_for_submit.clone();
+        let capture_button = capture_button_for_submit.clone();
+        let retake_button = retake_button_for_submit.clone();
+        let submit_button = submit_button_for_submit.clone();
+        spawn_local(async move {
+            set_button_disabled(&submit_button, true);
+            status.set_text_content(Some("Uploading selfie and starting avatar generation..."));
+
+            let selected_file = state.borrow().selected_selfie_file.clone();
+            let selected_preview_url = state.borrow().selfie_preview_url.clone();
+            let generation_input = if let Some(file) = selected_file {
+                let file_name = file.name();
+                let blob: Blob = file.unchecked_into();
+                Ok((blob, file_name))
+            } else if let Some(data_url) = selected_preview_url {
+                blob_from_data_url(&data_url)
+                    .await
+                    .map(|blob| (blob, "selfie.png".to_string()))
+            } else {
+                Err(anyhow::anyhow!("Capture or choose a selfie first."))
+            };
+
+            let task_result = match generation_input {
+                Ok((blob, file_name)) => {
+                    create_player_avatar_generation_task(&blob, &file_name).await
+                }
+                Err(error) => Err(error),
+            };
+
+            match task_result {
+                Ok(task) => {
+                    state.borrow_mut().active_task_id = Some(task.id.clone());
+                    stop_video_stream(&video);
+                    render_avatar_generation_modal(
+                        Some(&task),
+                        &state,
+                        &video,
+                        &selfie_preview,
+                        &portrait_preview,
+                        &progress_fill,
+                        &progress_label,
+                        &step_list,
+                        &status,
+                        &capture_button,
+                        &retake_button,
+                        &submit_button,
+                    );
+                    start_avatar_generation_polling(
+                        state,
+                        video,
+                        selfie_preview,
+                        portrait_preview,
+                        progress_fill,
+                        progress_label,
+                        step_list,
+                        status,
+                        capture_button,
+                        retake_button,
+                        submit_button,
+                    );
+                }
+                Err(error) => {
+                    status.set_text_content(Some(&format!(
+                        "Avatar generation failed to start: {error}"
+                    )));
+                    render_avatar_generation_modal(
+                        None,
+                        &state,
+                        &video,
+                        &selfie_preview,
+                        &portrait_preview,
+                        &progress_fill,
+                        &progress_label,
+                        &step_list,
+                        &status,
+                        &capture_button,
+                        &retake_button,
+                        &submit_button,
+                    );
+                }
+            }
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = submit_button
+        .add_event_listener_with_callback("click", submit_onclick.as_ref().unchecked_ref());
+    submit_onclick.forget();
+
     let _ = body.append_child(&root);
-    let _ = body.append_child(&modal);
-    (root, modal, status, onclick)
+    let _ = modal_root.append_child(&modal);
+    let _ = body.append_child(&modal_root);
+    (root, modal_root, status, onclick)
 }
 
 fn create_player_avatar_file_input(
@@ -7505,6 +8695,7 @@ async fn upload_player_avatar_set(
     if dance_file.is_some() {
         dance_input.set_value("");
     }
+    queue_auth_refresh();
     status.set_text_content(Some("Avatar upload complete."));
     Ok(())
 }
@@ -7690,6 +8881,7 @@ async fn save_player_avatar_urls(
         (!dance_url.is_empty()).then_some(dance_url.as_str()),
     )
     .await?;
+    queue_auth_refresh();
     status.set_text_content(Some("Saved avatar URL changes."));
     Ok(())
 }

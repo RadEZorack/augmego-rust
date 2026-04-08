@@ -1,6 +1,5 @@
-use crate::pet_registry::{
-    downscale_glb_embedded_images, maybe_gzip_bytes, parse_uuid, should_retry_with_meshy_6,
-};
+use crate::generated_asset::{downscale_glb_embedded_images, maybe_gzip_bytes};
+use crate::pet_registry::{parse_uuid, should_retry_with_meshy_6};
 use crate::storage::{StorageObject, StorageService};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};

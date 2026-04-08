@@ -730,6 +730,32 @@ impl AccountService {
         self.load_avatar_selection(user_id).await
     }
 
+    pub async fn activate_avatar_storage_keys(
+        &self,
+        user_id: Uuid,
+        idle_storage_key: &str,
+        run_storage_key: &str,
+        dance_storage_key: &str,
+    ) -> Result<AvatarSelection> {
+        self.upsert_avatar_slot(
+            user_id,
+            PlayerAvatarSlot::Idle,
+            None,
+            Some(idle_storage_key),
+        )
+        .await?;
+        self.upsert_avatar_slot(user_id, PlayerAvatarSlot::Run, None, Some(run_storage_key))
+            .await?;
+        self.upsert_avatar_slot(
+            user_id,
+            PlayerAvatarSlot::Dance,
+            None,
+            Some(dance_storage_key),
+        )
+        .await?;
+        self.load_avatar_selection(user_id).await
+    }
+
     pub async fn read_avatar_file(
         &self,
         user_id: Uuid,

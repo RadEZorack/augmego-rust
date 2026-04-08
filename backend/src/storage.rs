@@ -240,7 +240,53 @@ impl StorageService {
                 }
             }
             StorageProvider::Spaces => {
-                bail!("DigitalOcean Spaces reads are not yet implemented in the Rust runtime")
+                let url = self
+                    .public_url(storage_key)
+                    .or_else(|| self.spaces_object_url(storage_key))
+                    .context("resolve spaces object read URL")?;
+                let response = self
+                    .http
+                    .get(&url)
+                    .send()
+                    .await
+                    .context("download spaces object")?;
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(None);
+                }
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    bail!("Spaces read failed ({status}): {body}");
+                }
+
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                let cache_control = response
+                    .headers()
+                    .get(reqwest::header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let content_encoding = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let bytes = response
+                    .bytes()
+                    .await
+                    .context("read spaces object body")?
+                    .to_vec();
+
+                Ok(Some(StorageObject {
+                    bytes,
+                    content_type,
+                    cache_control,
+                    content_encoding,
+                }))
             }
         }
     }

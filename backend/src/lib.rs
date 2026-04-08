@@ -1,6 +1,8 @@
 pub mod account;
 pub mod auth;
+pub mod avatar_generation;
 pub mod db;
+pub mod generated_asset;
 pub mod net;
 pub mod persistence;
 pub mod pet_registry;

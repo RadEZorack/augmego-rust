@@ -1,5 +1,9 @@
 use crate::account::{AccountConfig, AccountService, AvatarFileResponse, PlayerAvatarSlot};
 use crate::auth::{SameSitePolicy, SessionCookieConfig};
+use crate::avatar_generation::{
+    AvatarGenerationAssetKind, AvatarGenerationAssetResponse, AvatarGenerationClient,
+    AvatarGenerationConfig,
+};
 use crate::db;
 use crate::persistence::{ChunkStore, ChunkStoreConfig, PostgresValkeyChunkStore};
 use crate::pet_registry::{
@@ -175,6 +179,7 @@ pub struct ServerConfig {
     pub generated_pet_cache_control: String,
     pub generated_pet_texture_max_dimension: u32,
     pub generated_pet_texture_jpeg_quality: u8,
+    pub generated_avatar_cache_control: String,
     pub meshy_api_base_url: String,
     pub meshy_api_key: String,
     pub meshy_text_to_3d_model: String,
@@ -184,6 +189,16 @@ pub struct ServerConfig {
     pub meshy_text_to_3d_enable_pbr: bool,
     pub meshy_text_to_3d_topology: String,
     pub meshy_text_to_3d_target_polycount: Option<i32>,
+    pub openai_api_base_url: String,
+    pub openai_api_key: String,
+    pub openai_avatar_image_model: String,
+    pub generated_avatar_texture_max_dimension: u32,
+    pub generated_avatar_texture_jpeg_quality: u8,
+    pub avatar_generation_idle_action_id: i32,
+    pub avatar_generation_dance_action_id: i32,
+    pub avatar_generation_worker_interval: Duration,
+    pub avatar_generation_poll_interval: Duration,
+    pub avatar_generation_max_attempts: i32,
     pub pet_pool_target: i64,
     pub pet_generation_max_in_flight: i64,
     pub pet_generation_worker_interval: Duration,
@@ -319,6 +334,8 @@ impl Default for ServerConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(85),
+            generated_avatar_cache_control: std::env::var("GENERATED_AVATAR_CACHE_CONTROL")
+                .unwrap_or_else(|_| "public, max-age=31536000, immutable".to_string()),
             meshy_api_base_url: std::env::var("MESHY_API_BASE_URL")
                 .unwrap_or_else(|_| "https://api.meshy.ai".to_string()),
             meshy_api_key: std::env::var("MESHY_API_KEY").unwrap_or_default(),
@@ -341,6 +358,47 @@ impl Default for ServerConfig {
             meshy_text_to_3d_target_polycount: std::env::var("MESHY_TEXT_TO_3D_TARGET_POLYCOUNT")
                 .ok()
                 .and_then(|value| value.parse().ok()),
+            openai_api_base_url: std::env::var("OPENAI_API_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+            openai_api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+            openai_avatar_image_model: std::env::var("OPENAI_AVATAR_IMAGE_MODEL")
+                .unwrap_or_else(|_| "gpt-image-1.5".to_string()),
+            generated_avatar_texture_max_dimension: std::env::var(
+                "GENERATED_AVATAR_TEXTURE_MAX_DIMENSION",
+            )
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024),
+            generated_avatar_texture_jpeg_quality: std::env::var(
+                "GENERATED_AVATAR_TEXTURE_JPEG_QUALITY",
+            )
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(85),
+            avatar_generation_idle_action_id: std::env::var("AVATAR_GENERATION_IDLE_ACTION_ID")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+            avatar_generation_dance_action_id: std::env::var("AVATAR_GENERATION_DANCE_ACTION_ID")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(22),
+            avatar_generation_worker_interval: Duration::from_secs(
+                std::env::var("AVATAR_GENERATION_WORKER_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(10),
+            ),
+            avatar_generation_poll_interval: Duration::from_secs(
+                std::env::var("AVATAR_GENERATION_POLL_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(10),
+            ),
+            avatar_generation_max_attempts: std::env::var("AVATAR_GENERATION_MAX_ATTEMPTS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(3),
             pet_pool_target: std::env::var("PET_POOL_TARGET")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -2170,6 +2228,7 @@ struct AppleCallbackForm {
 pub struct VoxelServer {
     config: ServerConfig,
     account_service: AccountService,
+    avatar_generation: AvatarGenerationClient,
     pet_registry: PetRegistryClient,
     weapon_registry: WeaponRegistryClient,
     websocket_sessions: WebSocketSessionService,
@@ -2226,7 +2285,7 @@ impl VoxelServer {
 
         let pet_registry = PetRegistryClient::new(
             pool.clone(),
-            storage,
+            storage.clone(),
             PetRegistryConfig {
                 auth_secret: config.game_backend_auth_secret.clone(),
                 generated_pet_cache_control: config.generated_pet_cache_control.clone(),
@@ -2250,18 +2309,7 @@ impl VoxelServer {
         );
         let weapon_registry = WeaponRegistryClient::new(
             pool.clone(),
-            StorageService::new(StorageConfig {
-                provider: config.storage_provider.clone(),
-                root: config.storage_root.clone(),
-                namespace: config.storage_namespace.clone(),
-                spaces_bucket: config.spaces_bucket.clone(),
-                spaces_endpoint: config.spaces_endpoint.clone(),
-                spaces_custom_domain: config.spaces_custom_domain.clone(),
-                spaces_access_key_id: config.spaces_access_key_id.clone(),
-                spaces_secret_access_key: config.spaces_secret_access_key.clone(),
-                spaces_region: config.spaces_region.clone(),
-            })
-            .await?,
+            storage.clone(),
             WeaponRegistryConfig {
                 generated_cache_control: config.generated_pet_cache_control.clone(),
                 generated_texture_max_dimension: config.generated_pet_texture_max_dimension,
@@ -2280,6 +2328,27 @@ impl VoxelServer {
                 weapon_generation_worker_interval: config.pet_generation_worker_interval,
                 weapon_generation_poll_interval: config.pet_generation_poll_interval,
                 weapon_generation_max_attempts: config.pet_generation_max_attempts,
+            },
+        );
+        let avatar_generation = AvatarGenerationClient::new(
+            pool.clone(),
+            storage,
+            account_service.clone(),
+            AvatarGenerationConfig {
+                openai_api_base_url: config.openai_api_base_url.clone(),
+                openai_api_key: config.openai_api_key.clone(),
+                openai_avatar_image_model: config.openai_avatar_image_model.clone(),
+                generated_avatar_cache_control: config.generated_avatar_cache_control.clone(),
+                generated_avatar_texture_max_dimension: config
+                    .generated_avatar_texture_max_dimension,
+                generated_avatar_texture_jpeg_quality: config.generated_avatar_texture_jpeg_quality,
+                meshy_api_base_url: config.meshy_api_base_url.clone(),
+                meshy_api_key: config.meshy_api_key.clone(),
+                avatar_generation_idle_action_id: config.avatar_generation_idle_action_id,
+                avatar_generation_dance_action_id: config.avatar_generation_dance_action_id,
+                avatar_generation_worker_interval: config.avatar_generation_worker_interval,
+                avatar_generation_poll_interval: config.avatar_generation_poll_interval,
+                avatar_generation_max_attempts: config.avatar_generation_max_attempts,
             },
         );
 
@@ -2323,6 +2392,7 @@ impl VoxelServer {
             static_root: config.static_root.clone(),
             config,
             account_service,
+            avatar_generation,
             pet_registry,
             weapon_registry,
             websocket_sessions,
@@ -2336,6 +2406,7 @@ impl VoxelServer {
 
     pub async fn run(self) -> Result<()> {
         tracing::info!(http_addr = %self.config.bind_addr, "augmego rust server listening");
+        self.avatar_generation.start_generation_worker();
         self.pet_registry.start_generation_worker();
         self.weapon_registry.start_generation_worker();
         match self.pet_registry.reset_spawned_pets().await {
@@ -2415,6 +2486,14 @@ impl VoxelServer {
             .route(
                 "/api/v1/auth/player-avatar/upload",
                 post(player_avatar_upload),
+            )
+            .route(
+                "/api/v1/auth/player-avatar/generation",
+                get(player_avatar_generation_get).post(player_avatar_generation_post),
+            )
+            .route(
+                "/api/v1/auth/player-avatar/generation/{task_id}/{asset}",
+                get(player_avatar_generation_asset),
             )
             .route(
                 "/api/v1/auth/player-avatar/upload-url",
@@ -4907,6 +4986,122 @@ async fn player_avatar_upload(
     .into_response()
 }
 
+async fn player_avatar_generation_get(
+    State(server): State<VoxelServer>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(session_user) = load_session_user(&server, &headers).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED");
+    };
+
+    match server.avatar_generation.latest_task(session_user.id).await {
+        Ok(task) => Json(json!({ "task": task })).into_response(),
+        Err(error) => {
+            tracing::warn!(?error, user_id = %session_user.id, "failed to load latest avatar generation task");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AVATAR_GENERATION_LOOKUP_FAILED",
+            )
+        }
+    }
+}
+
+async fn player_avatar_generation_post(
+    State(server): State<VoxelServer>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    let Some(session_user) = load_session_user(&server, &headers).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED");
+    };
+
+    let mut selfie: Option<(Vec<u8>, String)> = None;
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let field_name = field.name().unwrap_or_default();
+        if !matches!(field_name, "selfie" | "file") {
+            continue;
+        }
+
+        let content_type = field
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        match field.bytes().await {
+            Ok(bytes) => {
+                selfie = Some((bytes.to_vec(), content_type));
+            }
+            Err(error) => {
+                tracing::warn!(?error, user_id = %session_user.id, "failed to read selfie upload field");
+                return api_error(StatusCode::BAD_REQUEST, "INVALID_SELFIE_FILE");
+            }
+        }
+    }
+
+    let Some((bytes, content_type)) = selfie else {
+        return api_error(StatusCode::BAD_REQUEST, "SELFIE_REQUIRED");
+    };
+    if bytes.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "INVALID_SELFIE_FILE");
+    }
+
+    match server
+        .avatar_generation
+        .create_or_get_active_task(session_user.id, &bytes, &content_type)
+        .await
+    {
+        Ok(task) => Json(json!({ "task": task })).into_response(),
+        Err(error) => {
+            if error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("unsupported selfie content type")
+            {
+                return api_error(StatusCode::BAD_REQUEST, "INVALID_SELFIE_CONTENT_TYPE");
+            }
+            tracing::warn!(?error, user_id = %session_user.id, "failed to create avatar generation task");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AVATAR_GENERATION_CREATE_FAILED",
+            )
+        }
+    }
+}
+
+async fn player_avatar_generation_asset(
+    State(server): State<VoxelServer>,
+    headers: HeaderMap,
+    AxumPath((task_id, asset)): AxumPath<(String, String)>,
+) -> Response {
+    let Some(session_user) = load_session_user(&server, &headers).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED");
+    };
+    let Ok(task_id) = Uuid::parse_str(&task_id) else {
+        return api_error(StatusCode::NOT_FOUND, "NOT_FOUND");
+    };
+    let Some(asset_kind) = AvatarGenerationAssetKind::parse(&asset) else {
+        return api_error(StatusCode::NOT_FOUND, "NOT_FOUND");
+    };
+
+    match server
+        .avatar_generation
+        .read_task_asset(session_user.id, task_id, asset_kind)
+        .await
+    {
+        Ok(Some(AvatarGenerationAssetResponse::Redirect { url })) => {
+            Redirect::temporary(&url).into_response()
+        }
+        Ok(Some(AvatarGenerationAssetResponse::Bytes(object))) => storage_object_response(object),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND"),
+        Err(error) => {
+            tracing::warn!(?error, user_id = %session_user.id, %task_id, asset, "failed to read avatar generation asset");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AVATAR_GENERATION_ASSET_READ_FAILED",
+            )
+        }
+    }
+}
+
 async fn player_avatar_upload_url(
     State(server): State<VoxelServer>,
     headers: HeaderMap,
@@ -5260,6 +5455,7 @@ impl Clone for VoxelServer {
         Self {
             config: self.config.clone(),
             account_service: self.account_service.clone(),
+            avatar_generation: self.avatar_generation.clone(),
             pet_registry: self.pet_registry.clone(),
             weapon_registry: self.weapon_registry.clone(),
             websocket_sessions: self.websocket_sessions.clone(),

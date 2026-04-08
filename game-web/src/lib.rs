@@ -192,7 +192,7 @@ const PEER_REALTIME_BROADCAST_INTERVAL: Duration = Duration::from_millis(33);
 const PEER_REALTIME_RADIUS: f32 = CHUNK_WIDTH as f32 * WEB_RADIUS as f32;
 const REMOTE_AVATAR_RUN_SPEED_THRESHOLD: f32 = 0.15;
 const REMOTE_AVATAR_IDLE_DELAY_SECS: f32 = 0.35;
-const REMOTE_AVATAR_DANCE_DELAY_SECS: f32 = 5.0;
+const REMOTE_AVATAR_DANCE_DELAY_SECS: f32 = 10.0;
 const AUTH_STATUS_CHECKING: &str = "Checking your sign-in session...";
 
 #[derive(Clone, Debug)]
@@ -421,6 +421,7 @@ impl Default for RemoteAvatarPlaybackState {
 struct LocalAvatarPlaybackState {
     animation: RemoteAvatarAnimation,
     playback_time: f32,
+    time_since_motion: f32,
     active_url: Option<String>,
 }
 
@@ -429,6 +430,7 @@ impl Default for LocalAvatarPlaybackState {
         Self {
             animation: RemoteAvatarAnimation::Idle,
             playback_time: 0.0,
+            time_since_motion: 0.0,
             active_url: None,
         }
     }
@@ -2980,9 +2982,16 @@ impl WebApp {
 
         let moving = self.movement_active
             || Vec3::new(actual_velocity.x, 0.0, actual_velocity.z).length_squared() > 0.01;
+        if moving {
+            self.local_avatar_state.time_since_motion = 0.0;
+        } else {
+            self.local_avatar_state.time_since_motion += dt_secs;
+        }
         let selection = self.local_avatar_selection().cloned().unwrap_or_default();
         let desired_animation = if moving {
             RemoteAvatarAnimation::Run
+        } else if self.local_avatar_state.time_since_motion >= REMOTE_AVATAR_DANCE_DELAY_SECS {
+            RemoteAvatarAnimation::Dance
         } else {
             RemoteAvatarAnimation::Idle
         };

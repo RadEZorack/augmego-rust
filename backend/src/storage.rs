@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::time::{Duration, sleep};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StorageProvider {
@@ -53,10 +54,11 @@ impl StorageService {
                 .await
                 .with_context(|| format!("create storage root {}", config.root.display()))?;
         }
-        Ok(Self {
-            config,
-            http: Client::new(),
-        })
+        let http = Client::builder()
+            .http1_only()
+            .build()
+            .context("build storage http client")?;
+        Ok(Self { config, http })
     }
 
     pub fn namespace(&self) -> &str {
@@ -128,86 +130,44 @@ impl StorageService {
                 Ok(())
             }
             StorageProvider::Spaces => {
-                let url = self
-                    .spaces_object_url(storage_key)
-                    .context("resolve spaces object URL")?;
-                let host = self.spaces_host().context("resolve spaces host")?;
-                let region = self.spaces_region();
-                let access_key = self.config.spaces_access_key_id.trim();
-                let secret_key = self.config.spaces_secret_access_key.trim();
-                if access_key.is_empty() || secret_key.is_empty() {
-                    bail!("DigitalOcean Spaces credentials are not configured");
+                let max_attempts = 3_u32;
+                let mut last_error_message = None;
+
+                for attempt in 1..=max_attempts {
+                    match self
+                        .write_object_to_spaces_once(
+                            storage_key,
+                            bytes,
+                            content_type,
+                            cache_control,
+                            content_encoding,
+                        )
+                        .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(error) => {
+                            let is_last_attempt = attempt == max_attempts;
+                            let error_message = error.to_string();
+                            if is_last_attempt {
+                                return Err(error);
+                            }
+                            last_error_message = Some(error_message.clone());
+                            tracing::warn!(
+                                attempt,
+                                max_attempts,
+                                storage_key,
+                                error = %error_message,
+                                "spaces upload failed; retrying"
+                            );
+                            sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+                        }
+                    }
                 }
 
-                let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-                let date_stamp = &amz_date[..8];
-                let payload_hash = sha256_hex(bytes);
-                let canonical_uri = format!("/{}", to_url_safe_storage_key(storage_key));
-
-                let mut signed_headers = vec![
-                    ("content-type", content_type.to_string()),
-                    ("host", host.clone()),
-                    ("x-amz-acl", "public-read".to_string()),
-                    ("x-amz-content-sha256", payload_hash.clone()),
-                    ("x-amz-date", amz_date.clone()),
-                ];
-                if let Some(cache_control) = cache_control {
-                    signed_headers.push(("cache-control", cache_control.to_string()));
-                }
-                if let Some(content_encoding) = content_encoding {
-                    signed_headers.push(("content-encoding", content_encoding.to_string()));
-                }
-                signed_headers.sort_by(|left, right| left.0.cmp(right.0));
-
-                let canonical_headers = signed_headers
-                    .iter()
-                    .map(|(name, value)| format!("{name}:{}\n", canonicalize_header_value(value)))
-                    .collect::<String>();
-                let signed_header_names = signed_headers
-                    .iter()
-                    .map(|(name, _)| *name)
-                    .collect::<Vec<_>>()
-                    .join(";");
-
-                let canonical_request = format!(
-                    "PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_header_names}\n{payload_hash}"
+                bail!(
+                    "Spaces upload failed after retries: {}",
+                    last_error_message.unwrap_or_else(|| "unknown error".to_string())
                 );
-                let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
-                let string_to_sign = format!(
-                    "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
-                    sha256_hex(canonical_request.as_bytes())
-                );
-
-                let signing_key = aws_v4_signing_key(secret_key, date_stamp, &region, "s3");
-                let signature = hex_bytes(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
-                let authorization = format!(
-                    "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_header_names}, Signature={signature}"
-                );
-
-                let mut request = self
-                    .http
-                    .put(&url)
-                    .header("authorization", authorization)
-                    .header("content-type", content_type)
-                    .header("host", host)
-                    .header("x-amz-acl", "public-read")
-                    .header("x-amz-content-sha256", payload_hash)
-                    .header("x-amz-date", amz_date)
-                    .body(bytes.to_vec());
-                if let Some(cache_control) = cache_control {
-                    request = request.header("cache-control", cache_control);
-                }
-                if let Some(content_encoding) = content_encoding {
-                    request = request.header("content-encoding", content_encoding);
-                }
-
-                let response = request.send().await.context("upload object to spaces")?;
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    bail!("Spaces upload failed ({status}): {body}");
-                }
-                Ok(())
             }
         }
     }
@@ -357,6 +317,96 @@ impl StorageService {
             .next()
             .unwrap_or("us-east-1")
             .to_string()
+    }
+
+    async fn write_object_to_spaces_once(
+        &self,
+        storage_key: &str,
+        bytes: &[u8],
+        content_type: &str,
+        cache_control: Option<&str>,
+        content_encoding: Option<&str>,
+    ) -> Result<()> {
+        let url = self
+            .spaces_object_url(storage_key)
+            .context("resolve spaces object URL")?;
+        let host = self.spaces_host().context("resolve spaces host")?;
+        let region = self.spaces_region();
+        let access_key = self.config.spaces_access_key_id.trim();
+        let secret_key = self.config.spaces_secret_access_key.trim();
+        if access_key.is_empty() || secret_key.is_empty() {
+            bail!("DigitalOcean Spaces credentials are not configured");
+        }
+
+        let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let date_stamp = &amz_date[..8];
+        let payload_hash = sha256_hex(bytes);
+        let canonical_uri = format!("/{}", to_url_safe_storage_key(storage_key));
+
+        let mut signed_headers = vec![
+            ("content-type", content_type.to_string()),
+            ("host", host.clone()),
+            ("x-amz-acl", "public-read".to_string()),
+            ("x-amz-content-sha256", payload_hash.clone()),
+            ("x-amz-date", amz_date.clone()),
+        ];
+        if let Some(cache_control) = cache_control {
+            signed_headers.push(("cache-control", cache_control.to_string()));
+        }
+        if let Some(content_encoding) = content_encoding {
+            signed_headers.push(("content-encoding", content_encoding.to_string()));
+        }
+        signed_headers.sort_by(|left, right| left.0.cmp(right.0));
+
+        let canonical_headers = signed_headers
+            .iter()
+            .map(|(name, value)| format!("{name}:{}\n", canonicalize_header_value(value)))
+            .collect::<String>();
+        let signed_header_names = signed_headers
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(";");
+
+        let canonical_request = format!(
+            "PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_header_names}\n{payload_hash}"
+        );
+        let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+            sha256_hex(canonical_request.as_bytes())
+        );
+
+        let signing_key = aws_v4_signing_key(secret_key, date_stamp, &region, "s3");
+        let signature = hex_bytes(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_header_names}, Signature={signature}"
+        );
+
+        let mut request = self
+            .http
+            .put(&url)
+            .header("authorization", authorization)
+            .header("content-type", content_type)
+            .header("host", host)
+            .header("x-amz-acl", "public-read")
+            .header("x-amz-content-sha256", payload_hash)
+            .header("x-amz-date", amz_date)
+            .body(bytes.to_vec());
+        if let Some(cache_control) = cache_control {
+            request = request.header("cache-control", cache_control);
+        }
+        if let Some(content_encoding) = content_encoding {
+            request = request.header("content-encoding", content_encoding);
+        }
+
+        let response = request.send().await.context("upload object to spaces")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            bail!("Spaces upload failed ({status}): {body}");
+        }
+        Ok(())
     }
 }
 

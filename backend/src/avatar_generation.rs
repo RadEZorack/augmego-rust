@@ -230,6 +230,7 @@ struct MeshyModelUrls {
 struct MeshyResultUrls {
     glb_url: Option<String>,
     animated_glb_url: Option<String>,
+    animation_glb_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -413,7 +414,7 @@ impl AvatarGenerationClient {
         loop {
             match current.status.as_str() {
                 STATUS_QUEUED => {
-                    let Some(claimed) = self.claim_queued_task(current.id).await? else {
+                    let Some(claimed) = self.claim_queued_task(&current).await? else {
                         return Ok(());
                     };
                     current = claimed;
@@ -430,7 +431,7 @@ impl AvatarGenerationClient {
                         PHASE_DANCE_ANIMATING => self.poll_dance_animation_task(current).await,
                         PHASE_FINALIZING => self.finalize_task(current).await,
                         PHASE_UPLOADED => {
-                            let Some(claimed) = self.claim_queued_task(current.id).await? else {
+                            let Some(claimed) = self.claim_queued_task(&current).await? else {
                                 return Ok(());
                             };
                             current = claimed;
@@ -444,7 +445,15 @@ impl AvatarGenerationClient {
         }
     }
 
-    async fn claim_queued_task(&self, task_id: Uuid) -> Result<Option<AvatarGenerationTaskRecord>> {
+    async fn claim_queued_task(
+        &self,
+        task: &AvatarGenerationTaskRecord,
+    ) -> Result<Option<AvatarGenerationTaskRecord>> {
+        let (phase, progress_percent) = if task.phase == PHASE_UPLOADED {
+            (PHASE_PORTRAIT_GENERATING, 12_i32)
+        } else {
+            (task.phase.as_str(), task.progress_percent.clamp(0, 99))
+        };
         let updated = sqlx::query(
             "UPDATE player_avatar_generation_tasks
              SET status = $2,
@@ -459,11 +468,11 @@ impl AvatarGenerationClient {
              WHERE id = $1
                AND status = $6",
         )
-        .bind(task_id)
+        .bind(task.id)
         .bind(STATUS_PROCESSING)
-        .bind(PHASE_PORTRAIT_GENERATING)
-        .bind(12_i32)
-        .bind(message_for_phase(PHASE_PORTRAIT_GENERATING))
+        .bind(phase)
+        .bind(progress_percent)
+        .bind(message_for_phase(phase))
         .bind(STATUS_QUEUED)
         .execute(&self.pool)
         .await
@@ -473,7 +482,7 @@ impl AvatarGenerationClient {
             return Ok(None);
         }
 
-        self.load_task_by_id(task_id).await
+        self.load_task_by_id(task.id).await
     }
 
     async fn generate_portrait_and_submit_mesh(
@@ -924,11 +933,28 @@ impl AvatarGenerationClient {
 
     async fn fail_task(&self, task: &AvatarGenerationTaskRecord, reason: &str) -> Result<()> {
         let attempts = task.attempts.max(1);
-        let final_reason = if attempts >= self.config.avatar_generation_max_attempts {
-            reason.to_string()
-        } else {
-            reason.to_string()
-        };
+        if attempts < self.config.avatar_generation_max_attempts {
+            let retry_message = format!(
+                "Temporary failure on attempt {attempts}/{}. Retrying soon.",
+                self.config.avatar_generation_max_attempts
+            );
+            sqlx::query(
+                "UPDATE player_avatar_generation_tasks
+                 SET status = $2,
+                     status_message = $3,
+                     failure_reason = NULL,
+                     updated_at = NOW()
+                 WHERE id = $1",
+            )
+            .bind(task.id)
+            .bind(STATUS_QUEUED)
+            .bind(retry_message)
+            .execute(&self.pool)
+            .await
+            .context("requeue avatar generation task after failure")?;
+            return Ok(());
+        }
+
         sqlx::query(
             "UPDATE player_avatar_generation_tasks
              SET status = $2,
@@ -943,7 +969,7 @@ impl AvatarGenerationClient {
         .bind(STATUS_FAILED)
         .bind(PHASE_FAILED)
         .bind(message_for_phase(PHASE_FAILED))
-        .bind(final_reason)
+        .bind(reason.to_string())
         .execute(&self.pool)
         .await
         .context("mark avatar generation task failed")?;
@@ -1477,6 +1503,7 @@ fn extract_meshy_glb_url(
         model_urls.and_then(|value| value.glb.clone()),
         result_urls.and_then(|value| value.glb_url.clone()),
         result_urls.and_then(|value| value.animated_glb_url.clone()),
+        result_urls.and_then(|value| value.animation_glb_url.clone()),
         glb_url.cloned(),
     ]
     .into_iter()
@@ -1542,6 +1569,20 @@ mod tests {
         assert_eq!(banded_progress(PHASE_MESH_GENERATING, 0), 20);
         assert_eq!(banded_progress(PHASE_MESH_GENERATING, 100), 45);
         assert_eq!(banded_progress(PHASE_DANCE_ANIMATING, 50), 90);
+    }
+
+    #[test]
+    fn extract_meshy_glb_url_supports_animation_glb_url() {
+        let result_urls = MeshyResultUrls {
+            glb_url: None,
+            animated_glb_url: None,
+            animation_glb_url: Some("https://example.com/idle.glb".to_string()),
+        };
+
+        assert_eq!(
+            extract_meshy_glb_url(None, Some(&result_urls), None),
+            Some("https://example.com/idle.glb".to_string())
+        );
     }
 
     #[tokio::test]

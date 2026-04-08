@@ -93,6 +93,8 @@ const CROSSHAIR_THICKNESS: f32 = 0.004;
 const TARGET_OUTLINE_THICKNESS: f32 = 0.035;
 const WILD_PET_TARGET_OUTLINE_THICKNESS: f32 = 0.045;
 const WILD_PET_TARGET_OUTLINE_PADDING: f32 = 0.06;
+const WORLD_WEAPON_TARGET_OUTLINE_THICKNESS: f32 = 0.04;
+const WORLD_WEAPON_TARGET_OUTLINE_PADDING: f32 = 0.05;
 const THIRD_PERSON_ENTRY_ZOOM: f32 = 3.25;
 const THIRD_PERSON_SCROLL_STEP: f32 = 0.75;
 const THIRD_PERSON_MAX_ZOOM: f32 = 6.0;
@@ -3948,7 +3950,29 @@ impl WebApp {
                     (3, 1),
                 );
             }
-            InteractionTarget::Link | InteractionTarget::WorldWeapon(_) => return None,
+            InteractionTarget::WorldWeapon(hit) => {
+                let weapon = self.world_weapons.get(&hit.weapon_id)?;
+                let min = Vec3::new(
+                    weapon.position.x - WORLD_WEAPON_PICKUP_BOX_RADIUS,
+                    weapon.position.y - WORLD_WEAPON_PICKUP_BOX_FOOT_PADDING,
+                    weapon.position.z - WORLD_WEAPON_PICKUP_BOX_RADIUS,
+                ) - Vec3::splat(WORLD_WEAPON_TARGET_OUTLINE_PADDING);
+                let max = Vec3::new(
+                    weapon.position.x + WORLD_WEAPON_PICKUP_BOX_RADIUS,
+                    weapon.position.y + WORLD_WEAPON_PICKUP_BOX_HEIGHT,
+                    weapon.position.z + WORLD_WEAPON_PICKUP_BOX_RADIUS,
+                ) + Vec3::splat(WORLD_WEAPON_TARGET_OUTLINE_PADDING);
+                add_aabb_outline(
+                    &mut vertices,
+                    &mut indices,
+                    min,
+                    max,
+                    WORLD_WEAPON_TARGET_OUTLINE_THICKNESS,
+                    [1.0, 0.84, 0.32],
+                    (3, 1),
+                );
+            }
+            InteractionTarget::Link => return None,
         }
 
         (!vertices.is_empty()).then(|| renderer.create_mesh(&vertices, &indices))

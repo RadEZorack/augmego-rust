@@ -91,6 +91,8 @@ const CROSSHAIR_DISTANCE: f32 = 0.6;
 const CROSSHAIR_LENGTH: f32 = 0.035;
 const CROSSHAIR_THICKNESS: f32 = 0.004;
 const TARGET_OUTLINE_THICKNESS: f32 = 0.035;
+const WILD_PET_TARGET_OUTLINE_THICKNESS: f32 = 0.045;
+const WILD_PET_TARGET_OUTLINE_PADDING: f32 = 0.06;
 const THIRD_PERSON_ENTRY_ZOOM: f32 = 3.25;
 const THIRD_PERSON_SCROLL_STEP: f32 = 0.75;
 const THIRD_PERSON_MAX_ZOOM: f32 = 6.0;
@@ -3909,22 +3911,47 @@ impl WebApp {
     }
 
     fn build_target_highlight_mesh(&mut self, renderer: &Renderer<'_>) -> Option<Mesh> {
-        let InteractionTarget::Block(target) = self.current_interaction_target()? else {
-            return None;
-        };
-        let face = target.face?;
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
-        add_face_highlight(
-            &mut vertices,
-            &mut indices,
-            target.block,
-            face,
-            TARGET_OUTLINE_THICKNESS,
-            [1.0, 0.95, 0.45],
-            (3, 1),
-        );
-        Some(renderer.create_mesh(&vertices, &indices))
+        match self.current_interaction_target()? {
+            InteractionTarget::Block(target) => {
+                let face = target.face?;
+                add_face_highlight(
+                    &mut vertices,
+                    &mut indices,
+                    target.block,
+                    face,
+                    TARGET_OUTLINE_THICKNESS,
+                    [1.0, 0.95, 0.45],
+                    (3, 1),
+                );
+            }
+            InteractionTarget::WildPet(hit) => {
+                let pet = self.wild_pets.get(&hit.pet_id)?;
+                let min = Vec3::new(
+                    pet.position.x - WILD_PET_CAPTURE_BOX_RADIUS,
+                    pet.position.y - WILD_PET_CAPTURE_BOX_FOOT_PADDING,
+                    pet.position.z - WILD_PET_CAPTURE_BOX_RADIUS,
+                ) - Vec3::splat(WILD_PET_TARGET_OUTLINE_PADDING);
+                let max = Vec3::new(
+                    pet.position.x + WILD_PET_CAPTURE_BOX_RADIUS,
+                    pet.position.y + WILD_PET_CAPTURE_BOX_HEIGHT,
+                    pet.position.z + WILD_PET_CAPTURE_BOX_RADIUS,
+                ) + Vec3::splat(WILD_PET_TARGET_OUTLINE_PADDING);
+                add_aabb_outline(
+                    &mut vertices,
+                    &mut indices,
+                    min,
+                    max,
+                    WILD_PET_TARGET_OUTLINE_THICKNESS,
+                    [1.0, 0.58, 0.24],
+                    (3, 1),
+                );
+            }
+            InteractionTarget::Link | InteractionTarget::WorldWeapon(_) => return None,
+        }
+
+        (!vertices.is_empty()).then(|| renderer.create_mesh(&vertices, &indices))
     }
 
     fn build_pet_weapon_shot_mesh(&mut self, renderer: &Renderer<'_>) -> Option<Mesh> {
@@ -9245,6 +9272,65 @@ fn add_face_highlight(
             color,
             tile,
         ),
+    }
+}
+
+fn add_aabb_outline(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    min: Vec3,
+    max: Vec3,
+    thickness: f32,
+    color: [f32; 3],
+    tile: (u32, u32),
+) {
+    let half = thickness * 0.5;
+    let center = (min + max) * 0.5;
+    let extent = (max - min) * 0.5;
+
+    for &y in &[-extent.y, extent.y] {
+        for &z in &[-extent.z, extent.z] {
+            add_box_oriented(
+                vertices,
+                indices,
+                center + Vec3::new(0.0, y, z),
+                Vec3::new(extent.x, 0.0, 0.0),
+                Vec3::new(0.0, half, 0.0),
+                Vec3::new(0.0, 0.0, half),
+                color,
+                tile,
+            );
+        }
+    }
+
+    for &x in &[-extent.x, extent.x] {
+        for &z in &[-extent.z, extent.z] {
+            add_box_oriented(
+                vertices,
+                indices,
+                center + Vec3::new(x, 0.0, z),
+                Vec3::new(half, 0.0, 0.0),
+                Vec3::new(0.0, extent.y, 0.0),
+                Vec3::new(0.0, 0.0, half),
+                color,
+                tile,
+            );
+        }
+    }
+
+    for &x in &[-extent.x, extent.x] {
+        for &y in &[-extent.y, extent.y] {
+            add_box_oriented(
+                vertices,
+                indices,
+                center + Vec3::new(x, y, 0.0),
+                Vec3::new(half, 0.0, 0.0),
+                Vec3::new(0.0, half, 0.0),
+                Vec3::new(0.0, 0.0, extent.z),
+                color,
+                tile,
+            );
+        }
     }
 }
 

@@ -36,7 +36,7 @@ use wgpu_lite::{
     AnimatedMesh, AnimatedMeshDraw, AnimatedVertex, DynamicTexture, MAX_SKIN_JOINTS, Mesh,
     Renderer, TexturedMesh, TexturedMeshDraw, Vertex,
 };
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{
     DeviceEvent, ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase,
     WindowEvent,
@@ -1474,13 +1474,27 @@ impl WebApp {
         }
 
         let touch_id = touch.id;
-        let position = Vec2::new(touch.location.x as f32, touch.location.y as f32);
+        let position = self.touch_position_in_viewport(touch.location);
         match touch.phase {
             TouchPhase::Started => self.handle_touch_started(touch_id, position),
             TouchPhase::Moved => self.handle_touch_moved(touch_id, position),
             TouchPhase::Ended | TouchPhase::Cancelled => self.handle_touch_ended(touch_id),
         }
         self.sync_mobile_hud_state();
+    }
+
+    fn touch_position_in_viewport(&self, position: PhysicalPosition<f64>) -> Vec2 {
+        let rect = self.canvas.get_bounding_client_rect();
+        map_physical_touch_to_viewport(
+            Vec2::new(position.x as f32, position.y as f32),
+            self.size,
+            ScreenRect {
+                left: rect.left() as f32,
+                top: rect.top() as f32,
+                right: rect.right() as f32,
+                bottom: rect.bottom() as f32,
+            },
+        )
     }
 
     fn handle_touch_started(&mut self, touch_id: u64, position: Vec2) {
@@ -7890,6 +7904,26 @@ fn normalized_joystick_vector(rect: ScreenRect, position: Vec2) -> Vec2 {
     delta.normalize_or_zero() * scaled
 }
 
+fn map_physical_touch_to_viewport(
+    position: Vec2,
+    window_size: PhysicalSize<u32>,
+    canvas_rect: ScreenRect,
+) -> Vec2 {
+    if window_size.width == 0 || window_size.height == 0 {
+        return position;
+    }
+
+    let canvas_size = canvas_rect.size();
+    if canvas_size.x <= f32::EPSILON || canvas_size.y <= f32::EPSILON {
+        return position;
+    }
+
+    Vec2::new(
+        canvas_rect.left + position.x * canvas_size.x / window_size.width as f32,
+        canvas_rect.top + position.y * canvas_size.y / window_size.height as f32,
+    )
+}
+
 fn mobile_pinch_target_zoom(
     baseline_zoom: f32,
     baseline_distance: f32,
@@ -12113,5 +12147,22 @@ mod tests {
             classify_mobile_touch_zone(Vec2::new(40.0, 160.0), &rects, false),
             MobileTouchZone::Unclaimed
         );
+    }
+
+    #[test]
+    fn physical_touch_positions_are_mapped_back_to_css_pixels() {
+        let mapped = map_physical_touch_to_viewport(
+            Vec2::new(900.0, 1800.0),
+            PhysicalSize::new(1080, 2160),
+            ScreenRect {
+                left: 0.0,
+                top: 0.0,
+                right: 360.0,
+                bottom: 720.0,
+            },
+        );
+
+        assert!((mapped.x - 300.0).abs() < 0.01);
+        assert!((mapped.y - 600.0).abs() < 0.01);
     }
 }

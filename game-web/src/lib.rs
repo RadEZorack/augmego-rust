@@ -6494,7 +6494,7 @@ fn create_weapon_collection_panel() -> Element {
         .expect("weapon collection panel");
     let _ = panel.set_attribute(
         "style",
-        "position:fixed;left:16px;bottom:168px;width:min(300px,calc(100vw - 32px));max-height:220px;overflow:auto;padding:14px 16px;border-radius:18px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:30;font:600 12px/1.45 ui-sans-serif,system-ui,sans-serif;white-space:pre-line;",
+        "display:none;position:fixed;left:16px;bottom:168px;width:min(300px,calc(100vw - 32px));max-height:220px;overflow:auto;padding:14px 16px;border-radius:18px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:30;font:600 12px/1.45 ui-sans-serif,system-ui,sans-serif;white-space:pre-line;",
     );
     let _ = body.append_child(&panel);
     panel
@@ -7780,14 +7780,6 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
     let _ = generate_launcher.set_attribute("style", player_avatar_primary_button_style());
     let _ = root.append_child(&generate_launcher);
 
-    let manual_launcher = document
-        .create_element("button")
-        .expect("player avatar manual launcher");
-    manual_launcher.set_text_content(Some("Manual Upload"));
-    let _ = manual_launcher.set_attribute("type", "button");
-    let _ = manual_launcher.set_attribute("style", player_avatar_secondary_button_style());
-    let _ = root.append_child(&manual_launcher);
-
     let modal_root = document
         .create_element("div")
         .expect("player avatar modal root");
@@ -8342,17 +8334,6 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
     let _ = generate_launcher
         .add_event_listener_with_callback("click", open_generate_modal.as_ref().unchecked_ref());
     open_generate_modal.forget();
-
-    let modal_for_open = modal.clone();
-    let open_modal = Closure::wrap(Box::new(move |_event: WebEvent| {
-        let _ = modal_for_open.set_attribute(
-            "style",
-            "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(5,8,12,0.72);backdrop-filter:blur(10px);z-index:65;",
-        );
-    }) as Box<dyn FnMut(WebEvent)>);
-    let _ = manual_launcher
-        .add_event_listener_with_callback("click", open_modal.as_ref().unchecked_ref());
-    open_modal.forget();
 
     let modal_for_close = modal.clone();
     let close_modal = Closure::wrap(Box::new(move |_event: WebEvent| {

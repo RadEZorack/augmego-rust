@@ -110,10 +110,10 @@ const MOBILE_JOYSTICK_DEADZONE: f32 = 0.16;
 const MOBILE_JOYSTICK_TURN_SPEED: f32 = 2.8;
 const MOBILE_JOYSTICK_THUMB_OFFSET_PX: f32 = 32.0;
 const MOBILE_PINCH_MIN_DISTANCE: f32 = 12.0;
-const MOBILE_TILT_DEADZONE_DEGREES: f32 = 2.0;
+const MOBILE_TILT_DEADZONE_DEGREES: f32 = 1.25;
 const MOBILE_TILT_MAX_DEGREES: f32 = 32.0;
-const MOBILE_TILT_MAX_YAW_RADIANS: f32 = 0.55;
-const MOBILE_TILT_MAX_PITCH_RADIANS: f32 = 0.48;
+const MOBILE_TILT_MAX_YAW_RADIANS: f32 = 0.9;
+const MOBILE_TILT_MAX_PITCH_RADIANS: f32 = 0.8;
 const MOBILE_TILT_SMOOTHING: f32 = 10.0;
 const LOCAL_AVATAR_TURN_SPEED: f32 = 10.0;
 const LOCAL_AVATAR_PLACEHOLDER_TINT: [f32; 3] = [0.82, 0.73, 0.44];
@@ -3719,14 +3719,7 @@ impl WebApp {
         let Some(sample) = self.mobile_controls.latest_tilt_sample else {
             return Vec2::ZERO;
         };
-        let delta = sample.axes - baseline.axes;
-        let yaw = clamp_mobile_tilt_axis(delta.x, MOBILE_TILT_DEADZONE_DEGREES)
-            / MOBILE_TILT_MAX_DEGREES
-            * MOBILE_TILT_MAX_YAW_RADIANS;
-        let pitch = clamp_mobile_tilt_axis(delta.y, MOBILE_TILT_DEADZONE_DEGREES)
-            / MOBILE_TILT_MAX_DEGREES
-            * MOBILE_TILT_MAX_PITCH_RADIANS;
-        Vec2::new(yaw, pitch)
+        mobile_tilt_offset_from_delta(sample.axes - baseline.axes)
     }
 
     fn apply_mobile_look(&mut self, dt_secs: f32) -> f32 {
@@ -7950,6 +7943,16 @@ fn clamp_mobile_tilt_axis(value: f32, deadzone: f32) -> f32 {
     adjusted.clamp(-MOBILE_TILT_MAX_DEGREES, MOBILE_TILT_MAX_DEGREES)
 }
 
+fn mobile_tilt_offset_from_delta(delta: Vec2) -> Vec2 {
+    let yaw = clamp_mobile_tilt_axis(delta.x, MOBILE_TILT_DEADZONE_DEGREES)
+        / MOBILE_TILT_MAX_DEGREES
+        * MOBILE_TILT_MAX_YAW_RADIANS;
+    let pitch = -clamp_mobile_tilt_axis(delta.y, MOBILE_TILT_DEADZONE_DEGREES)
+        / MOBILE_TILT_MAX_DEGREES
+        * MOBILE_TILT_MAX_PITCH_RADIANS;
+    Vec2::new(yaw, pitch)
+}
+
 fn normalize_tilt_axes(
     beta: f32,
     gamma: f32,
@@ -12105,6 +12108,13 @@ mod tests {
         assert_eq!(clamp_mobile_tilt_axis(1.5, 2.0), 0.0);
         assert_eq!(clamp_mobile_tilt_axis(-1.5, 2.0), 0.0);
         assert_eq!(clamp_mobile_tilt_axis(7.0, 2.0), 5.0);
+    }
+
+    #[test]
+    fn tilt_vertical_offset_is_reversed_and_stronger() {
+        let offset = mobile_tilt_offset_from_delta(Vec2::new(8.0, 8.0));
+        assert!(offset.x > 0.18);
+        assert!(offset.y < -0.16);
     }
 
     #[test]

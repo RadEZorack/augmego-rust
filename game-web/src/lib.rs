@@ -110,10 +110,6 @@ const MOBILE_JOYSTICK_DEADZONE: f32 = 0.16;
 const MOBILE_JOYSTICK_TURN_SPEED: f32 = 2.8;
 const MOBILE_JOYSTICK_THUMB_OFFSET_PX: f32 = 32.0;
 const MOBILE_PINCH_MIN_DISTANCE: f32 = 12.0;
-const MOBILE_TILT_DEADZONE_DEGREES: f32 = 1.25;
-const MOBILE_TILT_MAX_DEGREES: f32 = 32.0;
-const MOBILE_TILT_MAX_YAW_RADIANS: f32 = 0.9;
-const MOBILE_TILT_MAX_PITCH_RADIANS: f32 = 0.8;
 const MOBILE_TILT_SMOOTHING: f32 = 10.0;
 const LOCAL_AVATAR_TURN_SPEED: f32 = 10.0;
 const LOCAL_AVATAR_PLACEHOLDER_TINT: [f32; 3] = [0.82, 0.73, 0.44];
@@ -563,8 +559,8 @@ struct MobileControlsState {
     tilt_permission: MobileTiltPermissionState,
     tilt_baseline: Option<MobileTiltSample>,
     latest_tilt_sample: Option<MobileTiltSample>,
-    smoothed_look_offset: Vec2,
-    applied_look_offset: Vec2,
+    smoothed_look_offset: Vec3,
+    applied_look_offset: Vec3,
 }
 
 impl MobileControlsState {
@@ -580,8 +576,8 @@ impl MobileControlsState {
             tilt_permission: MobileTiltPermissionState::Inactive,
             tilt_baseline: None,
             latest_tilt_sample: None,
-            smoothed_look_offset: Vec2::ZERO,
-            applied_look_offset: Vec2::ZERO,
+            smoothed_look_offset: Vec3::ZERO,
+            applied_look_offset: Vec3::ZERO,
         }
     }
 
@@ -596,8 +592,8 @@ impl MobileControlsState {
 
     fn bake_current_tilt_into_camera(&mut self) {
         self.tilt_baseline = self.latest_tilt_sample;
-        self.smoothed_look_offset = Vec2::ZERO;
-        self.applied_look_offset = Vec2::ZERO;
+        self.smoothed_look_offset = Vec3::ZERO;
+        self.applied_look_offset = Vec3::ZERO;
     }
 }
 
@@ -1275,6 +1271,7 @@ impl WebApp {
             if next_mode == InputMode::Desktop {
                 self.mobile_controls.clear_touch_tracking();
                 self.mobile_controls.bake_current_tilt_into_camera();
+                self.camera.roll = 0.0;
             }
             self.input_mode = next_mode;
         }
@@ -1381,8 +1378,9 @@ impl WebApp {
                 | MobileTiltPermissionState::Unsupported
                 | MobileTiltPermissionState::Inactive => {
                     self.mobile_controls.tilt_baseline = None;
-                    self.mobile_controls.smoothed_look_offset = Vec2::ZERO;
-                    self.mobile_controls.applied_look_offset = Vec2::ZERO;
+                    self.mobile_controls.smoothed_look_offset = Vec3::ZERO;
+                    self.mobile_controls.applied_look_offset = Vec3::ZERO;
+                    self.camera.roll = 0.0;
                 }
                 MobileTiltPermissionState::Pending => {}
             }
@@ -1399,8 +1397,8 @@ impl WebApp {
                     .unwrap_or(false);
                 if orientation_changed {
                     self.mobile_controls.tilt_baseline = Some(default_mobile_tilt_baseline(sample));
-                    self.mobile_controls.smoothed_look_offset = Vec2::ZERO;
-                    self.mobile_controls.applied_look_offset = Vec2::ZERO;
+                    self.mobile_controls.smoothed_look_offset = Vec3::ZERO;
+                    self.mobile_controls.applied_look_offset = Vec3::ZERO;
                 } else if self.mobile_controls.tilt_baseline.is_none() {
                     self.mobile_controls.tilt_baseline = Some(default_mobile_tilt_baseline(sample));
                 }
@@ -1441,17 +1439,21 @@ impl WebApp {
     }
 
     fn recalibrate_mobile_tilt(&mut self) {
+        self.camera.yaw -= self.mobile_controls.applied_look_offset.x;
+        self.camera.pitch = 0.0;
+        self.camera.roll = 0.0;
         self.mobile_controls.tilt_baseline = self.mobile_controls.latest_tilt_sample;
-        self.mobile_controls.smoothed_look_offset = Vec2::ZERO;
-        self.mobile_controls.applied_look_offset = Vec2::ZERO;
+        self.mobile_controls.smoothed_look_offset = Vec3::ZERO;
+        self.mobile_controls.applied_look_offset = Vec3::ZERO;
     }
 
     fn activate_or_recalibrate_mobile_tilt(&mut self) {
         if !device_orientation_supported() {
             self.mobile_controls.tilt_permission = MobileTiltPermissionState::Unsupported;
             self.mobile_controls.tilt_baseline = None;
-            self.mobile_controls.smoothed_look_offset = Vec2::ZERO;
-            self.mobile_controls.applied_look_offset = Vec2::ZERO;
+            self.mobile_controls.smoothed_look_offset = Vec3::ZERO;
+            self.mobile_controls.applied_look_offset = Vec3::ZERO;
+            self.camera.roll = 0.0;
             self.sync_mobile_hud_state();
             return;
         }
@@ -3720,15 +3722,15 @@ impl WebApp {
         }
     }
 
-    fn current_mobile_tilt_target(&self) -> Vec2 {
+    fn current_mobile_tilt_target(&self) -> Vec3 {
         if self.mobile_controls.tilt_permission != MobileTiltPermissionState::Active {
-            return Vec2::ZERO;
+            return Vec3::ZERO;
         }
         let Some(baseline) = self.mobile_controls.tilt_baseline else {
-            return Vec2::ZERO;
+            return Vec3::ZERO;
         };
         let Some(sample) = self.mobile_controls.latest_tilt_sample else {
-            return Vec2::ZERO;
+            return Vec3::ZERO;
         };
         mobile_tilt_offset_from_samples(sample, baseline)
     }
@@ -3739,21 +3741,29 @@ impl WebApp {
         }
 
         let mut base_yaw = self.camera.yaw - self.mobile_controls.applied_look_offset.x;
-        let base_pitch = (self.camera.pitch + self.mobile_controls.applied_look_offset.y)
-            .clamp(-1.45, 1.45);
+        let base_pitch = self.camera.pitch + self.mobile_controls.applied_look_offset.y;
+        let base_roll = self.camera.roll - self.mobile_controls.applied_look_offset.z;
         let yaw_delta = -self.mobile_controls.joystick_vector.x * MOBILE_JOYSTICK_TURN_SPEED
             * dt_secs.max(0.0);
         base_yaw += yaw_delta;
 
         let target_offset = self.current_mobile_tilt_target();
         let smoothing = 1.0 - (-MOBILE_TILT_SMOOTHING * dt_secs.max(0.0)).exp();
+        let wrapped_target_offset = Vec3::new(
+            self.mobile_controls.smoothed_look_offset.x
+                + angle_delta(target_offset.x, self.mobile_controls.smoothed_look_offset.x),
+            self.mobile_controls.smoothed_look_offset.y
+                + angle_delta(target_offset.y, self.mobile_controls.smoothed_look_offset.y),
+            self.mobile_controls.smoothed_look_offset.z
+                + angle_delta(target_offset.z, self.mobile_controls.smoothed_look_offset.z),
+        );
         self.mobile_controls.smoothed_look_offset +=
-            (target_offset - self.mobile_controls.smoothed_look_offset) * smoothing;
+            (wrapped_target_offset - self.mobile_controls.smoothed_look_offset) * smoothing;
         self.mobile_controls.applied_look_offset = self.mobile_controls.smoothed_look_offset;
 
         self.camera.yaw = base_yaw + self.mobile_controls.applied_look_offset.x;
-        self.camera.pitch =
-            (base_pitch - self.mobile_controls.applied_look_offset.y).clamp(-1.45, 1.45);
+        self.camera.pitch = base_pitch - self.mobile_controls.applied_look_offset.y;
+        self.camera.roll = base_roll + self.mobile_controls.applied_look_offset.z;
         yaw_delta
     }
 
@@ -4599,8 +4609,8 @@ impl WebApp {
         }
 
         let forward = self.camera.forward();
-        let right = Vec3::new(-forward.z, 0.0, forward.x).normalize_or_zero();
-        let up = right.cross(forward).normalize_or_zero();
+        let right = self.camera.right();
+        let up = self.camera.up();
         let scale = if self.is_third_person_active() {
             0.7
         } else {
@@ -6665,6 +6675,7 @@ struct Camera {
     position: Vec3,
     yaw: f32,
     pitch: f32,
+    roll: f32,
     vertical_velocity: f32,
     on_ground: bool,
 }
@@ -6672,7 +6683,7 @@ struct Camera {
 impl Camera {
     fn matrix(&self, aspect: f32, eye_position: Vec3) -> Mat4 {
         let look = self.forward();
-        let view = Mat4::look_at_rh(eye_position, eye_position + look, Vec3::Y);
+        let view = Mat4::look_at_rh(eye_position, eye_position + look, self.up());
         let proj = Mat4::perspective_rh_gl(60.0_f32.to_radians(), aspect, 0.1, 1_500.0);
         proj * view
     }
@@ -6684,6 +6695,16 @@ impl Camera {
             self.yaw.cos() * self.pitch.cos(),
         )
         .normalize_or_zero()
+    }
+
+    fn right(&self) -> Vec3 {
+        let (right, _) = camera_basis_from_forward_and_roll(self.forward(), self.roll);
+        right
+    }
+
+    fn up(&self) -> Vec3 {
+        let (_, up) = camera_basis_from_forward_and_roll(self.forward(), self.roll);
+        up
     }
 }
 
@@ -7846,9 +7867,9 @@ fn mobile_hud_action_button_style(active: bool, upper_button: bool) -> &'static 
 
 fn mobile_hud_tilt_button_style(active: bool) -> &'static str {
     if active {
-        "position:fixed;left:50%;top:max(78px,calc(env(safe-area-inset-top) + 78px));transform:translateX(-50%);padding:12px 18px;border-radius:999px;border:1px solid rgba(183,230,255,0.38);background:linear-gradient(180deg,rgba(20,62,84,0.94),rgba(12,40,56,0.94));color:#effaff;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 12px 28px rgba(0,0,0,0.28);backdrop-filter:blur(10px);"
+        "position:fixed;left:max(18px,calc(env(safe-area-inset-left) + 18px));top:max(78px,calc(env(safe-area-inset-top) + 78px));padding:12px 18px;border-radius:999px;border:1px solid rgba(183,230,255,0.38);background:linear-gradient(180deg,rgba(20,62,84,0.94),rgba(12,40,56,0.94));color:#effaff;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 12px 28px rgba(0,0,0,0.28);backdrop-filter:blur(10px);"
     } else {
-        "position:fixed;left:50%;top:max(78px,calc(env(safe-area-inset-top) + 78px));transform:translateX(-50%);padding:12px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.18);background:rgba(18,24,32,0.88);color:#f6f8fb;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 12px 28px rgba(0,0,0,0.28);backdrop-filter:blur(10px);"
+        "position:fixed;left:max(18px,calc(env(safe-area-inset-left) + 18px));top:max(78px,calc(env(safe-area-inset-top) + 78px));padding:12px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.18);background:rgba(18,24,32,0.88);color:#f6f8fb;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 12px 28px rgba(0,0,0,0.28);backdrop-filter:blur(10px);"
     }
 }
 
@@ -7940,32 +7961,19 @@ fn mobile_pinch_target_zoom(
     (anchor_zoom + zoom_steps * THIRD_PERSON_SCROLL_STEP).clamp(0.0, THIRD_PERSON_MAX_ZOOM)
 }
 
-fn clamp_mobile_tilt_axis(value: f32, deadzone: f32) -> f32 {
-    let adjusted = if value.abs() <= deadzone {
-        0.0
-    } else {
-        value - deadzone * value.signum()
-    };
-    adjusted.clamp(-MOBILE_TILT_MAX_DEGREES, MOBILE_TILT_MAX_DEGREES)
-}
-
 fn mobile_tilt_offset_from_samples(
     sample: MobileTiltSample,
     baseline: MobileTiltSample,
-) -> Vec2 {
+) -> Vec3 {
     let relative = mobile_tilt_quaternion(baseline).inverse() * mobile_tilt_quaternion(sample);
     let forward = relative * Vec3::Z;
+    let up = relative * Vec3::Y;
     let yaw = forward.x.atan2(forward.z);
     let horizontal = Vec2::new(forward.x, forward.z).length();
     let pitch = forward.y.atan2(horizontal.max(1.0e-4));
-    Vec2::new(
-        clamp_mobile_tilt_axis(yaw.to_degrees(), MOBILE_TILT_DEADZONE_DEGREES)
-            .to_radians()
-            .clamp(-MOBILE_TILT_MAX_YAW_RADIANS, MOBILE_TILT_MAX_YAW_RADIANS),
-        clamp_mobile_tilt_axis(pitch.to_degrees(), MOBILE_TILT_DEADZONE_DEGREES)
-            .to_radians()
-            .clamp(-MOBILE_TILT_MAX_PITCH_RADIANS, MOBILE_TILT_MAX_PITCH_RADIANS),
-    )
+    let (_, zero_roll_up) = camera_basis_from_forward_and_roll(forward, 0.0);
+    let roll = signed_angle_around_axis(zero_roll_up, up, forward);
+    Vec3::new(yaw, pitch, roll)
 }
 
 fn default_mobile_tilt_baseline(sample: MobileTiltSample) -> MobileTiltSample {
@@ -8004,6 +8012,34 @@ fn viewport_orientation_radians(orientation: MobileViewportOrientation) -> f32 {
         MobileViewportOrientation::LandscapeRight => -std::f32::consts::FRAC_PI_2,
         MobileViewportOrientation::PortraitUpsideDown => std::f32::consts::PI,
     }
+}
+
+fn camera_basis_from_forward_and_roll(forward: Vec3, roll: f32) -> (Vec3, Vec3) {
+    let forward = forward.normalize_or_zero();
+    if forward == Vec3::ZERO {
+        return (Vec3::X, Vec3::Y);
+    }
+    let reference_up = if forward.y.abs() > 0.999 { Vec3::Z } else { Vec3::Y };
+    let right = reference_up.cross(forward).normalize_or_zero();
+    let up = forward.cross(right).normalize_or_zero();
+    if roll.abs() <= f32::EPSILON {
+        return (right, up);
+    }
+    let roll_rotation = Quat::from_axis_angle(forward, roll);
+    (roll_rotation * right, roll_rotation * up)
+}
+
+fn signed_angle_around_axis(from: Vec3, to: Vec3, axis: Vec3) -> f32 {
+    let axis = axis.normalize_or_zero();
+    if axis == Vec3::ZERO {
+        return 0.0;
+    }
+    let from = (from - axis * from.dot(axis)).normalize_or_zero();
+    let to = (to - axis * to.dot(axis)).normalize_or_zero();
+    if from == Vec3::ZERO || to == Vec3::ZERO {
+        return 0.0;
+    }
+    axis.dot(from.cross(to)).atan2(from.dot(to))
 }
 
 fn browser_supports_touch_input() -> bool {
@@ -12144,10 +12180,20 @@ mod tests {
     }
 
     #[test]
-    fn tilt_deadzone_zeroes_small_motion() {
-        assert_eq!(clamp_mobile_tilt_axis(1.5, 2.0), 0.0);
-        assert_eq!(clamp_mobile_tilt_axis(-1.5, 2.0), 0.0);
-        assert_eq!(clamp_mobile_tilt_axis(7.0, 2.0), 5.0);
+    fn tilt_roll_changes_camera_roll() {
+        let baseline = MobileTiltSample {
+            alpha_deg: 0.0,
+            beta_deg: 90.0,
+            gamma_deg: 0.0,
+            orientation: MobileViewportOrientation::Portrait,
+        };
+        let rolled = MobileTiltSample {
+            gamma_deg: 30.0,
+            ..baseline
+        };
+
+        let offset = mobile_tilt_offset_from_samples(rolled, baseline);
+        assert!(offset.z.abs() > 0.2);
     }
 
     #[test]
@@ -12166,6 +12212,7 @@ mod tests {
         let offset = mobile_tilt_offset_from_samples(spun, baseline);
         assert!(offset.x > 0.2);
         assert!(offset.y.abs() < 0.1);
+        assert!(offset.z.abs() < 0.1);
     }
 
     #[test]

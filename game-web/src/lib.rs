@@ -115,6 +115,7 @@ const MOBILE_TILT_MAX_DEGREES: f32 = 32.0;
 const MOBILE_TILT_MAX_YAW_RADIANS: f32 = 0.9;
 const MOBILE_TILT_MAX_PITCH_RADIANS: f32 = 0.8;
 const MOBILE_TILT_SMOOTHING: f32 = 10.0;
+const MOBILE_TILT_UPRIGHT_BASELINE_DEGREES: f32 = 90.0;
 const LOCAL_AVATAR_TURN_SPEED: f32 = 10.0;
 const LOCAL_AVATAR_PLACEHOLDER_TINT: [f32; 3] = [0.82, 0.73, 0.44];
 const LINK_PANEL_OPEN_URL: &str = "https://www.google.com";
@@ -1360,7 +1361,13 @@ impl WebApp {
             match permission {
                 MobileTiltPermissionState::Active => {
                     if self.mobile_controls.tilt_baseline.is_none() {
-                        self.mobile_controls.tilt_baseline = self.mobile_controls.latest_tilt_sample;
+                        let orientation = self
+                            .mobile_controls
+                            .latest_tilt_sample
+                            .map(|sample| sample.orientation)
+                            .unwrap_or_else(current_viewport_orientation);
+                        self.mobile_controls.tilt_baseline =
+                            Some(default_mobile_tilt_baseline(orientation));
                     }
                 }
                 MobileTiltPermissionState::Denied
@@ -1384,11 +1391,13 @@ impl WebApp {
                     .map(|baseline| baseline.orientation != sample.orientation)
                     .unwrap_or(false);
                 if orientation_changed {
-                    self.mobile_controls.tilt_baseline = Some(sample);
+                    self.mobile_controls.tilt_baseline =
+                        Some(default_mobile_tilt_baseline(sample.orientation));
                     self.mobile_controls.smoothed_look_offset = Vec2::ZERO;
                     self.mobile_controls.applied_look_offset = Vec2::ZERO;
                 } else if self.mobile_controls.tilt_baseline.is_none() {
-                    self.mobile_controls.tilt_baseline = Some(sample);
+                    self.mobile_controls.tilt_baseline =
+                        Some(default_mobile_tilt_baseline(sample.orientation));
                 }
             }
         }
@@ -7953,6 +7962,13 @@ fn mobile_tilt_offset_from_delta(delta: Vec2) -> Vec2 {
     Vec2::new(yaw, pitch)
 }
 
+fn default_mobile_tilt_baseline(orientation: MobileViewportOrientation) -> MobileTiltSample {
+    MobileTiltSample {
+        axes: Vec2::new(0.0, MOBILE_TILT_UPRIGHT_BASELINE_DEGREES),
+        orientation,
+    }
+}
+
 fn normalize_tilt_axes(
     beta: f32,
     gamma: f32,
@@ -12115,6 +12131,20 @@ mod tests {
         let offset = mobile_tilt_offset_from_delta(Vec2::new(8.0, 8.0));
         assert!(offset.x > 0.18);
         assert!(offset.y < -0.16);
+    }
+
+    #[test]
+    fn upright_portrait_pose_is_the_default_tilt_neutral() {
+        let baseline = default_mobile_tilt_baseline(MobileViewportOrientation::Portrait);
+        let upright_pose = MobileTiltSample {
+            axes: normalize_tilt_axes(90.0, 0.0, MobileViewportOrientation::Portrait),
+            orientation: MobileViewportOrientation::Portrait,
+        };
+
+        assert_eq!(
+            mobile_tilt_offset_from_delta(upright_pose.axes - baseline.axes),
+            Vec2::ZERO
+        );
     }
 
     #[test]

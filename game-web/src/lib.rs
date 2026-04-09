@@ -620,6 +620,7 @@ thread_local! {
     static AUTH_REFRESH_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static CHUNK_QUALITY_CYCLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
     static PERF_PANEL_TOGGLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
+    static HOTBAR_TOGGLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
     static PET_PARTY_MODAL_OPEN_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static PET_PARTY_MODAL_CLOSE_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static PET_PARTY_SAVE_QUEUE: RefCell<bool> = const { RefCell::new(false) };
@@ -910,11 +911,13 @@ struct WebApp {
     mobile_hud: MobileHud,
     _mobile_tilt_listener: Option<Closure<dyn FnMut(WebEvent)>>,
     hotbar_root: Element,
+    hotbar_toggle_button: Element,
     hotbar_slots: Vec<Element>,
     mouse_lock_prompt: Element,
     webcam_prompt: Element,
     hotbar_blocks: Vec<BlockId>,
     selected_hotbar: usize,
+    hotbar_expanded: bool,
     player_id: Option<u64>,
     remote_players: HashMap<u64, [f32; 3]>,
     remote_player_latest_ticks: HashMap<u64, u64>,
@@ -1015,6 +1018,7 @@ struct WebApp {
     next_worker_index: usize,
     last_perf_panel_update: Instant,
     _perf_panel_toggle_onclick: Closure<dyn FnMut(WebEvent)>,
+    _hotbar_toggle_onclick: Closure<dyn FnMut(WebEvent)>,
     _worker_onmessages: Vec<Closure<dyn FnMut(MessageEvent)>>,
     _chunk_quality_button_onclick: Closure<dyn FnMut(WebEvent)>,
 }
@@ -1047,7 +1051,8 @@ impl WebApp {
             BlockId::Lantern,
         ];
         let touch_capable = browser_supports_touch_input();
-        let (hotbar_root, hotbar_slots) = create_hotbar(&hotbar_blocks);
+        let (hotbar_root, hotbar_toggle_button, hotbar_slots, hotbar_toggle_onclick) =
+            create_hotbar(&hotbar_blocks);
         let (mouse_lock_prompt, mouse_lock_prompt_onclick) = create_mouse_lock_prompt(&canvas);
         let (webcam_prompt, webcam_prompt_onclick) = create_webcam_prompt();
         let mobile_hud = create_mobile_hud();
@@ -1129,11 +1134,13 @@ impl WebApp {
             mobile_hud,
             _mobile_tilt_listener: None,
             hotbar_root,
+            hotbar_toggle_button,
             hotbar_slots,
             mouse_lock_prompt,
             webcam_prompt,
             hotbar_blocks,
             selected_hotbar: 0,
+            hotbar_expanded: false,
             player_id: None,
             remote_players: HashMap::new(),
             remote_player_latest_ticks: HashMap::new(),
@@ -1234,6 +1241,7 @@ impl WebApp {
             next_worker_index: 0,
             last_perf_panel_update: now,
             _perf_panel_toggle_onclick: perf_panel_toggle_onclick,
+            _hotbar_toggle_onclick: hotbar_toggle_onclick,
             _worker_onmessages: worker_onmessages,
             _chunk_quality_button_onclick: chunk_quality_button_onclick,
         };
@@ -1244,6 +1252,7 @@ impl WebApp {
         app.update_pet_party_modal();
         app.update_perf_panel(0, 0);
         app.sync_perf_panel_visibility();
+        app.sync_hotbar_visibility();
         app.sync_mobile_layout();
         app
     }
@@ -1276,10 +1285,7 @@ impl WebApp {
             self.input_mode = next_mode;
         }
 
-        let mobile_active = self.is_mobile_active();
-        let _ = self
-            .hotbar_root
-            .set_attribute("style", hotbar_root_style(mobile_active));
+        self.sync_hotbar_visibility();
         self.update_control_hint();
         self.sync_mobile_hud_state();
         self.update_captured_pets_panel();
@@ -1771,6 +1777,19 @@ impl WebApp {
         }
     }
 
+    fn process_hotbar_toggle_requests(&mut self) {
+        let toggle_count = HOTBAR_TOGGLE_QUEUE.with(|queue| {
+            let mut value = queue.borrow_mut();
+            let count = *value;
+            *value = 0;
+            count
+        });
+        if toggle_count % 2 == 1 {
+            self.hotbar_expanded = !self.hotbar_expanded;
+            self.sync_hotbar_visibility();
+        }
+    }
+
     fn update_perf_panel(&mut self, visible_chunks: usize, loaded_chunks: usize) {
         let now = Instant::now();
         if now.duration_since(self.last_perf_panel_update) < PERF_PANEL_UPDATE_INTERVAL {
@@ -1828,6 +1847,34 @@ impl WebApp {
             } else {
                 "false"
             },
+        );
+    }
+
+    fn sync_hotbar_visibility(&self) {
+        let mobile_active = self.is_mobile_active();
+        let _ = self.hotbar_root.set_attribute(
+            "style",
+            hotbar_root_style(mobile_active, self.hotbar_expanded),
+        );
+        let _ = self.hotbar_toggle_button.set_text_content(Some(if self.hotbar_expanded {
+            "Hide Blocks"
+        } else {
+            "Blocks"
+        }));
+        let label = if self.hotbar_expanded {
+            "Hide block selector"
+        } else {
+            "Show block selector"
+        };
+        let _ = self.hotbar_toggle_button.set_attribute(
+            "style",
+            hotbar_toggle_button_style(mobile_active, self.hotbar_expanded),
+        );
+        let _ = self.hotbar_toggle_button.set_attribute("title", label);
+        let _ = self.hotbar_toggle_button.set_attribute("aria-label", label);
+        let _ = self.hotbar_toggle_button.set_attribute(
+            "aria-pressed",
+            if self.hotbar_expanded { "true" } else { "false" },
         );
     }
 
@@ -3779,6 +3826,7 @@ impl WebApp {
         self.sync_pointer_lock_state();
         self.process_chunk_quality_requests();
         self.process_perf_panel_toggle_requests();
+        self.process_hotbar_toggle_requests();
         self.process_auth_events();
         self.process_pet_party_requests();
         self.drain_network();
@@ -6986,16 +7034,30 @@ fn css_viewport_size() -> Option<(f32, f32)> {
     Some((width.max(1.0), height.max(1.0)))
 }
 
-fn create_hotbar(blocks: &[BlockId]) -> (Element, Vec<Element>) {
+fn create_hotbar(blocks: &[BlockId]) -> (Element, Element, Vec<Element>, Closure<dyn FnMut(WebEvent)>) {
     let Some(document) = document() else {
-        return (fallback_element(), Vec::new());
+        let closure =
+            Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        return (fallback_element(), fallback_element(), Vec::new(), closure);
     };
     let Some(body) = document.body() else {
-        return (fallback_element(), Vec::new());
+        let closure =
+            Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
+        return (fallback_element(), fallback_element(), Vec::new(), closure);
     };
 
     let root = document.create_element("div").expect("hotbar root");
-    let _ = root.set_attribute("style", hotbar_root_style(false));
+    let _ = root.set_attribute("style", hotbar_root_style(false, false));
+
+    let toggle_button = document
+        .create_element("button")
+        .expect("hotbar toggle button");
+    toggle_button.set_text_content(Some("Blocks"));
+    let _ = toggle_button.set_attribute("type", "button");
+    let _ = toggle_button.set_attribute("style", hotbar_toggle_button_style(false, false));
+    let _ = toggle_button.set_attribute("title", "Show block selector");
+    let _ = toggle_button.set_attribute("aria-label", "Show block selector");
+    let _ = toggle_button.set_attribute("aria-pressed", "false");
 
     let mut slots = Vec::new();
     for (index, block) in blocks.iter().enumerate() {
@@ -7013,8 +7075,17 @@ fn create_hotbar(blocks: &[BlockId]) -> (Element, Vec<Element>) {
         slots.push(slot);
     }
 
+    let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+        HOTBAR_TOGGLE_QUEUE.with(|queue| {
+            let mut pending = queue.borrow_mut();
+            *pending = pending.saturating_add(1);
+        });
+    }) as Box<dyn FnMut(WebEvent)>);
+    let _ = toggle_button.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+
     let _ = body.append_child(&root);
-    (root, slots)
+    let _ = body.append_child(&toggle_button);
+    (root, toggle_button, slots, onclick)
 }
 
 fn create_mobile_hud() -> MobileHud {
@@ -7528,7 +7599,7 @@ fn create_perf_panel() -> Element {
 
 fn perf_panel_style(visible: bool) -> &'static str {
     if visible {
-        "position:fixed;top:72px;right:220px;z-index:45;padding:10px 12px;border-radius:12px;background:rgba(7,10,14,0.74);border:1px solid rgba(255,255,255,0.10);color:rgba(233,239,245,0.92);font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-line;pointer-events:none;backdrop-filter:blur(8px);min-width:170px;"
+        "position:fixed;left:50%;top:max(18px,calc(env(safe-area-inset-top) + 18px));transform:translateX(-50%);z-index:70;padding:10px 12px;border-radius:12px;background:rgba(7,10,14,0.82);border:1px solid rgba(255,255,255,0.10);color:rgba(233,239,245,0.92);font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-line;pointer-events:none;backdrop-filter:blur(8px);min-width:170px;text-align:center;"
     } else {
         "display:none;"
     }
@@ -7819,11 +7890,22 @@ fn update_hotbar_ui(slots: &[Element], blocks: &[BlockId], selected: usize) {
     }
 }
 
-fn hotbar_root_style(mobile: bool) -> &'static str {
-    if mobile {
-        "position:fixed;left:50%;bottom:max(128px,calc(env(safe-area-inset-bottom) + 128px));transform:translateX(-50%);display:flex;flex-wrap:wrap;justify-content:center;gap:10px;max-width:min(560px,calc(100vw - 28px));padding:10px 14px;border-radius:18px;background:rgba(18,24,32,0.64);backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,0.28);pointer-events:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;z-index:20;"
+fn hotbar_root_style(mobile: bool, expanded: bool) -> &'static str {
+    if !expanded {
+        "display:none;"
+    } else if mobile {
+        "position:fixed;left:50%;bottom:max(150px,calc(env(safe-area-inset-bottom) + 150px));transform:translateX(-50%);display:flex;flex-wrap:wrap;justify-content:center;gap:10px;max-width:min(560px,calc(100vw - 28px));padding:10px 14px;border-radius:18px;background:rgba(18,24,32,0.64);backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,0.28);pointer-events:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;z-index:20;"
     } else {
-        "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);display:flex;gap:10px;padding:10px 14px;border-radius:18px;background:rgba(18,24,32,0.64);backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,0.28);pointer-events:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;z-index:20;"
+        "position:fixed;left:50%;bottom:86px;transform:translateX(-50%);display:flex;gap:10px;padding:10px 14px;border-radius:18px;background:rgba(18,24,32,0.64);backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,0.28);pointer-events:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;z-index:20;"
+    }
+}
+
+fn hotbar_toggle_button_style(mobile: bool, expanded: bool) -> &'static str {
+    match (mobile, expanded) {
+        (true, true) => "position:fixed;left:50%;bottom:max(92px,calc(env(safe-area-inset-bottom) + 92px));transform:translateX(-50%);min-width:116px;height:46px;padding:0 18px;border-radius:999px;border:1px solid rgba(248,225,153,0.42);background:linear-gradient(180deg,rgba(104,78,26,0.94),rgba(68,50,15,0.94));color:#fff4d8;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:31;backdrop-filter:blur(10px);",
+        (true, false) => "position:fixed;left:50%;bottom:max(92px,calc(env(safe-area-inset-bottom) + 92px));transform:translateX(-50%);min-width:116px;height:46px;padding:0 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:31;backdrop-filter:blur(10px);",
+        (false, true) => "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);min-width:116px;height:46px;padding:0 18px;border-radius:999px;border:1px solid rgba(248,225,153,0.42);background:linear-gradient(180deg,rgba(104,78,26,0.94),rgba(68,50,15,0.94));color:#fff4d8;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:31;backdrop-filter:blur(10px);",
+        (false, false) => "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);min-width:116px;height:46px;padding:0 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:31;backdrop-filter:blur(10px);",
     }
 }
 

@@ -1,7 +1,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use anyhow::Result;
-use glam::{Mat4, Quat, Vec3, Vec4};
+use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
     BreakBlockRequest, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
@@ -24,12 +24,12 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    BinaryType, Blob, CanvasRenderingContext2d, CloseEvent, Document, Element, ErrorEvent,
-    Event as WebEvent, FormData, HtmlCanvasElement, HtmlInputElement, HtmlVideoElement,
-    MediaStream, MediaStreamConstraints, MediaStreamTrack, MessageEvent, Request,
-    RequestCredentials, RequestInit, RequestMode, Response, RtcDataChannel, RtcDataChannelEvent,
-    RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType,
-    RtcSessionDescriptionInit, RtcTrackEvent, Url, WebSocket, Worker,
+    BinaryType, Blob, CanvasRenderingContext2d, CloseEvent, DeviceOrientationEvent, Document,
+    Element, ErrorEvent, Event as WebEvent, FormData, HtmlCanvasElement, HtmlInputElement,
+    HtmlVideoElement, MediaStream, MediaStreamConstraints, MediaStreamTrack, MessageEvent,
+    Request, RequestCredentials, RequestInit, RequestMode, Response, RtcDataChannel,
+    RtcDataChannelEvent, RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent,
+    RtcSdpType, RtcSessionDescriptionInit, RtcTrackEvent, Url, WebSocket, Worker,
 };
 use web_time::Instant;
 use wgpu_lite::{
@@ -38,7 +38,8 @@ use wgpu_lite::{
 };
 use winit::dpi::PhysicalSize;
 use winit::event::{
-    DeviceEvent, ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+    DeviceEvent, ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase,
+    WindowEvent,
 };
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -105,6 +106,15 @@ const THIRD_PERSON_CAMERA_COLLISION_STEP: f32 = 0.1;
 const THIRD_PERSON_CAMERA_CLEARANCE: f32 = 0.15;
 const THIRD_PERSON_SHOULDER_RIGHT_OFFSET: f32 = 0.45;
 const THIRD_PERSON_SHOULDER_UP_OFFSET: f32 = 0.2;
+const MOBILE_JOYSTICK_DEADZONE: f32 = 0.16;
+const MOBILE_JOYSTICK_TURN_SPEED: f32 = 2.8;
+const MOBILE_JOYSTICK_THUMB_OFFSET_PX: f32 = 32.0;
+const MOBILE_PINCH_MIN_DISTANCE: f32 = 12.0;
+const MOBILE_TILT_DEADZONE_DEGREES: f32 = 2.0;
+const MOBILE_TILT_MAX_DEGREES: f32 = 32.0;
+const MOBILE_TILT_MAX_YAW_RADIANS: f32 = 0.55;
+const MOBILE_TILT_MAX_PITCH_RADIANS: f32 = 0.48;
+const MOBILE_TILT_SMOOTHING: f32 = 10.0;
 const LOCAL_AVATAR_TURN_SPEED: f32 = 10.0;
 const LOCAL_AVATAR_PLACEHOLDER_TINT: [f32; 3] = [0.82, 0.73, 0.44];
 const LINK_PANEL_OPEN_URL: &str = "https://www.google.com";
@@ -459,6 +469,154 @@ impl Default for ThirdPersonCameraState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputMode {
+    Desktop,
+    Mobile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MobileTouchZone {
+    Unclaimed,
+    Joystick,
+    LeftButton,
+    RightButton,
+    TiltButton,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MobileTiltPermissionState {
+    Unsupported,
+    Inactive,
+    Pending,
+    Active,
+    Denied,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MobileViewportOrientation {
+    Portrait,
+    PortraitUpsideDown,
+    LandscapeLeft,
+    LandscapeRight,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScreenRect {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+impl ScreenRect {
+    fn contains(self, position: Vec2) -> bool {
+        position.x >= self.left
+            && position.x <= self.right
+            && position.y >= self.top
+            && position.y <= self.bottom
+    }
+
+    fn center(self) -> Vec2 {
+        Vec2::new(
+            (self.left + self.right) * 0.5,
+            (self.top + self.bottom) * 0.5,
+        )
+    }
+
+    fn size(self) -> Vec2 {
+        Vec2::new(self.right - self.left, self.bottom - self.top)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MobileTouchState {
+    zone: MobileTouchZone,
+    current: Vec2,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MobilePinchState {
+    first_touch_id: u64,
+    second_touch_id: u64,
+    baseline_distance: f32,
+    baseline_zoom: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MobileTiltSample {
+    axes: Vec2,
+    orientation: MobileViewportOrientation,
+}
+
+#[derive(Clone, Debug)]
+struct MobileControlsState {
+    touch_capable: bool,
+    active_touches: HashMap<u64, MobileTouchState>,
+    joystick_touch_id: Option<u64>,
+    joystick_vector: Vec2,
+    left_button_touch_id: Option<u64>,
+    right_button_touch_id: Option<u64>,
+    pinch: Option<MobilePinchState>,
+    tilt_permission: MobileTiltPermissionState,
+    tilt_baseline: Option<MobileTiltSample>,
+    latest_tilt_sample: Option<MobileTiltSample>,
+    smoothed_look_offset: Vec2,
+    applied_look_offset: Vec2,
+}
+
+impl MobileControlsState {
+    fn new(touch_capable: bool) -> Self {
+        Self {
+            touch_capable,
+            active_touches: HashMap::new(),
+            joystick_touch_id: None,
+            joystick_vector: Vec2::ZERO,
+            left_button_touch_id: None,
+            right_button_touch_id: None,
+            pinch: None,
+            tilt_permission: MobileTiltPermissionState::Inactive,
+            tilt_baseline: None,
+            latest_tilt_sample: None,
+            smoothed_look_offset: Vec2::ZERO,
+            applied_look_offset: Vec2::ZERO,
+        }
+    }
+
+    fn clear_touch_tracking(&mut self) {
+        self.active_touches.clear();
+        self.joystick_touch_id = None;
+        self.joystick_vector = Vec2::ZERO;
+        self.left_button_touch_id = None;
+        self.right_button_touch_id = None;
+        self.pinch = None;
+    }
+
+    fn bake_current_tilt_into_camera(&mut self) {
+        self.tilt_baseline = self.latest_tilt_sample;
+        self.smoothed_look_offset = Vec2::ZERO;
+        self.applied_look_offset = Vec2::ZERO;
+    }
+}
+
+struct MobileHud {
+    root: Element,
+    control_hint: Element,
+    joystick: Element,
+    joystick_thumb: Element,
+    left_button: Element,
+    right_button: Element,
+    tilt_button: Element,
+    crosshair: Element,
+}
+
+struct MobileHudRects {
+    joystick: ScreenRect,
+    left_button: ScreenRect,
+    right_button: ScreenRect,
+    tilt_button: ScreenRect,
+}
+
 thread_local! {
     static AUTH_GUEST_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static AUTH_REFRESH_QUEUE: RefCell<bool> = const { RefCell::new(false) };
@@ -469,6 +627,8 @@ thread_local! {
     static PET_PARTY_SAVE_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static PET_PARTY_TOGGLE_QUEUE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static PET_PARTY_WEAPON_ASSIGN_QUEUE: RefCell<Vec<(String, Option<String>)>> = const { RefCell::new(Vec::new()) };
+    static MOBILE_TILT_PERMISSION_QUEUE: RefCell<Option<MobileTiltPermissionState>> = const { RefCell::new(None) };
+    static MOBILE_TILT_SAMPLE_QUEUE: RefCell<Option<MobileTiltSample>> = const { RefCell::new(None) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -623,6 +783,7 @@ async fn run() -> Result<()> {
                 } => {
                     app.handle_mouse_button(button);
                 }
+                WindowEvent::Touch(touch) => app.handle_touch(touch),
                 WindowEvent::RedrawRequested => {
                     app.tick();
                     if let Some(render_size) = app.maybe_adjust_render_scale() {
@@ -746,6 +907,11 @@ struct WebApp {
     spawn_settled: bool,
     chunk_edits: HashMap<ChunkPos, HashMap<(u8, u8, u8), BlockId>>,
     link_panel: LinkPanel,
+    input_mode: InputMode,
+    mobile_controls: MobileControlsState,
+    mobile_hud: MobileHud,
+    _mobile_tilt_listener: Option<Closure<dyn FnMut(WebEvent)>>,
+    hotbar_root: Element,
     hotbar_slots: Vec<Element>,
     mouse_lock_prompt: Element,
     webcam_prompt: Element,
@@ -882,9 +1048,11 @@ impl WebApp {
             BlockId::Glass,
             BlockId::Lantern,
         ];
-        let hotbar_slots = create_hotbar(&hotbar_blocks);
+        let touch_capable = browser_supports_touch_input();
+        let (hotbar_root, hotbar_slots) = create_hotbar(&hotbar_blocks);
         let (mouse_lock_prompt, mouse_lock_prompt_onclick) = create_mouse_lock_prompt(&canvas);
         let (webcam_prompt, webcam_prompt_onclick) = create_webcam_prompt();
+        let mobile_hud = create_mobile_hud();
         let (auth_tx, auth_rx) = request_auth_session();
         let (remote_avatar_tx, remote_avatar_rx) = mpsc::channel();
         let (remote_pet_tx, remote_pet_rx) = mpsc::channel();
@@ -954,6 +1122,15 @@ impl WebApp {
             spawn_settled: false,
             chunk_edits: HashMap::new(),
             link_panel,
+            input_mode: if touch_capable {
+                InputMode::Mobile
+            } else {
+                InputMode::Desktop
+            },
+            mobile_controls: MobileControlsState::new(touch_capable),
+            mobile_hud,
+            _mobile_tilt_listener: None,
+            hotbar_root,
             hotbar_slots,
             mouse_lock_prompt,
             webcam_prompt,
@@ -1069,11 +1246,401 @@ impl WebApp {
         app.update_pet_party_modal();
         app.update_perf_panel(0, 0);
         app.sync_perf_panel_visibility();
+        app.sync_mobile_layout();
         app
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.size = size;
+        self.sync_mobile_layout();
+    }
+
+    fn is_mobile_active(&self) -> bool {
+        self.input_mode == InputMode::Mobile && self.mobile_controls.touch_capable
+    }
+
+    fn effective_input_mode(&self) -> InputMode {
+        if self.mobile_controls.touch_capable && !self.mouse_captured {
+            InputMode::Mobile
+        } else {
+            InputMode::Desktop
+        }
+    }
+
+    fn sync_mobile_layout(&mut self) {
+        let next_mode = self.effective_input_mode();
+        if self.input_mode != next_mode {
+            if next_mode == InputMode::Desktop {
+                self.mobile_controls.clear_touch_tracking();
+                self.mobile_controls.bake_current_tilt_into_camera();
+            }
+            self.input_mode = next_mode;
+        }
+
+        let mobile_active = self.is_mobile_active();
+        let _ = self
+            .hotbar_root
+            .set_attribute("style", hotbar_root_style(mobile_active));
+        self.update_control_hint();
+        self.sync_mobile_hud_state();
+        self.update_captured_pets_panel();
+        self.update_weapon_collection_panel();
+    }
+
+    fn update_control_hint(&self) {
+        let message = if self.is_mobile_active() {
+            "Joystick move/turn, L/R act, pinch zoom, tap Enable Tilt"
+        } else {
+            "WASD move, mouse look, Space up, Shift down"
+        };
+        self.mobile_hud.control_hint.set_text_content(Some(message));
+    }
+
+    fn sync_mobile_hud_state(&self) {
+        let mobile_active = self.is_mobile_active();
+        let _ = self.mobile_hud.root.set_attribute(
+            "style",
+            mobile_hud_root_style(mobile_active && self.mobile_controls.touch_capable),
+        );
+        let _ = self.mobile_hud.crosshair.set_attribute(
+            "style",
+            mobile_hud_crosshair_style(mobile_active && self.mobile_controls.touch_capable),
+        );
+        let _ = self
+            .mobile_hud
+            .joystick
+            .set_attribute("style", mobile_hud_joystick_style());
+        let _ = self.mobile_hud.joystick_thumb.set_attribute(
+            "style",
+            &mobile_hud_joystick_thumb_style(
+                self.mobile_controls.joystick_vector * MOBILE_JOYSTICK_THUMB_OFFSET_PX,
+            ),
+        );
+        let _ = self.mobile_hud.left_button.set_attribute(
+            "style",
+            mobile_hud_action_button_style(
+                self.mobile_controls.left_button_touch_id.is_some(),
+                true,
+            ),
+        );
+        let _ = self.mobile_hud.right_button.set_attribute(
+            "style",
+            mobile_hud_action_button_style(
+                self.mobile_controls.right_button_touch_id.is_some(),
+                false,
+            ),
+        );
+        let (tilt_label, tilt_active) = match self.mobile_controls.tilt_permission {
+            MobileTiltPermissionState::Unsupported => ("Tilt Unavailable", false),
+            MobileTiltPermissionState::Inactive => ("Enable Tilt", false),
+            MobileTiltPermissionState::Pending => ("Tilt…", false),
+            MobileTiltPermissionState::Active => ("Recenter Tilt", true),
+            MobileTiltPermissionState::Denied => ("Tilt Denied", false),
+        };
+        self.mobile_hud.tilt_button.set_text_content(Some(tilt_label));
+        let _ = self
+            .mobile_hud
+            .tilt_button
+            .set_attribute("style", mobile_hud_tilt_button_style(tilt_active));
+    }
+
+    fn mobile_hud_rects(&self) -> Option<MobileHudRects> {
+        Some(MobileHudRects {
+            joystick: element_screen_rect(&self.mobile_hud.joystick)?,
+            left_button: element_screen_rect(&self.mobile_hud.left_button)?,
+            right_button: element_screen_rect(&self.mobile_hud.right_button)?,
+            tilt_button: element_screen_rect(&self.mobile_hud.tilt_button)?,
+        })
+    }
+
+    fn process_mobile_tilt_events(&mut self) {
+        let permission_update = MOBILE_TILT_PERMISSION_QUEUE.with(|queue| queue.borrow_mut().take());
+        if let Some(permission) = permission_update {
+            self.mobile_controls.tilt_permission = permission;
+            match permission {
+                MobileTiltPermissionState::Active => {
+                    if self.mobile_controls.tilt_baseline.is_none() {
+                        self.mobile_controls.tilt_baseline = self.mobile_controls.latest_tilt_sample;
+                    }
+                }
+                MobileTiltPermissionState::Denied
+                | MobileTiltPermissionState::Unsupported
+                | MobileTiltPermissionState::Inactive => {
+                    self.mobile_controls.tilt_baseline = None;
+                    self.mobile_controls.smoothed_look_offset = Vec2::ZERO;
+                    self.mobile_controls.applied_look_offset = Vec2::ZERO;
+                }
+                MobileTiltPermissionState::Pending => {}
+            }
+        }
+
+        let tilt_sample = MOBILE_TILT_SAMPLE_QUEUE.with(|queue| queue.borrow_mut().take());
+        if let Some(sample) = tilt_sample {
+            self.mobile_controls.latest_tilt_sample = Some(sample);
+            if self.mobile_controls.tilt_permission == MobileTiltPermissionState::Active {
+                let orientation_changed = self
+                    .mobile_controls
+                    .tilt_baseline
+                    .map(|baseline| baseline.orientation != sample.orientation)
+                    .unwrap_or(false);
+                if orientation_changed {
+                    self.mobile_controls.tilt_baseline = Some(sample);
+                    self.mobile_controls.smoothed_look_offset = Vec2::ZERO;
+                    self.mobile_controls.applied_look_offset = Vec2::ZERO;
+                } else if self.mobile_controls.tilt_baseline.is_none() {
+                    self.mobile_controls.tilt_baseline = Some(sample);
+                }
+            }
+        }
+        self.sync_mobile_hud_state();
+    }
+
+    fn attach_mobile_tilt_listener_if_needed(&mut self) {
+        if self._mobile_tilt_listener.is_some() {
+            return;
+        }
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let on_orientation = Closure::wrap(Box::new(move |event: WebEvent| {
+            let Ok(event) = event.dyn_into::<DeviceOrientationEvent>() else {
+                return;
+            };
+            let beta = event.beta().unwrap_or(0.0) as f32;
+            let gamma = event.gamma().unwrap_or(0.0) as f32;
+            let orientation = current_viewport_orientation();
+            MOBILE_TILT_SAMPLE_QUEUE.with(|queue| {
+                *queue.borrow_mut() = Some(MobileTiltSample {
+                    axes: normalize_tilt_axes(beta, gamma, orientation),
+                    orientation,
+                });
+            });
+        }) as Box<dyn FnMut(WebEvent)>);
+        let _ = window.add_event_listener_with_callback(
+            "deviceorientation",
+            on_orientation.as_ref().unchecked_ref(),
+        );
+        self._mobile_tilt_listener = Some(on_orientation);
+    }
+
+    fn recalibrate_mobile_tilt(&mut self) {
+        self.mobile_controls.tilt_baseline = self.mobile_controls.latest_tilt_sample;
+        self.mobile_controls.smoothed_look_offset = Vec2::ZERO;
+        self.mobile_controls.applied_look_offset = Vec2::ZERO;
+    }
+
+    fn activate_or_recalibrate_mobile_tilt(&mut self) {
+        if !device_orientation_supported() {
+            self.mobile_controls.tilt_permission = MobileTiltPermissionState::Unsupported;
+            self.mobile_controls.tilt_baseline = None;
+            self.mobile_controls.smoothed_look_offset = Vec2::ZERO;
+            self.mobile_controls.applied_look_offset = Vec2::ZERO;
+            self.sync_mobile_hud_state();
+            return;
+        }
+
+        self.attach_mobile_tilt_listener_if_needed();
+        if self.mobile_controls.tilt_permission == MobileTiltPermissionState::Active {
+            self.recalibrate_mobile_tilt();
+            self.sync_mobile_hud_state();
+            return;
+        }
+        if self.mobile_controls.tilt_permission == MobileTiltPermissionState::Pending {
+            return;
+        }
+
+        self.mobile_controls.tilt_permission = MobileTiltPermissionState::Pending;
+        self.sync_mobile_hud_state();
+        spawn_local(async {
+            let status = match request_device_orientation_permission().await {
+                Ok(Some(true)) | Ok(None) => MobileTiltPermissionState::Active,
+                Ok(Some(false)) => MobileTiltPermissionState::Denied,
+                Err(error) => {
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "device orientation permission failed: {error:?}"
+                    )));
+                    MobileTiltPermissionState::Denied
+                }
+            };
+            MOBILE_TILT_PERMISSION_QUEUE.with(|queue| {
+                *queue.borrow_mut() = Some(status);
+            });
+        });
+    }
+
+    fn handle_touch(&mut self, touch: Touch) {
+        if !self.is_mobile_active() {
+            return;
+        }
+
+        let touch_id = touch.id;
+        let position = Vec2::new(touch.location.x as f32, touch.location.y as f32);
+        match touch.phase {
+            TouchPhase::Started => self.handle_touch_started(touch_id, position),
+            TouchPhase::Moved => self.handle_touch_moved(touch_id, position),
+            TouchPhase::Ended | TouchPhase::Cancelled => self.handle_touch_ended(touch_id),
+        }
+        self.sync_mobile_hud_state();
+    }
+
+    fn handle_touch_started(&mut self, touch_id: u64, position: Vec2) {
+        let rects = self.mobile_hud_rects();
+        let zone = rects
+            .as_ref()
+            .map(|rects| {
+                classify_mobile_touch_zone(
+                    position,
+                    rects,
+                    self.mobile_controls.joystick_touch_id.is_none(),
+                )
+            })
+            .unwrap_or(MobileTouchZone::Unclaimed);
+
+        self.mobile_controls.active_touches.insert(
+            touch_id,
+            MobileTouchState {
+                zone,
+                current: position,
+            },
+        );
+
+        match zone {
+            MobileTouchZone::Joystick => {
+                self.mobile_controls.joystick_touch_id = Some(touch_id);
+                if let Some(rects) = rects {
+                    self.mobile_controls.joystick_vector =
+                        normalized_joystick_vector(rects.joystick, position);
+                }
+            }
+            MobileTouchZone::LeftButton => {
+                self.mobile_controls.left_button_touch_id = Some(touch_id);
+                self.execute_pointer_action(MouseButton::Left);
+            }
+            MobileTouchZone::RightButton => {
+                self.mobile_controls.right_button_touch_id = Some(touch_id);
+                self.execute_pointer_action(MouseButton::Right);
+            }
+            MobileTouchZone::TiltButton => self.activate_or_recalibrate_mobile_tilt(),
+            MobileTouchZone::Unclaimed => {}
+        }
+
+        self.maybe_begin_mobile_pinch();
+        self.apply_mobile_pinch_zoom();
+    }
+
+    fn handle_touch_moved(&mut self, touch_id: u64, position: Vec2) {
+        let Some(zone) = self
+            .mobile_controls
+            .active_touches
+            .get_mut(&touch_id)
+            .map(|touch| {
+                touch.current = position;
+                touch.zone
+            })
+        else {
+            return;
+        };
+
+        if zone == MobileTouchZone::Joystick {
+            if let Some(rects) = self.mobile_hud_rects() {
+                self.mobile_controls.joystick_vector =
+                    normalized_joystick_vector(rects.joystick, position);
+            }
+        }
+        self.apply_mobile_pinch_zoom();
+    }
+
+    fn handle_touch_ended(&mut self, touch_id: u64) {
+        let Some(touch) = self.mobile_controls.active_touches.remove(&touch_id) else {
+            return;
+        };
+
+        match touch.zone {
+            MobileTouchZone::Joystick => {
+                if self.mobile_controls.joystick_touch_id == Some(touch_id) {
+                    self.mobile_controls.joystick_touch_id = None;
+                    self.mobile_controls.joystick_vector = Vec2::ZERO;
+                }
+            }
+            MobileTouchZone::LeftButton => {
+                if self.mobile_controls.left_button_touch_id == Some(touch_id) {
+                    self.mobile_controls.left_button_touch_id = None;
+                }
+            }
+            MobileTouchZone::RightButton => {
+                if self.mobile_controls.right_button_touch_id == Some(touch_id) {
+                    self.mobile_controls.right_button_touch_id = None;
+                }
+            }
+            MobileTouchZone::TiltButton | MobileTouchZone::Unclaimed => {}
+        }
+
+        if self.mobile_controls.pinch.is_some_and(|pinch| {
+            pinch.first_touch_id == touch_id || pinch.second_touch_id == touch_id
+        }) {
+            self.mobile_controls.pinch = None;
+        }
+        self.maybe_begin_mobile_pinch();
+        self.apply_mobile_pinch_zoom();
+    }
+
+    fn maybe_begin_mobile_pinch(&mut self) {
+        if self.mobile_controls.pinch.is_some() {
+            return;
+        }
+        let mut touches = self
+            .mobile_controls
+            .active_touches
+            .iter()
+            .filter(|(_, touch)| touch.zone == MobileTouchZone::Unclaimed)
+            .map(|(&touch_id, touch)| (touch_id, touch.current));
+        let Some((first_touch_id, first_position)) = touches.next() else {
+            return;
+        };
+        let Some((second_touch_id, second_position)) = touches.next() else {
+            return;
+        };
+        let baseline_distance = first_position.distance(second_position);
+        if baseline_distance < MOBILE_PINCH_MIN_DISTANCE {
+            return;
+        }
+        self.mobile_controls.pinch = Some(MobilePinchState {
+            first_touch_id,
+            second_touch_id,
+            baseline_distance,
+            baseline_zoom: self.third_person.target_zoom,
+        });
+    }
+
+    fn apply_mobile_pinch_zoom(&mut self) {
+        let Some(pinch) = self.mobile_controls.pinch else {
+            return;
+        };
+        let Some(first_touch) = self
+            .mobile_controls
+            .active_touches
+            .get(&pinch.first_touch_id)
+            .map(|touch| touch.current)
+        else {
+            self.mobile_controls.pinch = None;
+            return;
+        };
+        let Some(second_touch) = self
+            .mobile_controls
+            .active_touches
+            .get(&pinch.second_touch_id)
+            .map(|touch| touch.current)
+        else {
+            self.mobile_controls.pinch = None;
+            return;
+        };
+
+        let next_zoom = mobile_pinch_target_zoom(
+            pinch.baseline_zoom,
+            pinch.baseline_distance,
+            first_touch.distance(second_touch),
+        );
+        self.set_third_person_zoom_target(next_zoom);
     }
 
     fn scaled_render_size(&self) -> PhysicalSize<u32> {
@@ -1233,10 +1800,12 @@ impl WebApp {
 
     fn sync_pointer_lock_state(&mut self) {
         self.mouse_captured = pointer_is_locked(&self.canvas);
+        self.sync_mobile_layout();
         sync_mouse_lock_prompt(
             &self.mouse_lock_prompt,
             self.spawn_settled,
             self.mouse_captured,
+            self.is_mobile_active(),
         );
     }
 
@@ -1321,19 +1890,8 @@ impl WebApp {
         self.camera.pitch = (self.camera.pitch - dy * 0.0025).clamp(-1.45, 1.45);
     }
 
-    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
-        let normalized = normalize_scroll_delta(delta);
-        if normalized.abs() <= f32::EPSILON {
-            return;
-        }
-
-        if normalized < 0.0 && self.third_person.target_zoom < THIRD_PERSON_MIN_ACTIVE_ZOOM {
-            self.third_person.target_zoom = THIRD_PERSON_ENTRY_ZOOM;
-            return;
-        }
-
-        let next_zoom = (self.third_person.target_zoom - normalized * THIRD_PERSON_SCROLL_STEP)
-            .clamp(0.0, THIRD_PERSON_MAX_ZOOM);
+    fn set_third_person_zoom_target(&mut self, next_zoom: f32) {
+        let next_zoom = next_zoom.clamp(0.0, THIRD_PERSON_MAX_ZOOM);
         if next_zoom < THIRD_PERSON_MIN_ACTIVE_ZOOM {
             self.third_person.current_zoom = 0.0;
             self.third_person.target_zoom = 0.0;
@@ -1343,13 +1901,34 @@ impl WebApp {
         }
     }
 
+    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        let normalized = normalize_scroll_delta(delta);
+        if normalized.abs() <= f32::EPSILON {
+            return;
+        }
+
+        if normalized < 0.0 && self.third_person.target_zoom < THIRD_PERSON_MIN_ACTIVE_ZOOM {
+            self.set_third_person_zoom_target(THIRD_PERSON_ENTRY_ZOOM);
+            return;
+        }
+
+        let next_zoom = (self.third_person.target_zoom - normalized * THIRD_PERSON_SCROLL_STEP)
+            .clamp(0.0, THIRD_PERSON_MAX_ZOOM);
+        self.set_third_person_zoom_target(next_zoom);
+    }
+
     fn handle_mouse_button(&mut self, button: MouseButton) {
         if !self.mouse_captured {
             self.canvas.request_pointer_lock();
             self.mouse_captured = pointer_is_locked(&self.canvas);
+            self.sync_mobile_layout();
             return;
         }
 
+        self.execute_pointer_action(button);
+    }
+
+    fn execute_pointer_action(&mut self, button: MouseButton) {
         if !self.logged_in {
             return;
         }
@@ -2174,6 +2753,9 @@ impl WebApp {
             format!("Pet Party ({})", self.captured_pets.len())
         };
         self.captured_pets_panel.set_text_content(Some(&label));
+        let _ = self
+            .captured_pets_panel
+            .set_attribute("style", captured_pets_panel_style(self.is_mobile_active()));
     }
 
     fn update_weapon_collection_panel(&self) {
@@ -2196,6 +2778,13 @@ impl WebApp {
             }
         }
         self.weapons_panel.set_text_content(Some(&lines.join("\n")));
+        let _ = self.weapons_panel.set_attribute(
+            "style",
+            weapon_collection_panel_style(
+                self.is_mobile_active(),
+                !self.collected_weapons.is_empty() || self.weapon_notice.is_some(),
+            ),
+        );
     }
 
     fn drain_network(&mut self) {
@@ -2964,7 +3553,7 @@ impl WebApp {
         actual_velocity: Vec3,
     ) {
         if !self.is_third_person_active() {
-            self.avatar_yaw = self.camera.yaw;
+            self.avatar_yaw = self.control_yaw();
         } else {
             let mut desired_facing = Vec3::new(actual_velocity.x, 0.0, actual_velocity.z);
             if desired_facing.length_squared() <= 0.0001 {
@@ -3098,6 +3687,58 @@ impl WebApp {
             .is_some()
     }
 
+    fn control_yaw(&self) -> f32 {
+        if self.is_mobile_active() {
+            self.camera.yaw - self.mobile_controls.applied_look_offset.x
+        } else {
+            self.camera.yaw
+        }
+    }
+
+    fn current_mobile_tilt_target(&self) -> Vec2 {
+        if self.mobile_controls.tilt_permission != MobileTiltPermissionState::Active {
+            return Vec2::ZERO;
+        }
+        let Some(baseline) = self.mobile_controls.tilt_baseline else {
+            return Vec2::ZERO;
+        };
+        let Some(sample) = self.mobile_controls.latest_tilt_sample else {
+            return Vec2::ZERO;
+        };
+        let delta = sample.axes - baseline.axes;
+        let yaw = clamp_mobile_tilt_axis(delta.x, MOBILE_TILT_DEADZONE_DEGREES)
+            / MOBILE_TILT_MAX_DEGREES
+            * MOBILE_TILT_MAX_YAW_RADIANS;
+        let pitch = clamp_mobile_tilt_axis(delta.y, MOBILE_TILT_DEADZONE_DEGREES)
+            / MOBILE_TILT_MAX_DEGREES
+            * MOBILE_TILT_MAX_PITCH_RADIANS;
+        Vec2::new(yaw, pitch)
+    }
+
+    fn apply_mobile_look(&mut self, dt_secs: f32) -> f32 {
+        if !self.is_mobile_active() {
+            return 0.0;
+        }
+
+        let mut base_yaw = self.camera.yaw - self.mobile_controls.applied_look_offset.x;
+        let base_pitch = (self.camera.pitch + self.mobile_controls.applied_look_offset.y)
+            .clamp(-1.45, 1.45);
+        let yaw_delta = -self.mobile_controls.joystick_vector.x * MOBILE_JOYSTICK_TURN_SPEED
+            * dt_secs.max(0.0);
+        base_yaw += yaw_delta;
+
+        let target_offset = self.current_mobile_tilt_target();
+        let smoothing = 1.0 - (-MOBILE_TILT_SMOOTHING * dt_secs.max(0.0)).exp();
+        self.mobile_controls.smoothed_look_offset +=
+            (target_offset - self.mobile_controls.smoothed_look_offset) * smoothing;
+        self.mobile_controls.applied_look_offset = self.mobile_controls.smoothed_look_offset;
+
+        self.camera.yaw = base_yaw + self.mobile_controls.applied_look_offset.x;
+        self.camera.pitch =
+            (base_pitch - self.mobile_controls.applied_look_offset.y).clamp(-1.45, 1.45);
+        yaw_delta
+    }
+
     fn tick(&mut self) {
         self.sync_pointer_lock_state();
         self.process_chunk_quality_requests();
@@ -3106,6 +3747,7 @@ impl WebApp {
         self.process_pet_party_requests();
         self.drain_network();
         self.process_peer_realtime_events();
+        self.process_mobile_tilt_events();
         self.ensure_local_avatar_assets_requested();
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick);
@@ -3131,6 +3773,12 @@ impl WebApp {
         let jump = self.pressed.contains(&KeyCode::Space);
         let sprint = self.pressed.contains(&KeyCode::ShiftLeft);
 
+        let mobile_yaw_delta = self.apply_mobile_look(dt_secs);
+        if self.is_mobile_active() {
+            movement.x = 0.0;
+            movement.z = -self.mobile_controls.joystick_vector.y;
+        }
+
         self.movement_active = movement != Vec3::ZERO;
 
         if !self.spawn_settled {
@@ -3147,8 +3795,8 @@ impl WebApp {
         if movement_for_server.length_squared() > 1.0 {
             movement_for_server = movement_for_server.normalize();
         }
-        let forward =
-            Vec3::new(self.camera.yaw.sin(), 0.0, self.camera.yaw.cos()).normalize_or_zero();
+        let movement_yaw = self.control_yaw();
+        let forward = Vec3::new(movement_yaw.sin(), 0.0, movement_yaw.cos()).normalize_or_zero();
         let right = Vec3::new(-forward.z, 0.0, forward.x);
         let world_movement = forward * -movement_for_server.z + right * movement_for_server.x;
 
@@ -3159,6 +3807,13 @@ impl WebApp {
         } else {
             Vec3::ZERO
         };
+        if self.is_mobile_active()
+            && self.is_third_person_active()
+            && movement.z.abs() <= f32::EPSILON
+            && mobile_yaw_delta.abs() > f32::EPSILON
+        {
+            self.avatar_yaw += mobile_yaw_delta;
+        }
         self.update_local_avatar_playback(dt_secs, world_movement, actual_velocity);
         if self.logged_in {
             self.ensure_pet_followers_initialized();
@@ -5210,8 +5865,8 @@ impl WebApp {
             horizontal = horizontal.normalize();
         }
 
-        let forward =
-            Vec3::new(self.camera.yaw.sin(), 0.0, self.camera.yaw.cos()).normalize_or_zero();
+        let control_yaw = self.control_yaw();
+        let forward = Vec3::new(control_yaw.sin(), 0.0, control_yaw.cos()).normalize_or_zero();
         let right = Vec3::new(-forward.z, 0.0, forward.x);
         let speed = if sprint {
             PLAYER_SPRINT_SPEED
@@ -6284,19 +6939,16 @@ fn css_viewport_size() -> Option<(f32, f32)> {
     Some((width.max(1.0), height.max(1.0)))
 }
 
-fn create_hotbar(blocks: &[BlockId]) -> Vec<Element> {
+fn create_hotbar(blocks: &[BlockId]) -> (Element, Vec<Element>) {
     let Some(document) = document() else {
-        return Vec::new();
+        return (fallback_element(), Vec::new());
     };
     let Some(body) = document.body() else {
-        return Vec::new();
+        return (fallback_element(), Vec::new());
     };
 
     let root = document.create_element("div").expect("hotbar root");
-    let _ = root.set_attribute(
-        "style",
-        "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);display:flex;gap:10px;padding:10px 14px;border-radius:18px;background:rgba(18,24,32,0.64);backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,0.28);pointer-events:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;z-index:20;",
-    );
+    let _ = root.set_attribute("style", hotbar_root_style(false));
 
     let mut slots = Vec::new();
     for (index, block) in blocks.iter().enumerate() {
@@ -6315,7 +6967,90 @@ fn create_hotbar(blocks: &[BlockId]) -> Vec<Element> {
     }
 
     let _ = body.append_child(&root);
-    slots
+    (root, slots)
+}
+
+fn create_mobile_hud() -> MobileHud {
+    let Some(document) = document() else {
+        return MobileHud {
+            root: fallback_element(),
+            control_hint: fallback_element(),
+            joystick: fallback_element(),
+            joystick_thumb: fallback_element(),
+            left_button: fallback_element(),
+            right_button: fallback_element(),
+            tilt_button: fallback_element(),
+            crosshair: fallback_element(),
+        };
+    };
+    let Some(body) = document.body() else {
+        return MobileHud {
+            root: fallback_element(),
+            control_hint: fallback_element(),
+            joystick: fallback_element(),
+            joystick_thumb: fallback_element(),
+            left_button: fallback_element(),
+            right_button: fallback_element(),
+            tilt_button: fallback_element(),
+            crosshair: fallback_element(),
+        };
+    };
+
+    let control_hint = document
+        .get_element_by_id("augmego-control-hint")
+        .unwrap_or_else(|| {
+            let hint = document.create_element("div").expect("control hint");
+            let _ = hint.set_attribute("id", "augmego-control-hint");
+            let _ = body.append_child(&hint);
+            hint
+        });
+
+    let root = document.create_element("div").expect("mobile hud root");
+    let _ = root.set_attribute("style", mobile_hud_root_style(false));
+
+    let joystick = document.create_element("div").expect("mobile joystick");
+    let _ = joystick.set_attribute("style", mobile_hud_joystick_style());
+    let joystick_thumb = document
+        .create_element("div")
+        .expect("mobile joystick thumb");
+    let _ = joystick_thumb.set_attribute("style", &mobile_hud_joystick_thumb_style(Vec2::ZERO));
+    let _ = joystick.append_child(&joystick_thumb);
+
+    let left_button = document.create_element("div").expect("mobile left button");
+    left_button.set_text_content(Some("L"));
+    let _ = left_button.set_attribute("style", mobile_hud_action_button_style(false, true));
+
+    let right_button = document.create_element("div").expect("mobile right button");
+    right_button.set_text_content(Some("R"));
+    let _ = right_button.set_attribute("style", mobile_hud_action_button_style(false, false));
+
+    let tilt_button = document.create_element("div").expect("mobile tilt button");
+    tilt_button.set_text_content(Some("Enable Tilt"));
+    let _ = tilt_button.set_attribute("style", mobile_hud_tilt_button_style(false));
+
+    let crosshair = document.create_element("div").expect("mobile crosshair");
+    crosshair.set_inner_html(
+        "<span style=\"position:absolute;left:50%;top:50%;width:18px;height:2px;background:rgba(255,255,255,0.92);transform:translate(-50%,-50%);\"></span><span style=\"position:absolute;left:50%;top:50%;width:2px;height:18px;background:rgba(255,255,255,0.92);transform:translate(-50%,-50%);\"></span>",
+    );
+    let _ = crosshair.set_attribute("style", mobile_hud_crosshair_style(false));
+
+    let _ = root.append_child(&joystick);
+    let _ = root.append_child(&left_button);
+    let _ = root.append_child(&right_button);
+    let _ = root.append_child(&tilt_button);
+    let _ = root.append_child(&crosshair);
+    let _ = body.append_child(&root);
+
+    MobileHud {
+        root,
+        control_hint,
+        joystick,
+        joystick_thumb,
+        left_button,
+        right_button,
+        tilt_button,
+        crosshair,
+    }
 }
 
 fn create_mouse_lock_prompt(canvas: &HtmlCanvasElement) -> (Element, Closure<dyn FnMut(WebEvent)>) {
@@ -6334,7 +7069,7 @@ fn create_mouse_lock_prompt(canvas: &HtmlCanvasElement) -> (Element, Closure<dyn
         .expect("mouse lock prompt");
     let _ = prompt.set_attribute("type", "button");
     let _ = prompt.set_attribute("aria-live", "polite");
-    sync_mouse_lock_prompt(&prompt, false, false);
+    sync_mouse_lock_prompt(&prompt, false, false, false);
     let canvas = canvas.clone();
     let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
         canvas.request_pointer_lock();
@@ -6365,8 +7100,13 @@ fn ensure_mouse_lock_prompt_styles(document: &Document) {
     }
 }
 
-fn sync_mouse_lock_prompt(prompt: &Element, spawn_settled: bool, mouse_captured: bool) {
-    if mouse_captured {
+fn sync_mouse_lock_prompt(
+    prompt: &Element,
+    spawn_settled: bool,
+    mouse_captured: bool,
+    hidden_for_mobile: bool,
+) {
+    if mouse_captured || hidden_for_mobile {
         let _ = prompt.set_attribute("style", "display:none;");
         return;
     }
@@ -7034,6 +7774,250 @@ fn update_hotbar_ui(slots: &[Element], blocks: &[BlockId], selected: usize) {
             index + 1,
             block_label(block)
         ));
+    }
+}
+
+fn hotbar_root_style(mobile: bool) -> &'static str {
+    if mobile {
+        "position:fixed;left:50%;bottom:max(128px,calc(env(safe-area-inset-bottom) + 128px));transform:translateX(-50%);display:flex;flex-wrap:wrap;justify-content:center;gap:10px;max-width:min(560px,calc(100vw - 28px));padding:10px 14px;border-radius:18px;background:rgba(18,24,32,0.64);backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,0.28);pointer-events:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;z-index:20;"
+    } else {
+        "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);display:flex;gap:10px;padding:10px 14px;border-radius:18px;background:rgba(18,24,32,0.64);backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,0.28);pointer-events:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;z-index:20;"
+    }
+}
+
+fn captured_pets_panel_style(mobile: bool) -> &'static str {
+    if mobile {
+        "position:fixed;left:16px;bottom:max(232px,calc(env(safe-area-inset-bottom) + 232px));min-width:136px;padding:12px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.16);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:30;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.12em;text-transform:uppercase;text-align:center;cursor:pointer;"
+    } else {
+        "position:fixed;left:16px;bottom:108px;min-width:136px;padding:12px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.16);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:30;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.12em;text-transform:uppercase;text-align:center;cursor:pointer;"
+    }
+}
+
+fn weapon_collection_panel_style(mobile: bool, visible: bool) -> &'static str {
+    if !visible {
+        "display:none;"
+    } else if mobile {
+        "display:block;position:fixed;left:16px;bottom:max(292px,calc(env(safe-area-inset-bottom) + 292px));width:min(300px,calc(100vw - 32px));max-height:220px;overflow:auto;padding:14px 16px;border-radius:18px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:30;font:600 12px/1.45 ui-sans-serif,system-ui,sans-serif;white-space:pre-line;"
+    } else {
+        "display:block;position:fixed;left:16px;bottom:168px;width:min(300px,calc(100vw - 32px));max-height:220px;overflow:auto;padding:14px 16px;border-radius:18px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(180deg,rgba(10,16,24,0.92),rgba(7,11,18,0.92));color:#e6edf3;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);z-index:30;font:600 12px/1.45 ui-sans-serif,system-ui,sans-serif;white-space:pre-line;"
+    }
+}
+
+fn mobile_hud_root_style(visible: bool) -> &'static str {
+    if visible {
+        "position:fixed;inset:0;pointer-events:none;z-index:52;"
+    } else {
+        "display:none;"
+    }
+}
+
+fn mobile_hud_joystick_style() -> &'static str {
+    "position:fixed;left:max(18px,calc(env(safe-area-inset-left) + 18px));bottom:max(18px,calc(env(safe-area-inset-bottom) + 18px));width:132px;height:132px;border-radius:999px;border:1px solid rgba(255,255,255,0.22);background:radial-gradient(circle at 50% 50%,rgba(255,255,255,0.12),rgba(18,24,32,0.78));box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);"
+}
+
+fn mobile_hud_joystick_thumb_style(offset: Vec2) -> String {
+    format!(
+        "position:absolute;left:50%;top:50%;width:54px;height:54px;border-radius:999px;border:1px solid rgba(255,255,255,0.28);background:linear-gradient(180deg,rgba(255,255,255,0.22),rgba(200,215,230,0.14));box-shadow:0 10px 24px rgba(0,0,0,0.22);transform:translate(calc(-50% + {:.1}px), calc(-50% + {:.1}px));",
+        offset.x, -offset.y
+    )
+}
+
+fn mobile_hud_action_button_style(active: bool, upper_button: bool) -> &'static str {
+    match (active, upper_button) {
+        (true, true) => "position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(118px,calc(env(safe-area-inset-bottom) + 118px));width:84px;height:84px;border-radius:999px;border:1px solid rgba(247,215,148,0.50);background:linear-gradient(180deg,rgba(122,78,24,0.96),rgba(82,48,13,0.96));color:#fff4d8;display:flex;align-items:center;justify-content:center;font:800 28px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);",
+        (false, true) => "position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(118px,calc(env(safe-area-inset-bottom) + 118px));width:84px;height:84px;border-radius:999px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;display:flex;align-items:center;justify-content:center;font:800 28px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);",
+        (true, false) => "position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(18px,calc(env(safe-area-inset-bottom) + 18px));width:84px;height:84px;border-radius:999px;border:1px solid rgba(183,230,255,0.50);background:linear-gradient(180deg,rgba(26,82,112,0.96),rgba(13,54,78,0.96));color:#effaff;display:flex;align-items:center;justify-content:center;font:800 28px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);",
+        (false, false) => "position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(18px,calc(env(safe-area-inset-bottom) + 18px));width:84px;height:84px;border-radius:999px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;display:flex;align-items:center;justify-content:center;font:800 28px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);",
+    }
+}
+
+fn mobile_hud_tilt_button_style(active: bool) -> &'static str {
+    if active {
+        "position:fixed;left:50%;top:max(78px,calc(env(safe-area-inset-top) + 78px));transform:translateX(-50%);padding:12px 18px;border-radius:999px;border:1px solid rgba(183,230,255,0.38);background:linear-gradient(180deg,rgba(20,62,84,0.94),rgba(12,40,56,0.94));color:#effaff;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 12px 28px rgba(0,0,0,0.28);backdrop-filter:blur(10px);"
+    } else {
+        "position:fixed;left:50%;top:max(78px,calc(env(safe-area-inset-top) + 78px));transform:translateX(-50%);padding:12px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.18);background:rgba(18,24,32,0.88);color:#f6f8fb;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 12px 28px rgba(0,0,0,0.28);backdrop-filter:blur(10px);"
+    }
+}
+
+fn mobile_hud_crosshair_style(visible: bool) -> &'static str {
+    if visible {
+        "position:fixed;left:50%;top:50%;width:24px;height:24px;transform:translate(-50%,-50%);pointer-events:none;filter:drop-shadow(0 0 6px rgba(0,0,0,0.35));"
+    } else {
+        "display:none;"
+    }
+}
+
+fn element_screen_rect(element: &Element) -> Option<ScreenRect> {
+    let rect = element.get_bounding_client_rect();
+    Some(ScreenRect {
+        left: rect.left() as f32,
+        top: rect.top() as f32,
+        right: rect.right() as f32,
+        bottom: rect.bottom() as f32,
+    })
+}
+
+fn classify_mobile_touch_zone(
+    position: Vec2,
+    rects: &MobileHudRects,
+    joystick_available: bool,
+) -> MobileTouchZone {
+    if rects.tilt_button.contains(position) {
+        MobileTouchZone::TiltButton
+    } else if rects.left_button.contains(position) {
+        MobileTouchZone::LeftButton
+    } else if rects.right_button.contains(position) {
+        MobileTouchZone::RightButton
+    } else if joystick_available && rects.joystick.contains(position) {
+        MobileTouchZone::Joystick
+    } else {
+        MobileTouchZone::Unclaimed
+    }
+}
+
+fn normalized_joystick_vector(rect: ScreenRect, position: Vec2) -> Vec2 {
+    let radius = (rect.size().min_element() * 0.5 - 16.0).max(1.0);
+    let mut delta = (position - rect.center()) / radius;
+    delta.y = -delta.y;
+    let length = delta.length();
+    if length <= MOBILE_JOYSTICK_DEADZONE {
+        return Vec2::ZERO;
+    }
+    if length > 1.0 {
+        delta /= length;
+    }
+    let scaled = (length.min(1.0) - MOBILE_JOYSTICK_DEADZONE) / (1.0 - MOBILE_JOYSTICK_DEADZONE);
+    delta.normalize_or_zero() * scaled
+}
+
+fn mobile_pinch_target_zoom(
+    baseline_zoom: f32,
+    baseline_distance: f32,
+    current_distance: f32,
+) -> f32 {
+    if baseline_distance <= f32::EPSILON {
+        return baseline_zoom;
+    }
+    let zoom_steps = (baseline_distance - current_distance) / 72.0;
+    let anchor_zoom = if zoom_steps > 0.0 && baseline_zoom < THIRD_PERSON_MIN_ACTIVE_ZOOM {
+        THIRD_PERSON_ENTRY_ZOOM
+    } else {
+        baseline_zoom
+    };
+    (anchor_zoom + zoom_steps * THIRD_PERSON_SCROLL_STEP).clamp(0.0, THIRD_PERSON_MAX_ZOOM)
+}
+
+fn clamp_mobile_tilt_axis(value: f32, deadzone: f32) -> f32 {
+    let adjusted = if value.abs() <= deadzone {
+        0.0
+    } else {
+        value - deadzone * value.signum()
+    };
+    adjusted.clamp(-MOBILE_TILT_MAX_DEGREES, MOBILE_TILT_MAX_DEGREES)
+}
+
+fn normalize_tilt_axes(
+    beta: f32,
+    gamma: f32,
+    orientation: MobileViewportOrientation,
+) -> Vec2 {
+    match orientation {
+        MobileViewportOrientation::Portrait => Vec2::new(gamma, beta),
+        MobileViewportOrientation::PortraitUpsideDown => Vec2::new(-gamma, -beta),
+        MobileViewportOrientation::LandscapeLeft => Vec2::new(beta, -gamma),
+        MobileViewportOrientation::LandscapeRight => Vec2::new(-beta, gamma),
+    }
+}
+
+fn browser_supports_touch_input() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let max_touch_points = js_sys::Reflect::get(
+        window.navigator().as_ref(),
+        &JsValue::from_str("maxTouchPoints"),
+    )
+    .ok()
+    .and_then(|value| value.as_f64())
+    .unwrap_or(0.0);
+    if max_touch_points > 0.0 {
+        return true;
+    }
+    window
+        .match_media("(pointer: coarse)")
+        .ok()
+        .flatten()
+        .map(|query| query.matches())
+        .unwrap_or(false)
+}
+
+fn device_orientation_supported() -> bool {
+    js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("DeviceOrientationEvent"))
+        .ok()
+        .is_some_and(|value| !value.is_null() && !value.is_undefined())
+}
+
+async fn request_device_orientation_permission() -> Result<Option<bool>> {
+    let device_orientation =
+        js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("DeviceOrientationEvent"))
+            .map_err(|error| anyhow::anyhow!("resolve DeviceOrientationEvent: {error:?}"))?;
+    if device_orientation.is_null() || device_orientation.is_undefined() {
+        return Ok(Some(false));
+    }
+
+    let request_permission =
+        js_sys::Reflect::get(&device_orientation, &JsValue::from_str("requestPermission"))
+            .map_err(|error| anyhow::anyhow!("resolve requestPermission: {error:?}"))?;
+    if request_permission.is_null() || request_permission.is_undefined() {
+        return Ok(None);
+    }
+
+    let request_permission = request_permission
+        .dyn_into::<js_sys::Function>()
+        .map_err(|_| anyhow::anyhow!("cast requestPermission"))?;
+    let promise = request_permission
+        .call0(&device_orientation)
+        .map_err(|error| anyhow::anyhow!("call requestPermission: {error:?}"))?
+        .dyn_into::<js_sys::Promise>()
+        .map_err(|_| anyhow::anyhow!("cast requestPermission promise"))?;
+    let result = JsFuture::from(promise)
+        .await
+        .map_err(|error| anyhow::anyhow!("await requestPermission: {error:?}"))?;
+    Ok(Some(result.as_string().as_deref() == Some("granted")))
+}
+
+fn current_viewport_orientation() -> MobileViewportOrientation {
+    let angle = web_sys::window().and_then(|window| {
+        js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("screen"))
+            .ok()
+            .and_then(|screen| {
+                js_sys::Reflect::get(&screen, &JsValue::from_str("orientation")).ok()
+            })
+            .and_then(|orientation| {
+                js_sys::Reflect::get(&orientation, &JsValue::from_str("angle")).ok()
+            })
+            .and_then(|value| value.as_f64())
+            .or_else(|| {
+                js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("orientation"))
+                    .ok()
+                    .and_then(|value| value.as_f64())
+            })
+    });
+
+    match angle.map(|value| value.round() as i32) {
+        Some(90) => MobileViewportOrientation::LandscapeLeft,
+        Some(-90) | Some(270) => MobileViewportOrientation::LandscapeRight,
+        Some(180) | Some(-180) => MobileViewportOrientation::PortraitUpsideDown,
+        Some(0) => MobileViewportOrientation::Portrait,
+        _ => css_viewport_size()
+            .map(|(width, height)| {
+                if width >= height {
+                    MobileViewportOrientation::LandscapeLeft
+                } else {
+                    MobileViewportOrientation::Portrait
+                }
+            })
+            .unwrap_or(MobileViewportOrientation::Portrait),
     }
 }
 
@@ -11045,4 +12029,89 @@ fn player_anchor_from_eye_with_look(eye: Vec3, _look: Vec3) -> PlayerAnchor {
     let head = body + Vec3::Y * PLAYER_HEIGHT;
     let media = head + Vec3::Y * 0.95;
     PlayerAnchor { body, head, media }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joystick_up_maps_to_positive_forward_input() {
+        let rect = ScreenRect {
+            left: 0.0,
+            top: 0.0,
+            right: 120.0,
+            bottom: 120.0,
+        };
+        let vector = normalized_joystick_vector(rect, Vec2::new(60.0, 20.0));
+        assert!(vector.y > 0.0);
+        assert!(vector.x.abs() < 0.05);
+    }
+
+    #[test]
+    fn pinch_can_enter_third_person_from_first_person() {
+        let zoom = mobile_pinch_target_zoom(0.0, 120.0, 72.0);
+        assert!(zoom >= THIRD_PERSON_ENTRY_ZOOM);
+    }
+
+    #[test]
+    fn tilt_axis_normalization_respects_orientation() {
+        assert_eq!(
+            normalize_tilt_axes(12.0, -6.0, MobileViewportOrientation::Portrait),
+            Vec2::new(-6.0, 12.0)
+        );
+        assert_eq!(
+            normalize_tilt_axes(12.0, -6.0, MobileViewportOrientation::LandscapeLeft),
+            Vec2::new(12.0, 6.0)
+        );
+    }
+
+    #[test]
+    fn tilt_deadzone_zeroes_small_motion() {
+        assert_eq!(clamp_mobile_tilt_axis(1.5, 2.0), 0.0);
+        assert_eq!(clamp_mobile_tilt_axis(-1.5, 2.0), 0.0);
+        assert_eq!(clamp_mobile_tilt_axis(7.0, 2.0), 5.0);
+    }
+
+    #[test]
+    fn mobile_touch_zone_prefers_explicit_controls() {
+        let rects = MobileHudRects {
+            joystick: ScreenRect {
+                left: 0.0,
+                top: 100.0,
+                right: 120.0,
+                bottom: 220.0,
+            },
+            left_button: ScreenRect {
+                left: 220.0,
+                top: 80.0,
+                right: 320.0,
+                bottom: 180.0,
+            },
+            right_button: ScreenRect {
+                left: 220.0,
+                top: 190.0,
+                right: 320.0,
+                bottom: 290.0,
+            },
+            tilt_button: ScreenRect {
+                left: 120.0,
+                top: 0.0,
+                right: 220.0,
+                bottom: 48.0,
+            },
+        };
+        assert_eq!(
+            classify_mobile_touch_zone(Vec2::new(170.0, 20.0), &rects, true),
+            MobileTouchZone::TiltButton
+        );
+        assert_eq!(
+            classify_mobile_touch_zone(Vec2::new(40.0, 160.0), &rects, true),
+            MobileTouchZone::Joystick
+        );
+        assert_eq!(
+            classify_mobile_touch_zone(Vec2::new(40.0, 160.0), &rects, false),
+            MobileTouchZone::Unclaimed
+        );
+    }
 }

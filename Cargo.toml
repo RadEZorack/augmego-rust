@@ -32,7 +32,7 @@ wgpu = { version = "0.20", features = ["webgl"] }
 
 [workspace.dependencies.web-sys]
 version = "0.3"
-features = ["BinaryType", "Blob", "CanvasRenderingContext2d", "CloseEvent", "Document", "Element", "ErrorEvent", "Event", "EventTarget", "File", "FileList", "FormData", "Headers", "HtmlCanvasElement", "HtmlInputElement", "HtmlMediaElement", "HtmlVideoElement", "ImageData", "Location", "MediaDevices", "MediaStream", "MediaStreamConstraints", "MediaStreamTrack", "MessageEvent", "Navigator", "Request", "RequestCredentials", "RequestInit", "RequestMode", "Response", "RtcDataChannel", "RtcDataChannelEvent", "RtcIceCandidate", "RtcIceCandidateInit", "RtcPeerConnection", "RtcPeerConnectionIceEvent", "RtcSdpType", "RtcSessionDescriptionInit", "RtcTrackEvent", "Url", "WebSocket", "Window", "Worker"]
+features = ["BinaryType", "Blob", "CanvasRenderingContext2d", "CloseEvent", "DeviceOrientationEvent", "Document", "DomRect", "Element", "ErrorEvent", "Event", "EventTarget", "File", "FileList", "FormData", "Headers", "HtmlCanvasElement", "HtmlInputElement", "HtmlMediaElement", "HtmlVideoElement", "ImageData", "Location", "MediaDevices", "MediaQueryList", "MediaStream", "MediaStreamConstraints", "MediaStreamTrack", "MessageEvent", "Navigator", "Request", "RequestCredentials", "RequestInit", "RequestMode", "Response", "RtcDataChannel", "RtcDataChannelEvent", "RtcIceCandidate", "RtcIceCandidateInit", "RtcPeerConnection", "RtcPeerConnectionIceEvent", "RtcSdpType", "RtcSessionDescriptionInit", "RtcTrackEvent", "Screen", "ScreenOrientation", "Url", "WebSocket", "Window", "Worker"]
 
 [workspace.dependencies.wasm-bindgen]
 version = "0.2"

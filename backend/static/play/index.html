@@ -2,12 +2,15 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
     <title>Augmego Voxel Sandbox Web</title>
     
 <script type="module">
-import init, * as bindings from '/play/game-web-8343e38f07cb64b3.js';
-const wasm = await init({ module_or_path: '/play/game-web-8343e38f07cb64b3_bg.wasm' });
+import init, * as bindings from '/play/game-web-7568e98f56a90185.js';
+const wasm = await init({ module_or_path: '/play/game-web-7568e98f56a90185_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -25,6 +28,8 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         overflow: hidden;
         background: #d7ecfb;
         font-family: ui-sans-serif, system-ui, sans-serif;
+        overscroll-behavior: none;
+        touch-action: none;
       }
 
       body {
@@ -35,11 +40,12 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         width: 100vw;
         height: 100vh;
         display: block;
+        touch-action: none;
       }
 
-      .hud {
+      #augmego-control-hint {
         position: fixed;
-        top: 0%;
+        top: max(0px, env(safe-area-inset-top));
         left: 50%;
         transform: translate(-50%, 50%);
         padding: 10px 12px;
@@ -52,8 +58,8 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         backdrop-filter: blur(12px);
       }
     </style>
-  <link rel="modulepreload" href="/play/game-web-8343e38f07cb64b3.js" crossorigin="anonymous" integrity="sha384-lGMRF5jASK3WuNAK6TiexSpA5aYlNcL3g8pb0jsvPXLiF1q4lA4oi6NwSjlZT2i4"><link rel="preload" href="/play/game-web-8343e38f07cb64b3_bg.wasm" crossorigin="anonymous" integrity="sha384-x0yHeMk5kuyWbMHGJUNSqqm51lfrURxVWE4eDj2WVOi+mXn9FNhCGdr+hkwuZFt1" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/play/game-web-7568e98f56a90185.js" crossorigin="anonymous" integrity="sha384-2kGEUNwlPmpKBiIVbPmf/wrnaYNJNV7dvY1gqwU4wJ2AYgg8krVejp1Q/c6rRNCt"><link rel="preload" href="/play/game-web-7568e98f56a90185_bg.wasm" crossorigin="anonymous" integrity="sha384-xIpvd6eZpyuE2y2T8SPn5hSmrB1JZMW5zcOnyttQwESLGDZ8aXWia+9ZP3N4Lfd9" as="fetch" type="application/wasm"></head>
   <body>
-    <div class="hud">WASD move, mouse look, Space up, Shift down</div>
+    <div id="augmego-control-hint">Loading controls…</div>
   </body>
 </html>

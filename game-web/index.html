@@ -2,7 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
     <title>Augmego Voxel Sandbox Web</title>
     <link data-trunk rel="rust" />
     <link data-trunk rel="copy-file" href="mesh-worker.js" />
@@ -14,6 +17,8 @@
         overflow: hidden;
         background: #d7ecfb;
         font-family: ui-sans-serif, system-ui, sans-serif;
+        overscroll-behavior: none;
+        touch-action: none;
       }
 
       body {
@@ -24,11 +29,12 @@
         width: 100vw;
         height: 100vh;
         display: block;
+        touch-action: none;
       }
 
-      .hud {
+      #augmego-control-hint {
         position: fixed;
-        top: 0%;
+        top: max(0px, env(safe-area-inset-top));
         left: 50%;
         transform: translate(-50%, 50%);
         padding: 10px 12px;
@@ -43,6 +49,6 @@
     </style>
   </head>
   <body>
-    <div class="hud">WASD move, mouse look, Space up, Shift down</div>
+    <div id="augmego-control-hint">Loading controls…</div>
   </body>
 </html>

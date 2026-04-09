@@ -7867,9 +7867,9 @@ fn mobile_hud_action_button_style(active: bool, upper_button: bool) -> &'static 
 
 fn mobile_hud_tilt_button_style(active: bool) -> &'static str {
     if active {
-        "position:fixed;left:max(18px,calc(env(safe-area-inset-left) + 18px));top:max(78px,calc(env(safe-area-inset-top) + 78px));padding:12px 18px;border-radius:999px;border:1px solid rgba(183,230,255,0.38);background:linear-gradient(180deg,rgba(20,62,84,0.94),rgba(12,40,56,0.94));color:#effaff;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 12px 28px rgba(0,0,0,0.28);backdrop-filter:blur(10px);"
+        "position:fixed;left:max(18px,calc(env(safe-area-inset-left) + 18px));top:max(136px,calc(env(safe-area-inset-top) + 136px));padding:12px 18px;border-radius:999px;border:1px solid rgba(183,230,255,0.38);background:linear-gradient(180deg,rgba(20,62,84,0.94),rgba(12,40,56,0.94));color:#effaff;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 12px 28px rgba(0,0,0,0.28);backdrop-filter:blur(10px);"
     } else {
-        "position:fixed;left:max(18px,calc(env(safe-area-inset-left) + 18px));top:max(78px,calc(env(safe-area-inset-top) + 78px));padding:12px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.18);background:rgba(18,24,32,0.88);color:#f6f8fb;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 12px 28px rgba(0,0,0,0.28);backdrop-filter:blur(10px);"
+        "position:fixed;left:max(18px,calc(env(safe-area-inset-left) + 18px));top:max(136px,calc(env(safe-area-inset-top) + 136px));padding:12px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.18);background:rgba(18,24,32,0.88);color:#f6f8fb;font:700 13px/1.2 ui-sans-serif,system-ui,sans-serif;box-shadow:0 12px 28px rgba(0,0,0,0.28);backdrop-filter:blur(10px);"
     }
 }
 
@@ -7972,7 +7972,7 @@ fn mobile_tilt_offset_from_samples(
     let horizontal = Vec2::new(forward.x, forward.z).length();
     let pitch = forward.y.atan2(horizontal.max(1.0e-4));
     let (_, zero_roll_up) = camera_basis_from_forward_and_roll(forward, 0.0);
-    let roll = signed_angle_around_axis(zero_roll_up, up, forward);
+    let roll = -signed_angle_around_axis(zero_roll_up, up, forward);
     Vec3::new(yaw, pitch, roll)
 }
 
@@ -12180,7 +12180,7 @@ mod tests {
     }
 
     #[test]
-    fn tilt_roll_changes_camera_roll() {
+    fn tilt_roll_direction_matches_swapped_mobile_expectation() {
         let baseline = MobileTiltSample {
             alpha_deg: 0.0,
             beta_deg: 90.0,
@@ -12193,7 +12193,7 @@ mod tests {
         };
 
         let offset = mobile_tilt_offset_from_samples(rolled, baseline);
-        assert!(offset.z.abs() > 0.2);
+        assert!(offset.z < -0.2);
     }
 
     #[test]

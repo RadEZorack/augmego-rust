@@ -67,6 +67,7 @@ const WILD_PET_GLOBAL_CAP: usize = 30;
 const WILD_PET_MIN_SPAWN_DISTANCE: f32 = 18.0;
 const WILD_PET_SPAWN_RADIUS: f32 = 56.0;
 const WILD_PET_MAX_HEALTH: u8 = 30;
+const WILD_PET_BOTTOM_DESPAWN_Y: f32 = 1.0;
 const WILD_WEAPON_PICKUP_DISTANCE: f32 = 3.8;
 const WILD_WEAPON_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 const WILD_WEAPON_TARGET_PER_PLAYER: usize = 6;
@@ -1009,6 +1010,12 @@ struct CompletedWildPetCapture {
     pet_identity: PetIdentity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BottomedOutWildPet {
+    world_pet_id: u64,
+    pet_identity_id: String,
+}
+
 #[derive(Debug, Clone)]
 struct PetWeaponShotDispatch {
     player_ids: Vec<u64>,
@@ -1138,6 +1145,35 @@ impl WildPetService {
             .retain(|_, pet| !(pet.captured && pet_identity_ids.contains(&pet.pet_identity.id)));
     }
 
+    async fn clear_pet_combat_targets_for_pet_ids(&self, pet_ids: &[u64]) {
+        if pet_ids.is_empty() {
+            return;
+        }
+
+        let pet_ids = pet_ids.iter().copied().collect::<HashSet<_>>();
+        self.pet_combat_targets
+            .lock()
+            .await
+            .retain(|_, target_pet_id| !pet_ids.contains(target_pet_id));
+    }
+
+    async fn release_bottomed_out_pets(
+        &self,
+        pet_registry: &PetRegistryClient,
+        pets: &[BottomedOutWildPet],
+    ) {
+        for pet in pets {
+            if let Err(error) = pet_registry.release_spawned_pet(&pet.pet_identity_id).await {
+                tracing::warn!(
+                    ?error,
+                    pet_id = pet.world_pet_id,
+                    registry_pet_id = %pet.pet_identity_id,
+                    "failed to release wild pet after bottom-of-map despawn"
+                );
+            }
+        }
+    }
+
     async fn maintain(
         &self,
         world_service: &WorldService,
@@ -1160,6 +1196,10 @@ impl WildPetService {
             pet.visible_viewers
                 .retain(|player_id| connected_player_ids.contains(player_id));
         }
+
+        let (despawn_dispatches, bottomed_out_pets) =
+            drain_bottomed_out_wild_pets(&mut pets, connected_player_ids);
+        dispatches.extend(despawn_dispatches);
 
         let mut uncaptured_count = pets.values().filter(|pet| !pet.captured).count();
         if uncaptured_count < WILD_PET_GLOBAL_CAP {
@@ -1202,11 +1242,22 @@ impl WildPetService {
             }
         }
 
+        drop(pets);
+        let bottomed_out_pet_ids = bottomed_out_pets
+            .iter()
+            .map(|pet| pet.world_pet_id)
+            .collect::<Vec<_>>();
+        self.clear_pet_combat_targets_for_pet_ids(&bottomed_out_pet_ids)
+            .await;
+        self.release_bottomed_out_pets(pet_registry, &bottomed_out_pets)
+            .await;
+
         Ok(dispatches)
     }
 
     async fn apply_host_motion(
         &self,
+        pet_registry: &PetRegistryClient,
         player_id: u64,
         tick: u64,
         wild_pet_states: Vec<WildPetMotionSnapshot>,
@@ -1244,6 +1295,20 @@ impl WildPetService {
             pet.tick = pet.tick.max(tick);
             dispatches.extend(reconcile_pet_visibility(pet, &active_players, true));
         }
+
+        let (despawn_dispatches, bottomed_out_pets) =
+            drain_bottomed_out_wild_pets(&mut pets, connected_player_ids);
+        dispatches.extend(despawn_dispatches);
+        drop(pets);
+
+        let bottomed_out_pet_ids = bottomed_out_pets
+            .iter()
+            .map(|pet| pet.world_pet_id)
+            .collect::<Vec<_>>();
+        self.clear_pet_combat_targets_for_pet_ids(&bottomed_out_pet_ids)
+            .await;
+        self.release_bottomed_out_pets(pet_registry, &bottomed_out_pets)
+            .await;
 
         dispatches
     }
@@ -2998,6 +3063,7 @@ impl VoxelServer {
                         let dispatches = self
                             .wild_pet_service
                             .apply_host_motion(
+                                &self.pet_registry,
                                 player_id,
                                 tick,
                                 wild_pet_states,
@@ -5571,6 +5637,49 @@ fn reconcile_pet_visibility(
     dispatches
 }
 
+fn drain_bottomed_out_wild_pets(
+    pets: &mut HashMap<u64, WildPet>,
+    connected_player_ids: &HashSet<u64>,
+) -> (Vec<WildPetDispatch>, Vec<BottomedOutWildPet>) {
+    let mut dispatches = Vec::new();
+    let mut bottomed_out_pets = Vec::new();
+
+    pets.retain(|_, pet| {
+        if pet.captured || pet.position[1] > WILD_PET_BOTTOM_DESPAWN_Y {
+            return true;
+        }
+
+        tracing::info!(
+            pet_id = pet.id,
+            registry_pet_id = %pet.pet_identity.id,
+            y = pet.position[1],
+            "despawning wild pet after it fell to the bottom of the map"
+        );
+
+        let mut viewer_ids = pet
+            .visible_viewers
+            .iter()
+            .copied()
+            .filter(|player_id| connected_player_ids.contains(player_id))
+            .collect::<Vec<_>>();
+        viewer_ids.sort_unstable();
+        if !viewer_ids.is_empty() {
+            dispatches.push(WildPetDispatch::Unload {
+                player_ids: viewer_ids,
+                pet_ids: vec![pet.id],
+            });
+        }
+
+        bottomed_out_pets.push(BottomedOutWildPet {
+            world_pet_id: pet.id,
+            pet_identity_id: pet.pet_identity.id.clone(),
+        });
+        false
+    });
+
+    (dispatches, bottomed_out_pets)
+}
+
 fn reconcile_weapon_visibility(
     weapon: &mut WildWeapon,
     players: &[Player],
@@ -5796,6 +5905,100 @@ mod tests {
                 visible_viewers: viewers.iter().copied().collect(),
             },
         );
+    }
+
+    #[test]
+    fn drain_bottomed_out_wild_pets_unloads_connected_viewers_and_keeps_other_pets() {
+        let mut pets = HashMap::from([
+            (
+                1,
+                WildPet {
+                    id: 1,
+                    pet_identity: PetIdentity {
+                        id: "00000000-0000-0000-0000-000000000001".to_string(),
+                        display_name: "Bottomed Out".to_string(),
+                        model_url: None,
+                        equipped_weapon: None,
+                    },
+                    tick: 0,
+                    spawn_position: [4.5, 88.0, 4.5],
+                    position: [4.5, 0.0, 4.5],
+                    velocity: [0.0; 3],
+                    yaw: 0.0,
+                    host_player_id: Some(7),
+                    health: WILD_PET_MAX_HEALTH,
+                    captured: false,
+                    visible_viewers: HashSet::from([7, 8]),
+                },
+            ),
+            (
+                2,
+                WildPet {
+                    id: 2,
+                    pet_identity: PetIdentity {
+                        id: "00000000-0000-0000-0000-000000000002".to_string(),
+                        display_name: "Still Fine".to_string(),
+                        model_url: None,
+                        equipped_weapon: None,
+                    },
+                    tick: 0,
+                    spawn_position: [8.5, 88.0, 8.5],
+                    position: [8.5, 88.0, 8.5],
+                    velocity: [0.0; 3],
+                    yaw: 0.0,
+                    host_player_id: Some(7),
+                    health: WILD_PET_MAX_HEALTH,
+                    captured: false,
+                    visible_viewers: HashSet::from([7]),
+                },
+            ),
+            (
+                3,
+                WildPet {
+                    id: 3,
+                    pet_identity: PetIdentity {
+                        id: "00000000-0000-0000-0000-000000000003".to_string(),
+                        display_name: "Captured".to_string(),
+                        model_url: None,
+                        equipped_weapon: None,
+                    },
+                    tick: 0,
+                    spawn_position: [12.5, 88.0, 12.5],
+                    position: [12.5, 0.0, 12.5],
+                    velocity: [0.0; 3],
+                    yaw: 0.0,
+                    host_player_id: None,
+                    health: 0,
+                    captured: true,
+                    visible_viewers: HashSet::new(),
+                },
+            ),
+        ]);
+
+        let (dispatches, bottomed_out_pets) =
+            drain_bottomed_out_wild_pets(&mut pets, &HashSet::from([8, 9]));
+
+        assert_eq!(
+            bottomed_out_pets,
+            vec![BottomedOutWildPet {
+                world_pet_id: 1,
+                pet_identity_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            }]
+        );
+        assert_eq!(pets.len(), 2);
+        assert!(pets.contains_key(&2));
+        assert!(pets.contains_key(&3));
+        assert_eq!(dispatches.len(), 1);
+        match &dispatches[0] {
+            WildPetDispatch::Unload {
+                player_ids,
+                pet_ids,
+            } => {
+                assert_eq!(player_ids, &vec![8]);
+                assert_eq!(pet_ids, &vec![1]);
+            }
+            WildPetDispatch::Snapshot { .. } => panic!("expected unload dispatch"),
+        }
     }
 
     #[test]

@@ -3722,6 +3722,14 @@ impl WebApp {
         }
     }
 
+    fn movement_yaw(&self) -> f32 {
+        if self.is_mobile_active() {
+            self.camera.yaw
+        } else {
+            self.control_yaw()
+        }
+    }
+
     fn current_mobile_tilt_target(&self) -> Vec3 {
         if self.mobile_controls.tilt_permission != MobileTiltPermissionState::Active {
             return Vec3::ZERO;
@@ -3823,7 +3831,7 @@ impl WebApp {
         if movement_for_server.length_squared() > 1.0 {
             movement_for_server = movement_for_server.normalize();
         }
-        let movement_yaw = self.control_yaw();
+        let movement_yaw = self.movement_yaw();
         let forward = Vec3::new(movement_yaw.sin(), 0.0, movement_yaw.cos()).normalize_or_zero();
         let right = Vec3::new(-forward.z, 0.0, forward.x);
         let world_movement = forward * -movement_for_server.z + right * movement_for_server.x;
@@ -5893,8 +5901,8 @@ impl WebApp {
             horizontal = horizontal.normalize();
         }
 
-        let control_yaw = self.control_yaw();
-        let forward = Vec3::new(control_yaw.sin(), 0.0, control_yaw.cos()).normalize_or_zero();
+        let movement_yaw = self.movement_yaw();
+        let forward = Vec3::new(movement_yaw.sin(), 0.0, movement_yaw.cos()).normalize_or_zero();
         let right = Vec3::new(-forward.z, 0.0, forward.x);
         let speed = if sprint {
             PLAYER_SPRINT_SPEED

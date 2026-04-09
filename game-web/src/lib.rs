@@ -1,7 +1,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use anyhow::Result;
-use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
+use glam::{EulerRot, Mat4, Quat, Vec2, Vec3, Vec4};
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
     BreakBlockRequest, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
@@ -115,7 +115,6 @@ const MOBILE_TILT_MAX_DEGREES: f32 = 32.0;
 const MOBILE_TILT_MAX_YAW_RADIANS: f32 = 0.9;
 const MOBILE_TILT_MAX_PITCH_RADIANS: f32 = 0.8;
 const MOBILE_TILT_SMOOTHING: f32 = 10.0;
-const MOBILE_TILT_UPRIGHT_BASELINE_DEGREES: f32 = 90.0;
 const LOCAL_AVATAR_TURN_SPEED: f32 = 10.0;
 const LOCAL_AVATAR_PLACEHOLDER_TINT: [f32; 3] = [0.82, 0.73, 0.44];
 const LINK_PANEL_OPEN_URL: &str = "https://www.google.com";
@@ -546,7 +545,9 @@ struct MobilePinchState {
 
 #[derive(Clone, Copy, Debug)]
 struct MobileTiltSample {
-    axes: Vec2,
+    alpha_deg: f32,
+    beta_deg: f32,
+    gamma_deg: f32,
     orientation: MobileViewportOrientation,
 }
 
@@ -1360,14 +1361,20 @@ impl WebApp {
             self.mobile_controls.tilt_permission = permission;
             match permission {
                 MobileTiltPermissionState::Active => {
-                    if self.mobile_controls.tilt_baseline.is_none() {
-                        let orientation = self
-                            .mobile_controls
-                            .latest_tilt_sample
-                            .map(|sample| sample.orientation)
-                            .unwrap_or_else(current_viewport_orientation);
-                        self.mobile_controls.tilt_baseline =
-                            Some(default_mobile_tilt_baseline(orientation));
+                    if let Some(sample) = self.mobile_controls.latest_tilt_sample {
+                        if self.mobile_controls.tilt_baseline.is_none() {
+                            self.mobile_controls.tilt_baseline =
+                                Some(default_mobile_tilt_baseline(sample));
+                        }
+                    } else if self.mobile_controls.tilt_baseline.is_none() {
+                        self.mobile_controls.tilt_baseline = Some(default_mobile_tilt_baseline(
+                            MobileTiltSample {
+                                alpha_deg: 0.0,
+                                beta_deg: 0.0,
+                                gamma_deg: 0.0,
+                                orientation: current_viewport_orientation(),
+                            },
+                        ));
                     }
                 }
                 MobileTiltPermissionState::Denied
@@ -1391,13 +1398,11 @@ impl WebApp {
                     .map(|baseline| baseline.orientation != sample.orientation)
                     .unwrap_or(false);
                 if orientation_changed {
-                    self.mobile_controls.tilt_baseline =
-                        Some(default_mobile_tilt_baseline(sample.orientation));
+                    self.mobile_controls.tilt_baseline = Some(default_mobile_tilt_baseline(sample));
                     self.mobile_controls.smoothed_look_offset = Vec2::ZERO;
                     self.mobile_controls.applied_look_offset = Vec2::ZERO;
                 } else if self.mobile_controls.tilt_baseline.is_none() {
-                    self.mobile_controls.tilt_baseline =
-                        Some(default_mobile_tilt_baseline(sample.orientation));
+                    self.mobile_controls.tilt_baseline = Some(default_mobile_tilt_baseline(sample));
                 }
             }
         }
@@ -1415,12 +1420,15 @@ impl WebApp {
             let Ok(event) = event.dyn_into::<DeviceOrientationEvent>() else {
                 return;
             };
+            let alpha = event.alpha().unwrap_or(0.0) as f32;
             let beta = event.beta().unwrap_or(0.0) as f32;
             let gamma = event.gamma().unwrap_or(0.0) as f32;
             let orientation = current_viewport_orientation();
             MOBILE_TILT_SAMPLE_QUEUE.with(|queue| {
                 *queue.borrow_mut() = Some(MobileTiltSample {
-                    axes: normalize_tilt_axes(beta, gamma, orientation),
+                    alpha_deg: alpha,
+                    beta_deg: beta,
+                    gamma_deg: gamma,
                     orientation,
                 });
             });
@@ -2801,13 +2809,7 @@ impl WebApp {
             }
         }
         self.weapons_panel.set_text_content(Some(&lines.join("\n")));
-        let _ = self.weapons_panel.set_attribute(
-            "style",
-            weapon_collection_panel_style(
-                self.is_mobile_active(),
-                !self.collected_weapons.is_empty() || self.weapon_notice.is_some(),
-            ),
-        );
+        let _ = self.weapons_panel.set_attribute("style", "display:none;");
     }
 
     fn drain_network(&mut self) {
@@ -3728,7 +3730,7 @@ impl WebApp {
         let Some(sample) = self.mobile_controls.latest_tilt_sample else {
             return Vec2::ZERO;
         };
-        mobile_tilt_offset_from_delta(sample.axes - baseline.axes)
+        mobile_tilt_offset_from_samples(sample, baseline)
     }
 
     fn apply_mobile_look(&mut self, dt_secs: f32) -> f32 {
@@ -7014,12 +7016,7 @@ fn create_mobile_hud() -> MobileHud {
 
     let control_hint = document
         .get_element_by_id("augmego-control-hint")
-        .unwrap_or_else(|| {
-            let hint = document.create_element("div").expect("control hint");
-            let _ = hint.set_attribute("id", "augmego-control-hint");
-            let _ = body.append_child(&hint);
-            hint
-        });
+        .unwrap_or_else(fallback_element);
 
     let root = document.create_element("div").expect("mobile hud root");
     let _ = root.set_attribute("style", mobile_hud_root_style(false));
@@ -7952,33 +7949,60 @@ fn clamp_mobile_tilt_axis(value: f32, deadzone: f32) -> f32 {
     adjusted.clamp(-MOBILE_TILT_MAX_DEGREES, MOBILE_TILT_MAX_DEGREES)
 }
 
-fn mobile_tilt_offset_from_delta(delta: Vec2) -> Vec2 {
-    let yaw = clamp_mobile_tilt_axis(delta.x, MOBILE_TILT_DEADZONE_DEGREES)
-        / MOBILE_TILT_MAX_DEGREES
-        * MOBILE_TILT_MAX_YAW_RADIANS;
-    let pitch = -clamp_mobile_tilt_axis(delta.y, MOBILE_TILT_DEADZONE_DEGREES)
-        / MOBILE_TILT_MAX_DEGREES
-        * MOBILE_TILT_MAX_PITCH_RADIANS;
-    Vec2::new(yaw, pitch)
+fn mobile_tilt_offset_from_samples(
+    sample: MobileTiltSample,
+    baseline: MobileTiltSample,
+) -> Vec2 {
+    let relative = mobile_tilt_quaternion(baseline).inverse() * mobile_tilt_quaternion(sample);
+    let forward = relative * Vec3::Z;
+    let yaw = forward.x.atan2(forward.z);
+    let horizontal = Vec2::new(forward.x, forward.z).length();
+    let pitch = forward.y.atan2(horizontal.max(1.0e-4));
+    Vec2::new(
+        clamp_mobile_tilt_axis(yaw.to_degrees(), MOBILE_TILT_DEADZONE_DEGREES)
+            .to_radians()
+            .clamp(-MOBILE_TILT_MAX_YAW_RADIANS, MOBILE_TILT_MAX_YAW_RADIANS),
+        clamp_mobile_tilt_axis(pitch.to_degrees(), MOBILE_TILT_DEADZONE_DEGREES)
+            .to_radians()
+            .clamp(-MOBILE_TILT_MAX_PITCH_RADIANS, MOBILE_TILT_MAX_PITCH_RADIANS),
+    )
 }
 
-fn default_mobile_tilt_baseline(orientation: MobileViewportOrientation) -> MobileTiltSample {
+fn default_mobile_tilt_baseline(sample: MobileTiltSample) -> MobileTiltSample {
+    let (beta_deg, gamma_deg) = upright_mobile_tilt_pose(sample.orientation);
     MobileTiltSample {
-        axes: Vec2::new(0.0, MOBILE_TILT_UPRIGHT_BASELINE_DEGREES),
-        orientation,
+        alpha_deg: sample.alpha_deg,
+        beta_deg,
+        gamma_deg,
+        orientation: sample.orientation,
     }
 }
 
-fn normalize_tilt_axes(
-    beta: f32,
-    gamma: f32,
-    orientation: MobileViewportOrientation,
-) -> Vec2 {
+fn upright_mobile_tilt_pose(orientation: MobileViewportOrientation) -> (f32, f32) {
     match orientation {
-        MobileViewportOrientation::Portrait => Vec2::new(gamma, beta),
-        MobileViewportOrientation::PortraitUpsideDown => Vec2::new(-gamma, -beta),
-        MobileViewportOrientation::LandscapeLeft => Vec2::new(beta, -gamma),
-        MobileViewportOrientation::LandscapeRight => Vec2::new(-beta, gamma),
+        MobileViewportOrientation::Portrait => (90.0, 0.0),
+        MobileViewportOrientation::PortraitUpsideDown => (-90.0, 0.0),
+        MobileViewportOrientation::LandscapeLeft => (0.0, -90.0),
+        MobileViewportOrientation::LandscapeRight => (0.0, 90.0),
+    }
+}
+
+fn mobile_tilt_quaternion(sample: MobileTiltSample) -> Quat {
+    let alpha = sample.alpha_deg.to_radians();
+    let beta = sample.beta_deg.to_radians();
+    let gamma = sample.gamma_deg.to_radians();
+    let screen = viewport_orientation_radians(sample.orientation);
+    Quat::from_euler(EulerRot::YXZ, alpha, beta, -gamma)
+        * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)
+        * Quat::from_rotation_z(-screen)
+}
+
+fn viewport_orientation_radians(orientation: MobileViewportOrientation) -> f32 {
+    match orientation {
+        MobileViewportOrientation::Portrait => 0.0,
+        MobileViewportOrientation::LandscapeLeft => std::f32::consts::FRAC_PI_2,
+        MobileViewportOrientation::LandscapeRight => -std::f32::consts::FRAC_PI_2,
+        MobileViewportOrientation::PortraitUpsideDown => std::f32::consts::PI,
     }
 }
 
@@ -12108,14 +12132,14 @@ mod tests {
     }
 
     #[test]
-    fn tilt_axis_normalization_respects_orientation() {
+    fn upright_mobile_tilt_pose_respects_orientation() {
         assert_eq!(
-            normalize_tilt_axes(12.0, -6.0, MobileViewportOrientation::Portrait),
-            Vec2::new(-6.0, 12.0)
+            upright_mobile_tilt_pose(MobileViewportOrientation::Portrait),
+            (90.0, 0.0)
         );
         assert_eq!(
-            normalize_tilt_axes(12.0, -6.0, MobileViewportOrientation::LandscapeLeft),
-            Vec2::new(12.0, 6.0)
+            upright_mobile_tilt_pose(MobileViewportOrientation::LandscapeLeft),
+            (0.0, -90.0)
         );
     }
 
@@ -12127,24 +12151,34 @@ mod tests {
     }
 
     #[test]
-    fn tilt_vertical_offset_is_reversed_and_stronger() {
-        let offset = mobile_tilt_offset_from_delta(Vec2::new(8.0, 8.0));
-        assert!(offset.x > 0.18);
-        assert!(offset.y < -0.16);
+    fn chair_spin_changes_tilt_yaw() {
+        let baseline = MobileTiltSample {
+            alpha_deg: 15.0,
+            beta_deg: 90.0,
+            gamma_deg: 0.0,
+            orientation: MobileViewportOrientation::Portrait,
+        };
+        let spun = MobileTiltSample {
+            alpha_deg: 45.0,
+            ..baseline
+        };
+
+        let offset = mobile_tilt_offset_from_samples(spun, baseline);
+        assert!(offset.x > 0.2);
+        assert!(offset.y.abs() < 0.1);
     }
 
     #[test]
     fn upright_portrait_pose_is_the_default_tilt_neutral() {
-        let baseline = default_mobile_tilt_baseline(MobileViewportOrientation::Portrait);
-        let upright_pose = MobileTiltSample {
-            axes: normalize_tilt_axes(90.0, 0.0, MobileViewportOrientation::Portrait),
+        let sample = MobileTiltSample {
+            alpha_deg: 32.0,
+            beta_deg: 90.0,
+            gamma_deg: 0.0,
             orientation: MobileViewportOrientation::Portrait,
         };
-
-        assert_eq!(
-            mobile_tilt_offset_from_delta(upright_pose.axes - baseline.axes),
-            Vec2::ZERO
-        );
+        let baseline = default_mobile_tilt_baseline(sample);
+        let offset = mobile_tilt_offset_from_samples(sample, baseline);
+        assert!(offset.length() < 1.0e-3);
     }
 
     #[test]

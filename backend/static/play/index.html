@@ -9,8 +9,8 @@
     <title>Augmego Voxel Sandbox Web</title>
     
 <script type="module">
-import init, * as bindings from '/play/game-web-a5dfa217ee3ed082.js';
-const wasm = await init({ module_or_path: '/play/game-web-a5dfa217ee3ed082_bg.wasm' });
+import init, * as bindings from '/play/game-web-b248ee6c3e0f58b8.js';
+const wasm = await init({ module_or_path: '/play/game-web-b248ee6c3e0f58b8_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -43,23 +43,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         touch-action: none;
       }
 
-      #augmego-control-hint {
-        position: fixed;
-        top: max(0px, env(safe-area-inset-top));
-        left: 50%;
-        transform: translate(-50%, 50%);
-        padding: 10px 12px;
-        border-radius: 10px;
-        background: rgba(255, 255, 255, 0.78);
-        color: #1f2937;
-        font-size: 14px;
-        text-align: center;
-        pointer-events: none;
-        backdrop-filter: blur(12px);
-      }
     </style>
-  <link rel="modulepreload" href="/play/game-web-a5dfa217ee3ed082.js" crossorigin="anonymous" integrity="sha384-2kGEUNwlPmpKBiIVbPmf/wrnaYNJNV7dvY1gqwU4wJ2AYgg8krVejp1Q/c6rRNCt"><link rel="preload" href="/play/game-web-a5dfa217ee3ed082_bg.wasm" crossorigin="anonymous" integrity="sha384-AJ8VLhHhqzHgRg8WcR0ekxCLs+qekuypdgP2G++QqltaoTG7aDVS4jAhsHAogDLa" as="fetch" type="application/wasm"></head>
-  <body>
-    <div id="augmego-control-hint">Loading controls…</div>
-  </body>
+  <link rel="modulepreload" href="/play/game-web-b248ee6c3e0f58b8.js" crossorigin="anonymous" integrity="sha384-NHkxY/lce1nuBfQZ2JXs3jTBvPR5yuJSPDGBRSIrgnFwpdPI3sfIMXHqroLiw5/g"><link rel="preload" href="/play/game-web-b248ee6c3e0f58b8_bg.wasm" crossorigin="anonymous" integrity="sha384-BsNYXCdIYRcH2TrXRbaZF10EkWekci9/XukO3dSKEXMnmeUUt/3TIHT6OK8O1uMb" as="fetch" type="application/wasm"></head>
+  <body></body>
 </html>

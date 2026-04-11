@@ -26,15 +26,48 @@ pub enum BlockId {
     Lantern = 10,
     Storage = 11,
     GoldOre = 12,
+    CoalOre = 13,
+    IronOre = 14,
+    Sandstone = 15,
 }
 
 impl BlockId {
+    pub fn from_raw(id: u16) -> Option<Self> {
+        match id {
+            0 => Some(Self::Air),
+            1 => Some(Self::Grass),
+            2 => Some(Self::Dirt),
+            3 => Some(Self::Stone),
+            4 => Some(Self::Sand),
+            5 => Some(Self::Water),
+            6 => Some(Self::Log),
+            7 => Some(Self::Leaves),
+            8 => Some(Self::Planks),
+            9 => Some(Self::Glass),
+            10 => Some(Self::Lantern),
+            11 => Some(Self::Storage),
+            12 => Some(Self::GoldOre),
+            13 => Some(Self::CoalOre),
+            14 => Some(Self::IronOre),
+            15 => Some(Self::Sandstone),
+            _ => None,
+        }
+    }
+
+    pub fn raw(self) -> u16 {
+        self as u16
+    }
+
     pub fn is_transparent(self) -> bool {
         matches!(self, Self::Air | Self::Water | Self::Leaves | Self::Glass)
     }
 
     pub fn is_empty(self) -> bool {
         matches!(self, Self::Air)
+    }
+
+    pub fn is_collectible(self) -> bool {
+        !matches!(self, Self::Air | Self::Water)
     }
 }
 
@@ -219,20 +252,7 @@ impl TerrainGenerator {
                         y: y as u8,
                         z: z as u8,
                     };
-                    let block = if y == surface {
-                        match column_biome {
-                            BiomeId::Desert => BlockId::Sand,
-                            BiomeId::Alpine => BlockId::Stone,
-                            _ => BlockId::Grass,
-                        }
-                    } else if y > surface - 4 {
-                        match column_biome {
-                            BiomeId::Desert => BlockId::Sand,
-                            _ => BlockId::Dirt,
-                        }
-                    } else {
-                        BlockId::Stone
-                    };
+                    let block = self.block_for_column(world_x, world_z, y, surface, column_biome);
                     let index = linear_index(local);
                     voxels[index] = Voxel { block };
                 }
@@ -311,6 +331,55 @@ impl TerrainGenerator {
 
     fn noise_value(&self, x: i64, z: i64, salt: u64) -> f32 {
         (self.hash(x, z, salt) as f64 / u64::MAX as f64) as f32
+    }
+
+    fn block_for_column(
+        &self,
+        world_x: i64,
+        world_z: i64,
+        y: i32,
+        surface: i32,
+        biome: BiomeId,
+    ) -> BlockId {
+        if y == surface {
+            return match biome {
+                BiomeId::Desert => BlockId::Sand,
+                BiomeId::Alpine => BlockId::Stone,
+                _ => BlockId::Grass,
+            };
+        }
+
+        if biome == BiomeId::Desert {
+            if y == surface - 1 {
+                return BlockId::Sand;
+            }
+            if (surface - 5..=surface - 2).contains(&y) {
+                return BlockId::Sandstone;
+            }
+        } else if y > surface - 4 {
+            return BlockId::Dirt;
+        }
+
+        self.decorate_stone_block(world_x, world_z, y)
+    }
+
+    fn decorate_stone_block(&self, world_x: i64, world_z: i64, y: i32) -> BlockId {
+        if y < 32 && self.ore_roll(world_x, world_z, y, 211) < 1 {
+            return BlockId::GoldOre;
+        }
+        if y < 56 && self.ore_roll(world_x, world_z, y, 157) < 2 {
+            return BlockId::IronOre;
+        }
+        if y < 72 && self.ore_roll(world_x, world_z, y, 101) < 3 {
+            return BlockId::CoalOre;
+        }
+
+        BlockId::Stone
+    }
+
+    fn ore_roll(&self, world_x: i64, world_z: i64, y: i32, salt: u64) -> u64 {
+        let y_mix = (y as u32 as u64).wrapping_mul(0x9E37_79B1);
+        self.hash(world_x, world_z, salt ^ y_mix) % 100
     }
 
     fn place_tree(&self, voxels: &mut [Voxel], x: u8, y: u8, z: u8) {
@@ -407,5 +476,104 @@ mod tests {
         let b = generator.generate_chunk(ChunkPos { x: 3, z: -7 });
 
         assert_eq!(serialize_chunk(&a).unwrap(), serialize_chunk(&b).unwrap());
+    }
+
+    #[test]
+    fn ores_generate_within_expected_depth_bands() {
+        let generator = TerrainGenerator::new(42);
+        let mut found_coal = false;
+        let mut found_iron = false;
+        let mut found_gold = false;
+
+        'chunks: for chunk_x in -6..=6 {
+            for chunk_z in -6..=6 {
+                let chunk = generator.generate_chunk(ChunkPos {
+                    x: chunk_x,
+                    z: chunk_z,
+                });
+                for y in 0..CHUNK_HEIGHT {
+                    for z in 0..CHUNK_DEPTH {
+                        for x in 0..CHUNK_WIDTH {
+                            let block = chunk
+                                .voxel(LocalVoxelPos {
+                                    x: x as u8,
+                                    y: y as u8,
+                                    z: z as u8,
+                                })
+                                .block;
+                            match block {
+                                BlockId::CoalOre => {
+                                    found_coal = true;
+                                    assert!(y < 72);
+                                }
+                                BlockId::IronOre => {
+                                    found_iron = true;
+                                    assert!(y < 56);
+                                }
+                                BlockId::GoldOre => {
+                                    found_gold = true;
+                                    assert!(y < 32);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                if found_coal && found_iron && found_gold {
+                    break 'chunks;
+                }
+            }
+        }
+
+        assert!(found_coal, "expected at least one coal ore block");
+        assert!(found_iron, "expected at least one iron ore block");
+        assert!(found_gold, "expected at least one gold ore block");
+    }
+
+    #[test]
+    fn sandstone_only_appears_in_desert_subsurface_layers() {
+        let generator = TerrainGenerator::new(42);
+        let mut found_sandstone = false;
+
+        for chunk_x in -6..=6 {
+            for chunk_z in -6..=6 {
+                let position = ChunkPos {
+                    x: chunk_x,
+                    z: chunk_z,
+                };
+                let chunk = generator.generate_chunk(position);
+                let base = position.min_world_block();
+
+                for z in 0..CHUNK_DEPTH {
+                    for x in 0..CHUNK_WIDTH {
+                        let world_x = base.x + i64::from(x);
+                        let world_z = base.z + i64::from(z);
+                        let biome = generator.biome_at_world(world_x, world_z);
+                        let surface = generator.height_at(world_x, world_z, biome);
+
+                        for y in 0..=surface.min(CHUNK_HEIGHT - 1) {
+                            let block = chunk
+                                .voxel(LocalVoxelPos {
+                                    x: x as u8,
+                                    y: y as u8,
+                                    z: z as u8,
+                                })
+                                .block;
+                            if block != BlockId::Sandstone {
+                                continue;
+                            }
+
+                            found_sandstone = true;
+                            assert_eq!(biome, BiomeId::Desert);
+                            assert!(y <= surface - 2);
+                            assert!(y >= surface - 5);
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(found_sandstone, "expected at least one sandstone block");
     }
 }

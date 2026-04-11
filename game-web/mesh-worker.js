@@ -4,50 +4,52 @@ const CHUNK_DEPTH = 32;
 const CHUNK_WORLD_RADIUS = CHUNK_WIDTH * 0.5;
 const DEFAULT_WORLD_SEED = 0xA66DE601n;
 
-self.onmessage = (event) => {
-  const data = event.data;
-  if (!data) {
-    return;
-  }
-
-  const { x, z, kind } = data;
-
-  try {
-    let mesh;
-    if (kind === "build") {
-      mesh = buildChunkMesh(
-        x,
-        z,
-        Array.isArray(data.edits) ? data.edits : [],
-        parseWorldSeed(data.worldSeed),
-      );
-    } else if (kind === "mesh_chunk") {
-      mesh = buildChunkMeshFromVoxels(x, z, new Uint16Array(data.voxels));
-    } else {
+if (typeof self !== "undefined") {
+  self.onmessage = (event) => {
+    const data = event.data;
+    if (!data) {
       return;
     }
 
-    self.postMessage(
-      {
-        kind: "mesh",
+    const { x, z, kind } = data;
+
+    try {
+      let mesh;
+      if (kind === "build") {
+        mesh = buildChunkMesh(
+          x,
+          z,
+          Array.isArray(data.edits) ? data.edits : [],
+          parseWorldSeed(data.worldSeed),
+        );
+      } else if (kind === "mesh_chunk") {
+        mesh = buildChunkMeshFromVoxels(x, z, new Uint16Array(data.voxels));
+      } else {
+        return;
+      }
+
+      self.postMessage(
+        {
+          kind: "mesh",
+          x,
+          z,
+          vertices: mesh.vertices.buffer,
+          indices: mesh.indices.buffer,
+          heights: mesh.heights.buffer,
+          voxels: mesh.voxels.buffer,
+        },
+        [mesh.vertices.buffer, mesh.indices.buffer, mesh.heights.buffer, mesh.voxels.buffer],
+      );
+    } catch (error) {
+      self.postMessage({
+        kind: "error",
         x,
         z,
-        vertices: mesh.vertices.buffer,
-        indices: mesh.indices.buffer,
-        heights: mesh.heights.buffer,
-        voxels: mesh.voxels.buffer,
-      },
-      [mesh.vertices.buffer, mesh.indices.buffer, mesh.heights.buffer, mesh.voxels.buffer],
-    );
-  } catch (error) {
-    self.postMessage({
-      kind: "error",
-      x,
-      z,
-      message: error instanceof Error ? error.message : String(error),
-    });
-  }
-};
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+}
 
 function buildChunkMesh(chunkX, chunkZ, edits, worldSeed) {
   const { voxels, heights } = generateChunk(chunkX, chunkZ, worldSeed);
@@ -103,16 +105,7 @@ function generateChunk(chunkX, chunkZ, worldSeed) {
       heights[z * CHUNK_WIDTH + x] = surface;
 
       for (let y = 0; y <= Math.min(surface, CHUNK_HEIGHT - 1); y++) {
-        let block;
-        if (y === surface) {
-          block = columnBiome === 2 ? 4 : columnBiome === 3 ? 3 : 1;
-        } else if (y > surface - 4) {
-          block = columnBiome === 2 ? 4 : 2;
-        } else {
-          block = 3;
-        }
-
-        voxels[linearIndex(x, y, z)] = block;
+        voxels[linearIndex(x, y, z)] = blockForColumn(worldX, worldZ, y, surface, columnBiome, worldSeed);
       }
 
       if (columnBiome === 1 && hash(worldSeed, worldX, worldZ, 99) % 23n === 0n) {
@@ -122,6 +115,43 @@ function generateChunk(chunkX, chunkZ, worldSeed) {
   }
 
   return { voxels, heights };
+}
+
+function blockForColumn(worldX, worldZ, y, surface, biome, worldSeed) {
+  if (y === surface) {
+    return biome === 2 ? 4 : biome === 3 ? 3 : 1;
+  }
+
+  if (biome === 2) {
+    if (y === surface - 1) {
+      return 4;
+    }
+    if (y >= surface - 5 && y <= surface - 2) {
+      return 15;
+    }
+  } else if (y > surface - 4) {
+    return 2;
+  }
+
+  return decorateStoneBlock(worldX, worldZ, y, worldSeed);
+}
+
+function decorateStoneBlock(worldX, worldZ, y, worldSeed) {
+  if (y < 32 && oreRoll(worldX, worldZ, y, 211, worldSeed) < 1) {
+    return 12;
+  }
+  if (y < 56 && oreRoll(worldX, worldZ, y, 157, worldSeed) < 2) {
+    return 14;
+  }
+  if (y < 72 && oreRoll(worldX, worldZ, y, 101, worldSeed) < 3) {
+    return 13;
+  }
+  return 3;
+}
+
+function oreRoll(worldX, worldZ, y, salt, worldSeed) {
+  const yMix = BigInt.asUintN(64, BigInt((y >>> 0)) * 0x9E3779B1n);
+  return Number(hash(worldSeed, worldX, worldZ, BigInt(salt) ^ yMix) % 100n);
 }
 
 function applyEdits(voxels, heights, edits) {
@@ -389,7 +419,13 @@ function blockBaseColor(block) {
     case 11:
       return [0.60, 0.42, 0.24];
     case 12:
-      return [0.55, 0.55, 0.58];
+      return [0.86, 0.72, 0.24];
+    case 13:
+      return [0.22, 0.22, 0.26];
+    case 14:
+      return [0.66, 0.48, 0.36];
+    case 15:
+      return [0.76, 0.66, 0.46];
     default:
       return [1, 1, 1];
   }
@@ -441,4 +477,16 @@ function wrapU64(value) {
 
 function wrapMulU64(a, b) {
   return wrapU64(wrapU64(a) * wrapU64(b));
+}
+
+if (typeof module !== "undefined") {
+  module.exports = {
+    biomeAt,
+    blockBaseColor,
+    buildChunkMesh,
+    buildChunkMeshFromVoxels,
+    generateChunk,
+    heightAt,
+    parseWorldSeed,
+  };
 }

@@ -4,6 +4,7 @@ use crate::avatar_generation::{
     AvatarGenerationAssetKind, AvatarGenerationAssetResponse, AvatarGenerationClient,
     AvatarGenerationConfig,
 };
+use crate::block_inventory::{BlockInventoryService, PlayerBlockInventory};
 use crate::db;
 use crate::persistence::{ChunkStore, ChunkStoreConfig, PostgresValkeyChunkStore};
 use crate::pet_registry::{
@@ -35,12 +36,12 @@ use shared_math::{CHUNK_HEIGHT, ChunkPos, WorldPos};
 use shared_protocol::{
     BlockActionResult, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
     CapturedPetsSnapshot, ChunkUnload, ClientHello, ClientMessage, CollectedWeapon,
-    CollectedWeaponsSnapshot, InventorySnapshot, InventoryStack, LoginResponse, PROTOCOL_VERSION,
-    PetIdentity, PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
+    CollectedWeaponsSnapshot, InventorySnapshot, LoginResponse, PROTOCOL_VERSION, PetIdentity,
+    PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
     PickupWorldWeaponStatus, PlayerLeft, PlayerStateSnapshot, ServerHello, ServerMessage,
-    ServerWebRtcSignal, StartPetCombatResult, SubscribeChunks, UpdatePetPartyResult,
-    WeaponIdentity, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload, WorldWeaponSnapshot,
-    WorldWeaponUnload, decode, encode,
+    ServerWebRtcSignal, StartPetCombatResult, SubscribeChunks, SwapInventorySlotsRequest,
+    UpdatePetPartyResult, WeaponIdentity, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload,
+    WorldWeaponSnapshot, WorldWeaponUnload, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
 use std::collections::{HashMap, HashSet};
@@ -450,6 +451,7 @@ struct Player {
     pet_states: Vec<PetStateSnapshot>,
     captured_pets: Vec<CapturedPet>,
     collected_weapons: Vec<CollectedWeapon>,
+    block_inventory: PlayerBlockInventory,
     active_pet_models: Vec<PetIdentity>,
     subscribed_chunks: HashSet<ChunkPos>,
 }
@@ -480,6 +482,10 @@ impl Player {
         CollectedWeaponsSnapshot {
             weapons: self.collected_weapons.clone(),
         }
+    }
+
+    fn block_inventory_snapshot(&self) -> InventorySnapshot {
+        self.block_inventory.snapshot()
     }
 }
 
@@ -692,6 +698,7 @@ impl PlayerService {
         user_id: Option<String>,
         pet_collection: Option<PlayerPetCollection>,
         weapon_collection: Option<PlayerWeaponCollection>,
+        block_inventory: PlayerBlockInventory,
         spawn: WorldPos,
         idle_model_url: Option<String>,
         run_model_url: Option<String>,
@@ -728,6 +735,7 @@ impl PlayerService {
             pet_states: Vec::new(),
             captured_pets,
             collected_weapons,
+            block_inventory,
             active_pet_models,
             subscribed_chunks: HashSet::new(),
         };
@@ -845,6 +853,17 @@ impl PlayerService {
         player.collected_weapons = collection.weapons;
         player.active_pet_models =
             active_pet_models_from_captured_pets(&player.captured_pets, &player.collected_weapons);
+        Some(player.clone())
+    }
+
+    async fn set_block_inventory(
+        &self,
+        player_id: u64,
+        inventory: PlayerBlockInventory,
+    ) -> Option<Player> {
+        let mut players = self.players.lock().await;
+        let player = players.get_mut(&player_id)?;
+        player.block_inventory = inventory;
         Some(player.clone())
     }
 
@@ -1949,6 +1968,17 @@ impl WorldService {
         ))
     }
 
+    pub async fn block_at(&self, position: WorldPos) -> Result<Option<BlockId>> {
+        if !(0..CHUNK_HEIGHT).contains(&position.y) {
+            return Ok(None);
+        }
+
+        let (chunk_pos, local) = position
+            .to_chunk_local()
+            .context("convert block read position")?;
+        Ok(Some(self.chunk(chunk_pos).await?.voxel(local).block))
+    }
+
     pub async fn persistence_status(&self) -> Result<crate::persistence::ChunkStoreRuntimeStatus> {
         self.chunk_store.runtime_status().await
     }
@@ -2128,14 +2158,10 @@ impl WorldService {
             y,
             z: i64::from(z),
         };
-        let (chunk_pos, local) = world
-            .to_chunk_local()
-            .context("convert world position for collision")?;
         Ok(!self
-            .chunk(chunk_pos)
+            .block_at(world)
             .await?
-            .voxel(local)
-            .block
+            .unwrap_or(BlockId::Air)
             .is_transparent())
     }
 }
@@ -2294,6 +2320,7 @@ pub struct VoxelServer {
     config: ServerConfig,
     account_service: AccountService,
     avatar_generation: AvatarGenerationClient,
+    block_inventory: BlockInventoryService,
     pet_registry: PetRegistryClient,
     weapon_registry: WeaponRegistryClient,
     websocket_sessions: WebSocketSessionService,
@@ -2347,6 +2374,7 @@ impl VoxelServer {
                 game_auth_ttl: config.game_auth_ttl,
             },
         );
+        let block_inventory = BlockInventoryService::new(pool.clone());
 
         let pet_registry = PetRegistryClient::new(
             pool.clone(),
@@ -2458,6 +2486,7 @@ impl VoxelServer {
             config,
             account_service,
             avatar_generation,
+            block_inventory,
             pet_registry,
             weapon_registry,
             websocket_sessions,
@@ -2705,6 +2734,16 @@ impl VoxelServer {
                 weapon_collection_loaded,
             )
             .await;
+        let block_inventory = match user_id.as_deref() {
+            Some(user_id) => match self.block_inventory.load_or_seed_user_inventory(user_id).await {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    tracing::warn!(?error, %user_id, "failed to load websocket player block inventory");
+                    PlayerBlockInventory::starter()
+                }
+            },
+            None => PlayerBlockInventory::starter(),
+        };
         let spawn_position = self.world_service.safe_spawn_position();
         let player = self
             .player_service
@@ -2713,6 +2752,7 @@ impl VoxelServer {
                 user_id,
                 pet_collection,
                 weapon_collection,
+                block_inventory,
                 spawn_position,
                 login.idle_model_url,
                 login.run_model_url,
@@ -2741,7 +2781,7 @@ impl VoxelServer {
             ),
         }));
         let _ = sender.send(ServerMessage::InventorySnapshot(
-            default_inventory_snapshot(),
+            player.block_inventory_snapshot(),
         ));
         let _ = sender.send(ServerMessage::CapturedPetsSnapshot(
             player.captured_pets_snapshot(),
@@ -3021,6 +3061,221 @@ impl VoxelServer {
         }
     }
 
+    async fn persist_block_inventory_for_player(
+        &self,
+        player: &Player,
+        inventory: &PlayerBlockInventory,
+    ) -> Result<()> {
+        if let Some(user_id) = player.user_id.as_deref() {
+            self.block_inventory
+                .save_user_inventory(user_id, inventory)
+                .await
+                .with_context(|| format!("save block inventory for player {}", player.id))?;
+        }
+
+        Ok(())
+    }
+
+    async fn rollback_block_inventory_change(&self, player_id: u64, previous_player: &Player) {
+        if let Some(user_id) = previous_player.user_id.as_deref() {
+            if let Err(error) = self
+                .block_inventory
+                .save_user_inventory(user_id, &previous_player.block_inventory)
+                .await
+            {
+                tracing::warn!(
+                    ?error,
+                    player_id,
+                    user_id = %user_id,
+                    "failed to roll back persisted block inventory"
+                );
+            }
+        }
+
+        let _ = self
+            .player_service
+            .set_block_inventory(player_id, previous_player.block_inventory.clone())
+            .await;
+    }
+
+    async fn handle_inventory_swap_for_websocket(
+        &self,
+        player_id: u64,
+        sender: &mpsc::UnboundedSender<ServerMessage>,
+        request: SwapInventorySlotsRequest,
+    ) -> Result<()> {
+        let Some(player) = self.player_service.player(player_id).await else {
+            return Ok(());
+        };
+
+        let mut next_inventory = player.block_inventory.clone();
+        if !next_inventory.swap_slots(
+            usize::from(request.from_slot),
+            usize::from(request.to_slot),
+        ) {
+            let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
+                accepted: false,
+                reason: "inventory slot is out of range".to_string(),
+            }));
+            return Ok(());
+        }
+
+        if let Err(error) = self
+            .persist_block_inventory_for_player(&player, &next_inventory)
+            .await
+        {
+            tracing::warn!(?error, player_id, "failed to save swapped block inventory");
+            let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
+                accepted: false,
+                reason: "we could not save that inventory swap".to_string(),
+            }));
+            return Ok(());
+        }
+
+        let Some(updated_player) = self
+            .player_service
+            .set_block_inventory(player_id, next_inventory)
+            .await
+        else {
+            self.rollback_block_inventory_change(player_id, &player).await;
+            return Ok(());
+        };
+
+        let _ = sender.send(ServerMessage::InventorySnapshot(
+            updated_player.block_inventory_snapshot(),
+        ));
+        Ok(())
+    }
+
+    async fn handle_block_request_for_websocket(
+        &self,
+        player_id: u64,
+        sender: &mpsc::UnboundedSender<ServerMessage>,
+        position: WorldPos,
+        place_block: Option<BlockId>,
+    ) -> Result<()> {
+        let Some(player) = self.player_service.player(player_id).await else {
+            return Ok(());
+        };
+
+        if !within_reach(player.position, position) {
+            let reason = if place_block.is_some() {
+                "target outside placement reach"
+            } else {
+                "target outside break reach"
+            };
+            let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
+                accepted: false,
+                reason: reason.to_string(),
+            }));
+            return Ok(());
+        }
+
+        let Some(current_block) = self.world_service.block_at(position).await? else {
+            let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
+                accepted: false,
+                reason: "block is outside vertical bounds".to_string(),
+            }));
+            return Ok(());
+        };
+
+        let mut next_inventory = player.block_inventory.clone();
+        let next_world_block = if let Some(block) = place_block {
+            if !block.is_collectible() {
+                let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: false,
+                    reason: "that block cannot be placed from inventory".to_string(),
+                }));
+                return Ok(());
+            }
+            if !current_block.is_empty() {
+                let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: false,
+                    reason: "target space is already occupied".to_string(),
+                }));
+                return Ok(());
+            }
+            if !next_inventory.remove_block(block) {
+                let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: false,
+                    reason: "that block is out of stock".to_string(),
+                }));
+                return Ok(());
+            }
+            block
+        } else {
+            if current_block.is_empty() {
+                let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: false,
+                    reason: "there is no block to break".to_string(),
+                }));
+                return Ok(());
+            }
+            if !current_block.is_collectible() {
+                let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: false,
+                    reason: "that block cannot be collected".to_string(),
+                }));
+                return Ok(());
+            }
+            if !next_inventory.add_block(current_block) {
+                let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: false,
+                    reason: "inventory is full".to_string(),
+                }));
+                return Ok(());
+            }
+            BlockId::Air
+        };
+
+        if let Err(error) = self
+            .persist_block_inventory_for_player(&player, &next_inventory)
+            .await
+        {
+            tracing::warn!(?error, player_id, "failed to save block inventory update");
+            let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
+                accepted: false,
+                reason: "we could not save that inventory update".to_string(),
+            }));
+            return Ok(());
+        }
+
+        let Some(updated_player) = self
+            .player_service
+            .set_block_inventory(player_id, next_inventory)
+            .await
+        else {
+            self.rollback_block_inventory_change(player_id, &player).await;
+            return Ok(());
+        };
+
+        let edit_result = self.world_service.apply_block_edit(position, next_world_block).await;
+        let (result, chunk) = match edit_result {
+            Ok((result, chunk)) if result.accepted => (result, chunk),
+            Ok((result, _)) => {
+                self.rollback_block_inventory_change(player_id, &player).await;
+                let _ = sender.send(ServerMessage::BlockActionResult(result));
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(?error, player_id, ?position, "failed to apply block edit");
+                self.rollback_block_inventory_change(player_id, &player).await;
+                let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: false,
+                    reason: "we could not update that block".to_string(),
+                }));
+                return Ok(());
+            }
+        };
+
+        let _ = sender.send(ServerMessage::InventorySnapshot(
+            updated_player.block_inventory_snapshot(),
+        ));
+        let _ = sender.send(ServerMessage::BlockActionResult(result));
+        self.broadcast_chunk_update(chunk).await;
+        Ok(())
+    }
+
     async fn handle_websocket_message(
         &self,
         player_id: u64,
@@ -3121,48 +3376,21 @@ impl VoxelServer {
                 .await?;
             }
             ClientMessage::PlaceBlockRequest(request) => {
-                let Some(player) = self.player_service.player(player_id).await else {
-                    return Ok(());
-                };
-
-                if !within_reach(player.position, request.position) {
-                    let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
-                        accepted: false,
-                        reason: "target outside placement reach".to_string(),
-                    }));
-                } else {
-                    let (result, chunk) = self
-                        .world_service
-                        .apply_block_edit(request.position, request.block)
-                        .await?;
-                    let accepted = result.accepted;
-                    let _ = sender.send(ServerMessage::BlockActionResult(result));
-                    if accepted {
-                        self.broadcast_chunk_update(chunk).await;
-                    }
-                }
+                self.handle_block_request_for_websocket(
+                    player_id,
+                    sender,
+                    request.position,
+                    Some(request.block),
+                )
+                .await?;
             }
             ClientMessage::BreakBlockRequest(request) => {
-                let Some(player) = self.player_service.player(player_id).await else {
-                    return Ok(());
-                };
-
-                if !within_reach(player.position, request.position) {
-                    let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
-                        accepted: false,
-                        reason: "target outside break reach".to_string(),
-                    }));
-                } else {
-                    let (result, chunk) = self
-                        .world_service
-                        .apply_block_edit(request.position, BlockId::Air)
-                        .await?;
-                    let accepted = result.accepted;
-                    let _ = sender.send(ServerMessage::BlockActionResult(result));
-                    if accepted {
-                        self.broadcast_chunk_update(chunk).await;
-                    }
-                }
+                self.handle_block_request_for_websocket(player_id, sender, request.position, None)
+                    .await?;
+            }
+            ClientMessage::SwapInventorySlotsRequest(request) => {
+                self.handle_inventory_swap_for_websocket(player_id, sender, request)
+                    .await?;
             }
             ClientMessage::ChatMessage(message) => {
                 let _ = sender.send(ServerMessage::ChatMessage(message));
@@ -5476,29 +5704,6 @@ fn first_present_value<'a>(
     keys.iter().find_map(|key| body.get(*key))
 }
 
-fn default_inventory_snapshot() -> InventorySnapshot {
-    InventorySnapshot {
-        slots: vec![
-            InventoryStack {
-                block: BlockId::Grass,
-                count: 64,
-            },
-            InventoryStack {
-                block: BlockId::Stone,
-                count: 64,
-            },
-            InventoryStack {
-                block: BlockId::GoldOre,
-                count: 32,
-            },
-            InventoryStack {
-                block: BlockId::Planks,
-                count: 32,
-            },
-        ],
-    }
-}
-
 fn player_input_is_stale(client_sent_at_ms: Option<u64>) -> bool {
     let Some(client_sent_at_ms) = client_sent_at_ms else {
         return false;
@@ -5522,6 +5727,7 @@ impl Clone for VoxelServer {
             config: self.config.clone(),
             account_service: self.account_service.clone(),
             avatar_generation: self.avatar_generation.clone(),
+            block_inventory: self.block_inventory.clone(),
             pet_registry: self.pet_registry.clone(),
             weapon_registry: self.weapon_registry.clone(),
             websocket_sessions: self.websocket_sessions.clone(),
@@ -5813,6 +6019,7 @@ mod tests {
             pet_states,
             captured_pets: Vec::new(),
             collected_weapons: Vec::new(),
+            block_inventory: PlayerBlockInventory::starter(),
             active_pet_models,
             subscribed_chunks: HashSet::new(),
         }
@@ -5848,6 +6055,48 @@ mod tests {
         (server, pool, base_database_url, schema_name)
     }
 
+    fn full_inventory(block: BlockId) -> PlayerBlockInventory {
+        PlayerBlockInventory {
+            slots: vec![
+                Some(shared_protocol::InventoryStack { block, count: 64 });
+                shared_protocol::INVENTORY_SLOT_COUNT
+            ],
+        }
+    }
+
+    fn drain_server_messages(
+        receiver: &mut mpsc::UnboundedReceiver<ServerMessage>,
+    ) -> Vec<ServerMessage> {
+        let mut messages = Vec::new();
+        while let Ok(message) = receiver.try_recv() {
+            messages.push(message);
+        }
+        messages
+    }
+
+    async fn first_collectible_block_below(
+        world: &WorldService,
+        origin: WorldPos,
+    ) -> (WorldPos, BlockId) {
+        for y in (0..origin.y).rev() {
+            let position = WorldPos {
+                x: origin.x,
+                y,
+                z: origin.z,
+            };
+            let block = world
+                .block_at(position)
+                .await
+                .expect("read world block")
+                .expect("block within bounds");
+            if block.is_collectible() && !block.is_empty() {
+                return (position, block);
+            }
+        }
+
+        panic!("expected to find a collectible block below the origin");
+    }
+
     async fn insert_landing_pet(pool: &sqlx::PgPool, pet_id: Uuid, label: &str) {
         sqlx::query(
             "INSERT INTO pets (id, display_name, base_prompt, effective_prompt, variation_key, status, model_storage_key)
@@ -5875,6 +6124,15 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert landing weapon");
+    }
+
+    async fn insert_test_user(pool: &sqlx::PgPool, user_id: Uuid) {
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(format!("{user_id}@example.test"))
+            .execute(pool)
+            .await
+            .expect("insert test user");
     }
 
     async fn insert_wild_pet(
@@ -6294,6 +6552,7 @@ mod tests {
                 None,
                 Some(starter_pet_collection),
                 Some(starter_weapon_collection),
+                PlayerBlockInventory::starter(),
                 WorldPos { x: 0, y: 72, z: 0 },
                 None,
                 None,
@@ -6312,6 +6571,513 @@ mod tests {
                 .map(|weapon| weapon.id.as_str()),
             Some("weapon-a")
         );
+    }
+
+    #[tokio::test]
+    async fn breaking_blocks_adds_to_inventory_and_updates_the_world() {
+        let (server, _pool, base_database_url, schema_name) = landing_test_server().await;
+        let spawn = server.world_service.safe_spawn_position();
+        let player = server
+            .player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                None,
+                PlayerBlockInventory::starter(),
+                spawn,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (target, block) = first_collectible_block_below(&server.world_service, spawn).await;
+        let before_count = player
+            .block_inventory
+            .slots
+            .iter()
+            .flatten()
+            .find(|stack| stack.block == block)
+            .map(|stack| stack.count)
+            .unwrap_or(0);
+
+        server
+            .handle_block_request_for_websocket(player.id, &sender, target, None)
+            .await
+            .expect("break block");
+
+        let updated_player = server
+            .player_service
+            .player(player.id)
+            .await
+            .expect("updated player");
+        let after_count = updated_player
+            .block_inventory
+            .slots
+            .iter()
+            .flatten()
+            .find(|stack| stack.block == block)
+            .map(|stack| stack.count)
+            .unwrap_or(0);
+        assert_eq!(after_count, before_count + 1);
+        assert_eq!(
+            server
+                .world_service
+                .block_at(target)
+                .await
+                .expect("read updated block"),
+            Some(BlockId::Air)
+        );
+        assert!(drain_server_messages(&mut receiver).iter().any(|message| {
+            matches!(
+                message,
+                ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: true,
+                    ..
+                })
+            )
+        }));
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
+    }
+
+    #[tokio::test]
+    async fn placing_blocks_consumes_inventory_and_updates_the_world() {
+        let (server, _pool, base_database_url, schema_name) = landing_test_server().await;
+        let spawn = server.world_service.safe_spawn_position();
+        let player = server
+            .player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                None,
+                PlayerBlockInventory::starter(),
+                spawn,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let target = WorldPos {
+            x: spawn.x + 1,
+            y: spawn.y - 1,
+            z: spawn.z,
+        };
+        assert_eq!(
+            server
+                .world_service
+                .block_at(target)
+                .await
+                .expect("read place target"),
+            Some(BlockId::Air)
+        );
+
+        server
+            .handle_block_request_for_websocket(player.id, &sender, target, Some(BlockId::Grass))
+            .await
+            .expect("place block");
+
+        let updated_player = server
+            .player_service
+            .player(player.id)
+            .await
+            .expect("updated player");
+        let grass_count = updated_player
+            .block_inventory
+            .slots
+            .iter()
+            .flatten()
+            .find(|stack| stack.block == BlockId::Grass)
+            .map(|stack| stack.count)
+            .unwrap_or(0);
+        assert_eq!(grass_count, 31);
+        assert_eq!(
+            server
+                .world_service
+                .block_at(target)
+                .await
+                .expect("read placed block"),
+            Some(BlockId::Grass)
+        );
+        assert!(drain_server_messages(&mut receiver).iter().any(|message| {
+            matches!(
+                message,
+                ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: true,
+                    ..
+                })
+            )
+        }));
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
+    }
+
+    #[tokio::test]
+    async fn breaking_air_is_rejected_without_inventory_changes() {
+        let (server, _pool, base_database_url, schema_name) = landing_test_server().await;
+        let spawn = server.world_service.safe_spawn_position();
+        let player = server
+            .player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                None,
+                PlayerBlockInventory::starter(),
+                spawn,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let target = WorldPos {
+            x: spawn.x,
+            y: spawn.y,
+            z: spawn.z,
+        };
+        assert_eq!(
+            server
+                .world_service
+                .block_at(target)
+                .await
+                .expect("read empty target"),
+            Some(BlockId::Air)
+        );
+
+        server
+            .handle_block_request_for_websocket(player.id, &sender, target, None)
+            .await
+            .expect("reject break air");
+
+        let updated_player = server
+            .player_service
+            .player(player.id)
+            .await
+            .expect("updated player");
+        assert_eq!(updated_player.block_inventory, PlayerBlockInventory::starter());
+        assert!(drain_server_messages(&mut receiver).iter().any(|message| {
+            matches!(
+                message,
+                ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: false,
+                    ..
+                })
+            )
+        }));
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
+    }
+
+    #[tokio::test]
+    async fn breaking_blocks_is_rejected_when_inventory_is_full() {
+        let (server, _pool, base_database_url, schema_name) = landing_test_server().await;
+        let spawn = server.world_service.safe_spawn_position();
+        let player = server
+            .player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                None,
+                full_inventory(BlockId::Stone),
+                spawn,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (target, block) = first_collectible_block_below(&server.world_service, spawn).await;
+
+        server
+            .handle_block_request_for_websocket(player.id, &sender, target, None)
+            .await
+            .expect("reject break with full inventory");
+
+        let updated_player = server
+            .player_service
+            .player(player.id)
+            .await
+            .expect("updated player");
+        assert_eq!(updated_player.block_inventory, full_inventory(BlockId::Stone));
+        assert_eq!(
+            server
+                .world_service
+                .block_at(target)
+                .await
+                .expect("read untouched block"),
+            Some(block)
+        );
+        assert!(drain_server_messages(&mut receiver).iter().any(|message| {
+            matches!(
+                message,
+                ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: false,
+                    ..
+                })
+            )
+        }));
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
+    }
+
+    #[tokio::test]
+    async fn placing_blocks_is_rejected_when_out_of_stock() {
+        let (server, _pool, base_database_url, schema_name) = landing_test_server().await;
+        let spawn = server.world_service.safe_spawn_position();
+        let player = server
+            .player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                None,
+                PlayerBlockInventory::starter(),
+                spawn,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let target = WorldPos {
+            x: spawn.x + 1,
+            y: spawn.y - 1,
+            z: spawn.z,
+        };
+
+        assert_eq!(
+            server
+                .world_service
+                .block_at(target)
+                .await
+                .expect("read empty placement target"),
+            Some(BlockId::Air)
+        );
+
+        server
+            .handle_block_request_for_websocket(player.id, &sender, target, Some(BlockId::CoalOre))
+            .await
+            .expect("reject out-of-stock placement");
+
+        let updated_player = server
+            .player_service
+            .player(player.id)
+            .await
+            .expect("updated player");
+        assert_eq!(updated_player.block_inventory, PlayerBlockInventory::starter());
+        assert_eq!(
+            server
+                .world_service
+                .block_at(target)
+                .await
+                .expect("read untouched placement target"),
+            Some(BlockId::Air)
+        );
+        assert!(drain_server_messages(&mut receiver).iter().any(|message| {
+            matches!(
+                message,
+                ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: false,
+                    reason,
+                }) if reason == "that block is out of stock"
+            )
+        }));
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
+    }
+
+    #[tokio::test]
+    async fn placing_blocks_is_rejected_when_target_is_occupied() {
+        let (server, _pool, base_database_url, schema_name) = landing_test_server().await;
+        let spawn = server.world_service.safe_spawn_position();
+        let player = server
+            .player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                None,
+                PlayerBlockInventory::starter(),
+                spawn,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (target, occupied_block) = first_collectible_block_below(&server.world_service, spawn).await;
+
+        server
+            .handle_block_request_for_websocket(player.id, &sender, target, Some(BlockId::Grass))
+            .await
+            .expect("reject occupied placement");
+
+        let updated_player = server
+            .player_service
+            .player(player.id)
+            .await
+            .expect("updated player");
+        assert_eq!(updated_player.block_inventory, PlayerBlockInventory::starter());
+        assert_eq!(
+            server
+                .world_service
+                .block_at(target)
+                .await
+                .expect("read unchanged occupied target"),
+            Some(occupied_block)
+        );
+        assert!(drain_server_messages(&mut receiver).iter().any(|message| {
+            matches!(
+                message,
+                ServerMessage::BlockActionResult(BlockActionResult {
+                    accepted: false,
+                    reason,
+                }) if reason == "target space is already occupied"
+            )
+        }));
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
+    }
+
+    #[tokio::test]
+    async fn inventory_slot_swaps_update_guest_state() {
+        let (server, _pool, base_database_url, schema_name) = landing_test_server().await;
+        let spawn = server.world_service.safe_spawn_position();
+        let player = server
+            .player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                None,
+                PlayerBlockInventory::starter(),
+                spawn,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        server
+            .handle_inventory_swap_for_websocket(
+                player.id,
+                &sender,
+                SwapInventorySlotsRequest {
+                    from_slot: 0,
+                    to_slot: 10,
+                },
+            )
+            .await
+            .expect("swap inventory slots");
+
+        let updated_player = server
+            .player_service
+            .player(player.id)
+            .await
+            .expect("updated player");
+        assert_eq!(updated_player.block_inventory.slots[0], None);
+        assert_eq!(
+            updated_player.block_inventory.slots[10],
+            Some(shared_protocol::InventoryStack {
+                block: BlockId::Grass,
+                count: 32,
+            })
+        );
+        assert!(drain_server_messages(&mut receiver).iter().any(|message| {
+            matches!(message, ServerMessage::InventorySnapshot(_))
+        }));
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
+    }
+
+    #[tokio::test]
+    async fn inventory_slot_swaps_persist_for_authenticated_players() {
+        let (server, pool, base_database_url, schema_name) = landing_test_server().await;
+        let user_id = Uuid::new_v4();
+        insert_test_user(&pool, user_id).await;
+        let spawn = server.world_service.safe_spawn_position();
+        let player = server
+            .player_service
+            .login(
+                "authed".to_string(),
+                Some(user_id.to_string()),
+                None,
+                None,
+                PlayerBlockInventory::starter(),
+                spawn,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        server
+            .handle_inventory_swap_for_websocket(
+                player.id,
+                &sender,
+                SwapInventorySlotsRequest {
+                    from_slot: 0,
+                    to_slot: 10,
+                },
+            )
+            .await
+            .expect("swap authenticated inventory slots");
+
+        let updated_player = server
+            .player_service
+            .player(player.id)
+            .await
+            .expect("updated player");
+        assert_eq!(updated_player.block_inventory.slots[0], None);
+        assert_eq!(
+            updated_player.block_inventory.slots[10],
+            Some(shared_protocol::InventoryStack {
+                block: BlockId::Grass,
+                count: 32,
+            })
+        );
+
+        let reloaded_inventory = server
+            .block_inventory
+            .load_or_seed_user_inventory(&user_id.to_string())
+            .await
+            .expect("reload persisted inventory");
+        assert_eq!(reloaded_inventory.slots[0], None);
+        assert_eq!(
+            reloaded_inventory.slots[10],
+            Some(shared_protocol::InventoryStack {
+                block: BlockId::Grass,
+                count: 32,
+            })
+        );
+        assert!(drain_server_messages(&mut receiver).iter().any(|message| {
+            matches!(message, ServerMessage::InventorySnapshot(_))
+        }));
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
     }
 
     #[tokio::test]
@@ -6730,6 +7496,7 @@ mod tests {
                 None,
                 None,
                 None,
+                PlayerBlockInventory::starter(),
                 WorldPos { x: 0, y: 72, z: 0 },
                 None,
                 None,
@@ -6810,6 +7577,7 @@ mod tests {
                 None,
                 None,
                 None,
+                PlayerBlockInventory::starter(),
                 WorldPos { x: 0, y: 72, z: 0 },
                 None,
                 None,
@@ -6853,6 +7621,7 @@ mod tests {
                 None,
                 None,
                 None,
+                PlayerBlockInventory::starter(),
                 WorldPos { x: 0, y: 72, z: 0 },
                 None,
                 None,
@@ -6894,6 +7663,7 @@ mod tests {
                 None,
                 None,
                 None,
+                PlayerBlockInventory::starter(),
                 WorldPos { x: 0, y: 72, z: 0 },
                 None,
                 None,
@@ -6938,6 +7708,7 @@ mod tests {
                 None,
                 None,
                 None,
+                PlayerBlockInventory::starter(),
                 WorldPos { x: 0, y: 72, z: 0 },
                 None,
                 None,
@@ -6997,6 +7768,7 @@ mod tests {
                 None,
                 None,
                 None,
+                PlayerBlockInventory::starter(),
                 WorldPos { x: 0, y: 72, z: 0 },
                 None,
                 None,
@@ -7081,6 +7853,7 @@ mod tests {
                 None,
                 None,
                 None,
+                PlayerBlockInventory::starter(),
                 WorldPos { x: 0, y: 72, z: 0 },
                 None,
                 None,

@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use tokio::fs;
 
 pub async fn connect(database_url: &str) -> Result<PgPool> {
+    let max_connections = if cfg!(test) { 2 } else { 10 };
     PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(max_connections)
         .connect(database_url)
         .await
         .context("connect to postgres")
@@ -58,6 +59,7 @@ pub async fn connect_isolated_test_pool(base_database_url: &str) -> Result<(PgPo
         .execute(&admin_pool)
         .await
         .with_context(|| format!("create isolated test schema {schema_name}"))?;
+    admin_pool.close().await;
 
     let pool = connect(&isolated_test_schema_database_url(
         base_database_url,
@@ -78,5 +80,6 @@ pub async fn cleanup_isolated_test_schema(
         .execute(&admin_pool)
         .await
         .with_context(|| format!("drop isolated test schema {schema_name}"))?;
+    admin_pool.close().await;
     Ok(())
 }

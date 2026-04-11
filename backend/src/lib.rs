@@ -1,6 +1,7 @@
 pub mod account;
 pub mod auth;
 pub mod avatar_generation;
+pub mod block_inventory;
 pub mod db;
 pub mod generated_asset;
 pub mod net;

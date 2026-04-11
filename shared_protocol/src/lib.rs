@@ -3,7 +3,10 @@ use shared_math::{ChunkPos, WorldPos};
 use shared_world::{BlockId, ChunkData, ChunkDelta};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 16;
+pub const PROTOCOL_VERSION: u16 = 17;
+pub const HOTBAR_SLOT_COUNT: usize = 9;
+pub const INVENTORY_SLOT_COUNT: usize = 27;
+pub const INVENTORY_MAX_STACK_SIZE: u16 = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -264,20 +267,34 @@ pub struct BreakBlockRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapInventorySlotsRequest {
+    pub from_slot: u8,
+    pub to_slot: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockActionResult {
     pub accepted: bool,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryStack {
     pub block: BlockId,
     pub count: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventorySnapshot {
-    pub slots: Vec<InventoryStack>,
+    pub slots: Vec<Option<InventoryStack>>,
+}
+
+impl InventorySnapshot {
+    pub fn empty() -> Self {
+        Self {
+            slots: vec![None; INVENTORY_SLOT_COUNT],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,6 +342,7 @@ pub enum ClientMessage {
     UpdatePetPartyRequest(UpdatePetPartyRequest),
     PlaceBlockRequest(PlaceBlockRequest),
     BreakBlockRequest(BreakBlockRequest),
+    SwapInventorySlotsRequest(SwapInventorySlotsRequest),
     ChatMessage(ChatMessage),
     WebRtcSignal(ClientWebRtcSignal),
 }
@@ -522,6 +540,65 @@ mod tests {
                 assert_eq!(shot.target, [4.0, 5.0, 6.0]);
             }
             _ => panic!("unexpected server message variant"),
+        }
+    }
+
+    #[test]
+    fn inventory_snapshot_round_trip_preserves_empty_slots() {
+        let message = ServerMessage::InventorySnapshot(InventorySnapshot {
+            slots: vec![
+                Some(InventoryStack {
+                    block: BlockId::Grass,
+                    count: 32,
+                }),
+                None,
+                Some(InventoryStack {
+                    block: BlockId::CoalOre,
+                    count: 7,
+                }),
+            ],
+        });
+
+        let bytes = encode(&message).unwrap();
+        let decoded: ServerMessage = decode(&bytes).unwrap();
+
+        match decoded {
+            ServerMessage::InventorySnapshot(snapshot) => {
+                assert_eq!(
+                    snapshot.slots,
+                    vec![
+                        Some(InventoryStack {
+                            block: BlockId::Grass,
+                            count: 32,
+                        }),
+                        None,
+                        Some(InventoryStack {
+                            block: BlockId::CoalOre,
+                            count: 7,
+                        }),
+                    ]
+                );
+            }
+            _ => panic!("unexpected server message variant"),
+        }
+    }
+
+    #[test]
+    fn swap_inventory_slots_request_round_trip() {
+        let message = ClientMessage::SwapInventorySlotsRequest(SwapInventorySlotsRequest {
+            from_slot: 3,
+            to_slot: 11,
+        });
+
+        let bytes = encode(&message).unwrap();
+        let decoded: ClientMessage = decode(&bytes).unwrap();
+
+        match decoded {
+            ClientMessage::SwapInventorySlotsRequest(request) => {
+                assert_eq!(request.from_slot, 3);
+                assert_eq!(request.to_slot, 11);
+            }
+            _ => panic!("unexpected client message variant"),
         }
     }
 }

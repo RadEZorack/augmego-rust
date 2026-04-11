@@ -6,11 +6,12 @@ use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPo
 use shared_protocol::{
     BreakBlockRequest, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
     CapturedPetsSnapshot, ClientHello, ClientMessage, ClientWebRtcSignal, CollectedWeapon,
-    CollectedWeaponsSnapshot, InventorySnapshot, LoginRequest, PROTOCOL_VERSION, PeerRealtimeState,
-    PetIdentity, PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
+    CollectedWeaponsSnapshot, HOTBAR_SLOT_COUNT, INVENTORY_SLOT_COUNT, InventorySnapshot,
+    InventoryStack, LoginRequest, PROTOCOL_VERSION, PeerRealtimeState, PetIdentity,
+    PetStateSnapshot, PetWeaponAssignment, PetWeaponShot, PickupWorldWeaponResult,
     PlaceBlockRequest, PlayerInputTick, PlayerLeft, ServerMessage, ServerWebRtcSignal,
-    SubscribeChunks, UpdatePetPartyRequest, UpdatePetPartyResult, WeaponIdentity,
-    WebRtcSignalPayload, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload,
+    SubscribeChunks, SwapInventorySlotsRequest, UpdatePetPartyRequest, UpdatePetPartyResult,
+    WeaponIdentity, WebRtcSignalPayload, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload,
     WorldWeaponSnapshot, WorldWeaponUnload, decode, encode,
 };
 use shared_world::{BlockId, ChunkData, TerrainGenerator};
@@ -621,6 +622,7 @@ thread_local! {
     static CHUNK_QUALITY_CYCLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
     static PERF_PANEL_TOGGLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
     static HOTBAR_TOGGLE_QUEUE: RefCell<u8> = const { RefCell::new(0) };
+    static HOTBAR_SLOT_CLICK_QUEUE: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     static PET_PARTY_MODAL_OPEN_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static PET_PARTY_MODAL_CLOSE_QUEUE: RefCell<bool> = const { RefCell::new(false) };
     static PET_PARTY_SAVE_QUEUE: RefCell<bool> = const { RefCell::new(false) };
@@ -915,9 +917,10 @@ struct WebApp {
     hotbar_slots: Vec<Element>,
     mouse_lock_prompt: Element,
     webcam_prompt: Element,
-    hotbar_blocks: Vec<BlockId>,
+    inventory_slots: Vec<Option<InventoryStack>>,
     selected_hotbar: usize,
     hotbar_expanded: bool,
+    pending_inventory_swap_slot: Option<usize>,
     player_id: Option<u64>,
     remote_players: HashMap<u64, [f32; 3]>,
     remote_player_latest_ticks: HashMap<u64, u64>,
@@ -1042,17 +1045,9 @@ impl WebApp {
         let mut camera = Camera::default();
         camera.position = Vec3::new(0.5, PLAYER_EYE_HEIGHT + 96.0, 0.5);
         let link_panel = LinkPanel::near_spawn(camera.position);
-        let hotbar_blocks = vec![
-            BlockId::Grass,
-            BlockId::Stone,
-            BlockId::GoldOre,
-            BlockId::Planks,
-            BlockId::Glass,
-            BlockId::Lantern,
-        ];
         let touch_capable = browser_supports_touch_input();
         let (hotbar_root, hotbar_toggle_button, hotbar_slots, hotbar_toggle_onclick) =
-            create_hotbar(&hotbar_blocks);
+            create_hotbar();
         let (mouse_lock_prompt, mouse_lock_prompt_onclick) = create_mouse_lock_prompt(&canvas);
         let (webcam_prompt, webcam_prompt_onclick) = create_webcam_prompt();
         let mobile_hud = create_mobile_hud();
@@ -1085,7 +1080,6 @@ impl WebApp {
             player_avatar_panel_onclick,
         ) = create_player_avatar_panel();
         let (logout_button, logout_button_onclick) = create_logout_button();
-        update_hotbar_ui(&hotbar_slots, &hotbar_blocks, 0);
         let current_chunk = chunk_from_world_position(camera.position);
         let desired_chunks = HashSet::new();
         let pending_generation = VecDeque::new();
@@ -1138,9 +1132,10 @@ impl WebApp {
             hotbar_slots,
             mouse_lock_prompt,
             webcam_prompt,
-            hotbar_blocks,
+            inventory_slots: vec![None; INVENTORY_SLOT_COUNT],
             selected_hotbar: 0,
             hotbar_expanded: false,
+            pending_inventory_swap_slot: None,
             player_id: None,
             remote_players: HashMap::new(),
             remote_player_latest_ticks: HashMap::new(),
@@ -1790,6 +1785,16 @@ impl WebApp {
         }
     }
 
+    fn process_hotbar_slot_click_requests(&mut self) {
+        let clicks = HOTBAR_SLOT_CLICK_QUEUE.with(|queue| {
+            let mut pending = queue.borrow_mut();
+            std::mem::take(&mut *pending)
+        });
+        for index in clicks {
+            self.handle_hotbar_slot_click(index);
+        }
+    }
+
     fn update_perf_panel(&mut self, visible_chunks: usize, loaded_chunks: usize) {
         let now = Instant::now();
         if now.duration_since(self.last_perf_panel_update) < PERF_PANEL_UPDATE_INTERVAL {
@@ -1854,17 +1859,17 @@ impl WebApp {
         let mobile_active = self.is_mobile_active();
         let _ = self.hotbar_root.set_attribute(
             "style",
-            hotbar_root_style(mobile_active, self.hotbar_expanded),
+            hotbar_root_style(mobile_active),
         );
         let _ = self.hotbar_toggle_button.set_text_content(Some(if self.hotbar_expanded {
-            "Hide Blocks"
+            "Hide Inventory"
         } else {
-            "Blocks"
+            "Inventory"
         }));
         let label = if self.hotbar_expanded {
-            "Hide block selector"
+            "Hide inventory"
         } else {
-            "Show block selector"
+            "Show inventory"
         };
         let _ = self.hotbar_toggle_button.set_attribute(
             "style",
@@ -1876,6 +1881,7 @@ impl WebApp {
             "aria-pressed",
             if self.hotbar_expanded { "true" } else { "false" },
         );
+        self.refresh_inventory_ui();
     }
 
     fn sync_pointer_lock_state(&mut self) {
@@ -1931,6 +1937,14 @@ impl WebApp {
                 KeyCode::Digit7 => self.set_selected_hotbar(6),
                 KeyCode::Digit8 => self.set_selected_hotbar(7),
                 KeyCode::Digit9 => self.set_selected_hotbar(8),
+                KeyCode::Tab => {
+                    if let Some(document) = document() {
+                        document.exit_pointer_lock();
+                    }
+                    self.mouse_captured = false;
+                    self.hotbar_expanded = !self.hotbar_expanded;
+                    self.sync_hotbar_visibility();
+                }
                 KeyCode::BracketLeft | KeyCode::Minus => self.step_chunk_quality_preset(-1),
                 KeyCode::BracketRight | KeyCode::Equal => self.step_chunk_quality_preset(1),
                 _ => {}
@@ -1948,21 +1962,62 @@ impl WebApp {
     }
 
     fn set_selected_hotbar(&mut self, index: usize) {
-        if index < self.hotbar_blocks.len() {
+        if index < HOTBAR_SLOT_COUNT {
             self.selected_hotbar = index;
-            update_hotbar_ui(
-                &self.hotbar_slots,
-                &self.hotbar_blocks,
-                self.selected_hotbar,
-            );
+            self.refresh_inventory_ui();
         }
     }
 
-    fn selected_hotbar_block(&self) -> BlockId {
-        self.hotbar_blocks
+    fn selected_hotbar_block(&self) -> Option<BlockId> {
+        self.inventory_slots
             .get(self.selected_hotbar)
-            .copied()
-            .unwrap_or(BlockId::Stone)
+            .and_then(|slot| slot.as_ref())
+            .map(|stack| stack.block)
+    }
+
+    fn handle_hotbar_slot_click(&mut self, index: usize) {
+        if index >= INVENTORY_SLOT_COUNT {
+            return;
+        }
+
+        if index < HOTBAR_SLOT_COUNT {
+            self.set_selected_hotbar(index);
+        }
+
+        if !self.hotbar_expanded {
+            return;
+        }
+
+        match self.pending_inventory_swap_slot {
+            Some(source) if source == index => {
+                self.pending_inventory_swap_slot = None;
+                self.refresh_inventory_ui();
+            }
+            Some(source) => {
+                self.pending_inventory_swap_slot = None;
+                self.refresh_inventory_ui();
+                self.send_client_message(&ClientMessage::SwapInventorySlotsRequest(
+                    SwapInventorySlotsRequest {
+                        from_slot: source as u8,
+                        to_slot: index as u8,
+                    },
+                ));
+            }
+            None => {
+                self.pending_inventory_swap_slot = Some(index);
+                self.refresh_inventory_ui();
+            }
+        }
+    }
+
+    fn refresh_inventory_ui(&self) {
+        update_hotbar_ui(
+            &self.hotbar_slots,
+            &self.inventory_slots,
+            self.selected_hotbar,
+            self.hotbar_expanded,
+            self.pending_inventory_swap_slot,
+        );
     }
 
     fn handle_mouse_motion(&mut self, dx: f32, dy: f32) {
@@ -2045,14 +2100,16 @@ impl WebApp {
             }
             InteractionTarget::Block(hit) => match button {
                 MouseButton::Left => {
-                    self.apply_local_block_edit(hit.block, BlockId::Air);
+                    self.request_block_edit(hit.block, BlockId::Air);
                 }
                 MouseButton::Right => {
                     let Some(place_at) = hit.previous_empty else {
                         return;
                     };
 
-                    let selected_block = self.selected_hotbar_block();
+                    let Some(selected_block) = self.selected_hotbar_block() else {
+                        return;
+                    };
                     if self.player_collides_with_world_pos(
                         self.camera.position,
                         place_at,
@@ -2061,7 +2118,7 @@ impl WebApp {
                         return;
                     }
 
-                    self.apply_local_block_edit(place_at, selected_block);
+                    self.request_block_edit(place_at, selected_block);
                 }
                 _ => {}
             },
@@ -3037,19 +3094,12 @@ impl WebApp {
                             }
                         }
                         ServerMessage::InventorySnapshot(InventorySnapshot { slots }) => {
-                            self.hotbar_blocks = slots.into_iter().map(|slot| slot.block).collect();
-                            if self.hotbar_blocks.is_empty() {
-                                self.hotbar_blocks =
-                                    vec![BlockId::Grass, BlockId::Stone, BlockId::Planks];
+                            self.inventory_slots = normalize_inventory_slots(slots);
+                            if self.selected_hotbar >= HOTBAR_SLOT_COUNT {
+                                self.selected_hotbar = HOTBAR_SLOT_COUNT.saturating_sub(1);
                             }
-                            if self.selected_hotbar >= self.hotbar_blocks.len() {
-                                self.selected_hotbar = self.hotbar_blocks.len().saturating_sub(1);
-                            }
-                            update_hotbar_ui(
-                                &self.hotbar_slots,
-                                &self.hotbar_blocks,
-                                self.selected_hotbar,
-                            );
+                            self.pending_inventory_swap_slot = None;
+                            self.refresh_inventory_ui();
                         }
                         ServerMessage::PlayerStateSnapshot(snapshot) => {
                             if Some(snapshot.player_id) != self.player_id {
@@ -3213,6 +3263,9 @@ impl WebApp {
                     self.last_peer_realtime_broadcast_at = None;
                     self.reset_pet_party_state();
                     self.reset_weapon_collection_state();
+                    self.inventory_slots = vec![None; INVENTORY_SLOT_COUNT];
+                    self.pending_inventory_swap_slot = None;
+                    self.refresh_inventory_ui();
                     web_sys::console::error_1(&JsValue::from_str(&format!(
                         "multiplayer disconnected: {reason}"
                     )));
@@ -3827,6 +3880,7 @@ impl WebApp {
         self.process_chunk_quality_requests();
         self.process_perf_panel_toggle_requests();
         self.process_hotbar_toggle_requests();
+        self.process_hotbar_slot_click_requests();
         self.process_auth_events();
         self.process_pet_party_requests();
         self.drain_network();
@@ -6225,19 +6279,7 @@ impl WebApp {
         None
     }
 
-    fn apply_local_block_edit(&mut self, position: WorldPos, block: BlockId) {
-        let Ok((chunk_pos, local)) = position.to_chunk_local() else {
-            return;
-        };
-
-        if let Some(chunk) = self.authoritative_chunks.get_mut(&chunk_pos) {
-            chunk.set_voxel(local, shared_world::Voxel { block });
-        } else {
-            let edits = self.chunk_edits.entry(chunk_pos).or_default();
-            edits.insert((local.x, local.y, local.z), block);
-        }
-        self.schedule_chunk_rebuild(chunk_pos);
-
+    fn request_block_edit(&mut self, position: WorldPos, block: BlockId) {
         match block {
             BlockId::Air => {
                 self.send_client_message(&ClientMessage::BreakBlockRequest(BreakBlockRequest {
@@ -7034,7 +7076,7 @@ fn css_viewport_size() -> Option<(f32, f32)> {
     Some((width.max(1.0), height.max(1.0)))
 }
 
-fn create_hotbar(blocks: &[BlockId]) -> (Element, Element, Vec<Element>, Closure<dyn FnMut(WebEvent)>) {
+fn create_hotbar() -> (Element, Element, Vec<Element>, Closure<dyn FnMut(WebEvent)>) {
     let Some(document) = document() else {
         let closure =
             Closure::wrap(Box::new(move |_event: WebEvent| {}) as Box<dyn FnMut(WebEvent)>);
@@ -7047,30 +7089,31 @@ fn create_hotbar(blocks: &[BlockId]) -> (Element, Element, Vec<Element>, Closure
     };
 
     let root = document.create_element("div").expect("hotbar root");
-    let _ = root.set_attribute("style", hotbar_root_style(false, false));
+    let _ = root.set_attribute("style", hotbar_root_style(false));
 
     let toggle_button = document
         .create_element("button")
         .expect("hotbar toggle button");
-    toggle_button.set_text_content(Some("Blocks"));
+    toggle_button.set_text_content(Some("Inventory"));
     let _ = toggle_button.set_attribute("type", "button");
     let _ = toggle_button.set_attribute("style", hotbar_toggle_button_style(false, false));
-    let _ = toggle_button.set_attribute("title", "Show block selector");
-    let _ = toggle_button.set_attribute("aria-label", "Show block selector");
+    let _ = toggle_button.set_attribute("title", "Show inventory");
+    let _ = toggle_button.set_attribute("aria-label", "Show inventory");
     let _ = toggle_button.set_attribute("aria-pressed", "false");
 
     let mut slots = Vec::new();
-    for (index, block) in blocks.iter().enumerate() {
+    for index in 0..INVENTORY_SLOT_COUNT {
         let slot = document.create_element("div").expect("hotbar slot");
-        let _ = slot.set_attribute(
-            "style",
-            "width:78px;height:62px;border-radius:14px;padding:8px 10px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;color:#e6edf3;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.08);",
-        );
-        slot.set_inner_html(&format!(
-            "<div style=\"font-size:11px;opacity:0.72;\">{}</div><div style=\"font-size:13px;font-weight:700;\">{}</div>",
-            index + 1,
-            block_label(*block)
-        ));
+        let _ = slot.set_attribute("style", inventory_slot_style(false, false, false, index, true));
+        slot.set_inner_html(&inventory_slot_markup(index, None));
+        let slot_index = index;
+        let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
+            HOTBAR_SLOT_CLICK_QUEUE.with(|queue| {
+                queue.borrow_mut().push(slot_index);
+            });
+        }) as Box<dyn FnMut(WebEvent)>);
+        let _ = slot.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+        onclick.forget();
         let _ = root.append_child(&slot);
         slots.push(slot);
     }
@@ -7872,31 +7915,90 @@ fn create_logout_button() -> (Element, Closure<dyn FnMut(WebEvent)>) {
     (button, onclick)
 }
 
-fn update_hotbar_ui(slots: &[Element], blocks: &[BlockId], selected: usize) {
+fn update_hotbar_ui(
+    slots: &[Element],
+    inventory_slots: &[Option<InventoryStack>],
+    selected: usize,
+    expanded: bool,
+    pending_swap_slot: Option<usize>,
+) {
     for (index, slot) in slots.iter().enumerate() {
-        let active = index == selected;
-        let block = blocks.get(index).copied().unwrap_or(BlockId::Air);
-        let style = if active {
-            "width:78px;height:62px;border-radius:14px;padding:8px 10px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;color:#081018;border:1px solid rgba(255,255,255,0.36);background:linear-gradient(180deg,rgba(255,244,196,0.96),rgba(245,208,105,0.96));box-shadow:0 0 0 2px rgba(255,240,180,0.42);"
-        } else {
-            "width:78px;height:62px;border-radius:14px;padding:8px 10px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;color:#e6edf3;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.08);"
-        };
-        let _ = slot.set_attribute("style", style);
-        slot.set_inner_html(&format!(
-            "<div style=\"font-size:11px;opacity:0.72;\">{}</div><div style=\"font-size:13px;font-weight:700;\">{}</div>",
-            index + 1,
-            block_label(block)
-        ));
+        let active = index == selected && index < HOTBAR_SLOT_COUNT;
+        let pending = pending_swap_slot == Some(index);
+        let hidden = !expanded && index >= HOTBAR_SLOT_COUNT;
+        let stack = inventory_slots.get(index).and_then(|slot| slot.as_ref());
+        let _ = slot.set_attribute(
+            "style",
+            inventory_slot_style(active, pending, hidden, index, stack.is_none()),
+        );
+        slot.set_inner_html(&inventory_slot_markup(index, stack));
     }
 }
 
-fn hotbar_root_style(mobile: bool, expanded: bool) -> &'static str {
-    if !expanded {
-        "display:none;"
-    } else if mobile {
-        "position:fixed;left:50%;bottom:max(150px,calc(env(safe-area-inset-bottom) + 150px));transform:translateX(-50%);display:flex;flex-wrap:wrap;justify-content:center;gap:10px;max-width:min(560px,calc(100vw - 28px));padding:10px 14px;border-radius:18px;background:rgba(18,24,32,0.64);backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,0.28);pointer-events:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;z-index:20;"
+fn inventory_slot_style(
+    active: bool,
+    pending: bool,
+    hidden: bool,
+    index: usize,
+    empty: bool,
+) -> &'static str {
+    if hidden {
+        return "display:none;";
+    }
+    let interactive = index < HOTBAR_SLOT_COUNT || !hidden;
+    match (active, pending, empty, interactive) {
+        (_, _, _, false) => {
+            "width:78px;height:74px;border-radius:14px;padding:8px 10px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;color:#e6edf3;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.08);opacity:0.5;"
+        }
+        (true, _, false, true) => {
+            "width:78px;height:74px;border-radius:14px;padding:8px 10px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;color:#081018;border:1px solid rgba(255,255,255,0.36);background:linear-gradient(180deg,rgba(255,244,196,0.96),rgba(245,208,105,0.96));box-shadow:0 0 0 2px rgba(255,240,180,0.42);cursor:pointer;"
+        }
+        (true, _, true, true) => {
+            "width:78px;height:74px;border-radius:14px;padding:8px 10px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;color:#1a222a;border:1px solid rgba(255,255,255,0.28);background:linear-gradient(180deg,rgba(219,226,235,0.94),rgba(182,194,208,0.9));box-shadow:0 0 0 2px rgba(240,245,255,0.28);cursor:pointer;"
+        }
+        (_, true, _, true) => {
+            "width:78px;height:74px;border-radius:14px;padding:8px 10px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;color:#fef6e4;border:1px solid rgba(255,214,122,0.54);background:rgba(255,196,76,0.16);box-shadow:0 0 0 2px rgba(255,208,102,0.22);cursor:pointer;"
+        }
+        (_, _, true, true) => {
+            "width:78px;height:74px;border-radius:14px;padding:8px 10px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;color:#b7c2cf;border:1px dashed rgba(255,255,255,0.18);background:rgba(255,255,255,0.04);cursor:pointer;"
+        }
+        _ => {
+            "width:78px;height:74px;border-radius:14px;padding:8px 10px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;color:#e6edf3;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.08);cursor:pointer;"
+        }
+    }
+}
+
+fn inventory_slot_markup(index: usize, stack: Option<&InventoryStack>) -> String {
+    let label = if index < HOTBAR_SLOT_COUNT {
+        (index + 1).to_string()
     } else {
-        "position:fixed;left:50%;bottom:86px;transform:translateX(-50%);display:flex;gap:10px;padding:10px 14px;border-radius:18px;background:rgba(18,24,32,0.64);backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,0.28);pointer-events:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;z-index:20;"
+        format!("{}", index + 1)
+    };
+    match stack {
+        Some(stack) => format!(
+            "<div style=\"font-size:11px;opacity:0.72;\">{}</div><div style=\"font-size:13px;font-weight:700;line-height:1.15;\">{}</div><div style=\"font-size:12px;opacity:0.86;\">x{}</div>",
+            label,
+            block_label(stack.block),
+            stack.count
+        ),
+        None => format!(
+            "<div style=\"font-size:11px;opacity:0.56;\">{}</div><div style=\"font-size:13px;font-weight:700;line-height:1.15;\">Empty</div><div style=\"font-size:12px;opacity:0.48;\">-</div>",
+            label
+        ),
+    }
+}
+
+fn normalize_inventory_slots(mut slots: Vec<Option<InventoryStack>>) -> Vec<Option<InventoryStack>> {
+    slots.truncate(INVENTORY_SLOT_COUNT);
+    slots.resize(INVENTORY_SLOT_COUNT, None);
+    slots
+}
+
+fn hotbar_root_style(mobile: bool) -> &'static str {
+    if mobile {
+        "position:fixed;left:50%;bottom:max(150px,calc(env(safe-area-inset-bottom) + 150px));transform:translateX(-50%);display:flex;flex-wrap:wrap;justify-content:center;gap:10px;width:min(780px,calc(100vw - 28px));padding:10px 14px;border-radius:18px;background:rgba(18,24,32,0.64);backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,0.28);pointer-events:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;z-index:20;"
+    } else {
+        "position:fixed;left:50%;bottom:86px;transform:translateX(-50%);display:flex;flex-wrap:wrap;justify-content:center;gap:10px;width:min(860px,calc(100vw - 28px));padding:10px 14px;border-radius:18px;background:rgba(18,24,32,0.64);backdrop-filter:blur(8px);box-shadow:0 12px 34px rgba(0,0,0,0.28);pointer-events:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;z-index:20;"
     }
 }
 
@@ -8238,6 +8340,9 @@ fn block_label(block: BlockId) -> &'static str {
         BlockId::Lantern => "Lantern",
         BlockId::Storage => "Storage",
         BlockId::GoldOre => "Gold Ore",
+        BlockId::CoalOre => "Coal Ore",
+        BlockId::IronOre => "Iron Ore",
+        BlockId::Sandstone => "Sandstone",
         BlockId::Air => "Empty",
     }
 }
@@ -11558,25 +11663,14 @@ fn block_is_solid(block: BlockId) -> bool {
             | BlockId::Lantern
             | BlockId::Storage
             | BlockId::GoldOre
+            | BlockId::CoalOre
+            | BlockId::IronOre
+            | BlockId::Sandstone
     )
 }
 
 fn block_from_id(id: u16) -> BlockId {
-    match id {
-        1 => BlockId::Grass,
-        2 => BlockId::Dirt,
-        3 => BlockId::Stone,
-        4 => BlockId::Sand,
-        5 => BlockId::Water,
-        6 => BlockId::Log,
-        7 => BlockId::Leaves,
-        8 => BlockId::Planks,
-        9 => BlockId::Glass,
-        10 => BlockId::Lantern,
-        11 => BlockId::Storage,
-        12 => BlockId::GoldOre,
-        _ => BlockId::Air,
-    }
+    BlockId::from_raw(id).unwrap_or(BlockId::Air)
 }
 
 fn face_from_empty_neighbor(block: WorldPos, empty: WorldPos) -> Option<Face> {

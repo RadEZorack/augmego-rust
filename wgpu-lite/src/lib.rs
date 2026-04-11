@@ -9,6 +9,11 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 const TILE_SIZE: u32 = 16;
 const ATLAS_TILES: u32 = 12;
+const COAL_ORE_ATLAS_TILE: (u32, u32) = (9, 4);
+const COAL_ORE_TEXTURE_ART: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/textures/coal_ore_16x16.txt"
+));
 pub const MAX_SKIN_JOINTS: usize = 128;
 
 #[repr(C)]
@@ -207,6 +212,7 @@ impl MaterialTarget {
                 );
             }
         }
+        fill_coal_ore_tile(&mut pixels, atlas_size);
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("material-atlas"),
@@ -1293,6 +1299,84 @@ fn fill_tile(pixels: &mut [u8], atlas_size: u32, tile_x: u32, tile_y: u32, base:
     fill_checker_tile(pixels, atlas_size, start_x, start_y, base);
 }
 
+fn fill_coal_ore_tile(pixels: &mut [u8], atlas_size: u32) {
+    let coal_pixels = parse_ascii_tile_rgba(COAL_ORE_TEXTURE_ART, coal_ore_texel)
+        .expect("coal ore texture asset should be a valid 16x16 sprite");
+    blit_tile_rgba(pixels, atlas_size, COAL_ORE_ATLAS_TILE, &coal_pixels);
+}
+
+fn parse_ascii_tile_rgba(
+    art: &str,
+    palette: fn(char) -> Option<[u8; 4]>,
+) -> std::result::Result<Vec<u8>, String> {
+    let rows = art
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if rows.len() != TILE_SIZE as usize {
+        return Err(format!(
+            "expected {} rows, got {}",
+            TILE_SIZE,
+            rows.len()
+        ));
+    }
+
+    let mut pixels = Vec::with_capacity((TILE_SIZE * TILE_SIZE * 4) as usize);
+    for (y, row) in rows.iter().enumerate() {
+        let chars = row.chars().collect::<Vec<_>>();
+        if chars.len() != TILE_SIZE as usize {
+            return Err(format!(
+                "expected row {} to have {} columns, got {}",
+                y,
+                TILE_SIZE,
+                chars.len()
+            ));
+        }
+
+        for (x, ch) in chars.into_iter().enumerate() {
+            let color = palette(ch).ok_or_else(|| {
+                format!("unknown palette key '{ch}' at column {x}, row {y}")
+            })?;
+            pixels.extend_from_slice(&color);
+        }
+    }
+
+    Ok(pixels)
+}
+
+fn blit_tile_rgba(pixels: &mut [u8], atlas_size: u32, tile: (u32, u32), tile_pixels: &[u8]) {
+    let expected_len = (TILE_SIZE * TILE_SIZE * 4) as usize;
+    if tile_pixels.len() != expected_len {
+        return;
+    }
+
+    let start_x = tile.0 * TILE_SIZE;
+    let start_y = tile.1 * TILE_SIZE;
+    for y in 0..TILE_SIZE {
+        for x in 0..TILE_SIZE {
+            let source_offset = ((y * TILE_SIZE + x) * 4) as usize;
+            let px = start_x + x;
+            let py = start_y + y;
+            let dest_offset = ((py * atlas_size + px) * 4) as usize;
+            pixels[dest_offset..dest_offset + 4]
+                .copy_from_slice(&tile_pixels[source_offset..source_offset + 4]);
+        }
+    }
+}
+
+fn coal_ore_texel(ch: char) -> Option<[u8; 4]> {
+    match ch {
+        'a' => Some([149, 153, 161, 255]),
+        'b' => Some([126, 130, 138, 255]),
+        'c' => Some([99, 103, 111, 255]),
+        'd' => Some([20, 21, 26, 255]),
+        'e' => Some([44, 46, 53, 255]),
+        'f' => Some([78, 81, 92, 255]),
+        _ => None,
+    }
+}
+
 fn fill_checker_tile(
     pixels: &mut [u8],
     atlas_size: u32,
@@ -1385,4 +1469,19 @@ fn shade_color(base: [u8; 4], delta: i16) -> [u8; 4] {
         (i16::from(base[2]) + delta).clamp(0, 255) as u8,
         base[3],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coal_ore_texture_asset_parses_to_full_rgba_tile() {
+        let pixels =
+            parse_ascii_tile_rgba(COAL_ORE_TEXTURE_ART, coal_ore_texel).expect("valid coal art");
+
+        assert_eq!(pixels.len(), (TILE_SIZE * TILE_SIZE * 4) as usize);
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel[0] <= 24));
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel[0] >= 140));
+    }
 }

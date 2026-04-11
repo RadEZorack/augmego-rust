@@ -14,6 +14,7 @@ struct VertexInput {
 };
 
 const MAX_SKIN_JOINTS: u32 = 128u;
+const ATLAS_TILE_COUNT: f32 = 12.0;
 
 struct SkinnedVertexInput {
     @location(0) position: vec3<f32>,
@@ -206,11 +207,35 @@ fn procedural_voxel_albedo(
     return palette_color * tint;
 }
 
+fn textured_voxel_albedo(
+    world_position: vec3<f32>,
+    normal: vec3<f32>,
+    uv: vec2<f32>,
+    material_id: f32,
+) -> vec3<f32> {
+    var albedo = textureSample(atlas_texture, atlas_sampler, uv).rgb;
+
+    if material_id >= 12.5 && material_id < 13.5 {
+        let block_origin = floor(world_position - normal * 0.5);
+        let local_uv = fract(uv * ATLAS_TILE_COUNT);
+        let pixel = floor(local_uv * 16.0);
+        let grain_noise = hash13(block_origin * 0.83 + vec3<f32>(pixel, 0.0));
+        let face_noise = hash13(block_origin * 1.41 + vec3<f32>(pixel.yx, dot(normal, vec3<f32>(3.0, 5.0, 7.0))));
+        let tint = clamp(1.0 + (grain_noise - 0.5) * 0.12 + (face_noise - 0.5) * 0.08, 0.88, 1.12);
+        albedo *= tint;
+    }
+
+    return albedo;
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let is_procedural_voxel = input.material_id >= 0.5;
+    let is_textured_voxel = input.material_id >= 12.5 && input.material_id < 13.5;
+    let is_procedural_voxel = input.material_id >= 0.5 && !is_textured_voxel;
     var albedo: vec3<f32>;
-    if is_procedural_voxel {
+    if is_textured_voxel {
+        albedo = textured_voxel_albedo(input.world_position, input.normal, input.uv, input.material_id);
+    } else if is_procedural_voxel {
         albedo = procedural_voxel_albedo(input.world_position, input.normal, input.uv, input.material_id);
     } else {
         albedo = textureSample(atlas_texture, atlas_sampler, input.uv).rgb;

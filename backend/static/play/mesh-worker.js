@@ -3,6 +3,9 @@ const CHUNK_HEIGHT = 256;
 const CHUNK_DEPTH = 32;
 const CHUNK_WORLD_RADIUS = CHUNK_WIDTH * 0.5;
 const DEFAULT_WORLD_SEED = 0xA66DE601n;
+const ATLAS_TILE_COUNT = 12;
+const ATLAS_UV_EPS = 0.001;
+const COAL_ORE_ATLAS_TILE = [9, 4];
 
 if (typeof self !== "undefined") {
   self.onmessage = (event) => {
@@ -258,6 +261,8 @@ function placeTree(voxels, x, y, z) {
 
 function emitBlockFaces(voxels, vertices, indices, world, x, y, z, block) {
   const baseColor = blockBaseColor(block);
+  const shadeColor = block === 13 ? [1, 1, 1] : baseColor;
+  const faceUvs = block === 13 ? coalOreFaceUvs() : proceduralFaceUvs();
   const faces = [
     { offset: [0, 0, -1], face: "north" },
     { offset: [0, 0, 1], face: "south" },
@@ -271,8 +276,8 @@ function emitBlockFaces(voxels, vertices, indices, world, x, y, z, block) {
     const neighbor = sampleVoxel(voxels, x + face.offset[0], y + face.offset[1], z + face.offset[2]);
     if (neighbor === null || isTransparent(neighbor)) {
       const shadow = skylightShadow(voxels, x + face.offset[0], y, z + face.offset[2]);
-      const color = shadedFaceColor(baseColor, face.face, shadow);
-      const faceVerticesData = faceVertices(world, face.face, color, proceduralFaceUvs(), block);
+      const color = shadedFaceColor(shadeColor, face.face, shadow);
+      const faceVerticesData = faceVertices(world, face.face, color, faceUvs, block);
       const base = vertices.length / 12;
       vertices.push(...faceVerticesData.flat());
       indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
@@ -419,6 +424,18 @@ function blockBaseColor(block) {
 
 function proceduralFaceUvs() {
   return [[2, 2], [3, 2], [3, 3], [2, 3]];
+}
+
+function coalOreFaceUvs() {
+  return atlasFaceUvs(COAL_ORE_ATLAS_TILE[0], COAL_ORE_ATLAS_TILE[1]);
+}
+
+function atlasFaceUvs(tileX, tileY) {
+  const minU = tileX / ATLAS_TILE_COUNT + ATLAS_UV_EPS;
+  const maxU = (tileX + 1) / ATLAS_TILE_COUNT - ATLAS_UV_EPS;
+  const minV = tileY / ATLAS_TILE_COUNT + ATLAS_UV_EPS;
+  const maxV = (tileY + 1) / ATLAS_TILE_COUNT - ATLAS_UV_EPS;
+  return [[minU, minV], [maxU, minV], [maxU, maxV], [minU, maxV]];
 }
 
 function darken(color, amount) {

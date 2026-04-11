@@ -27,10 +27,10 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     BinaryType, Blob, CanvasRenderingContext2d, CloseEvent, DeviceOrientationEvent, Document,
     Element, ErrorEvent, Event as WebEvent, FormData, HtmlCanvasElement, HtmlInputElement,
-    HtmlVideoElement, MediaStream, MediaStreamConstraints, MediaStreamTrack, MessageEvent,
-    Request, RequestCredentials, RequestInit, RequestMode, Response, RtcDataChannel,
-    RtcDataChannelEvent, RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent,
-    RtcSdpType, RtcSessionDescriptionInit, RtcTrackEvent, Url, WebSocket, Worker,
+    HtmlVideoElement, MediaStream, MediaStreamConstraints, MediaStreamTrack, MessageEvent, Request,
+    RequestCredentials, RequestInit, RequestMode, Response, RtcDataChannel, RtcDataChannelEvent,
+    RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType,
+    RtcSessionDescriptionInit, RtcTrackEvent, Url, WebSocket, Worker,
 };
 use web_time::Instant;
 use wgpu_lite::{
@@ -1337,7 +1337,9 @@ impl WebApp {
             MobileTiltPermissionState::Active => ("Recenter Tilt", true),
             MobileTiltPermissionState::Denied => ("Tilt Denied", false),
         };
-        self.mobile_hud.tilt_button.set_text_content(Some(tilt_label));
+        self.mobile_hud
+            .tilt_button
+            .set_text_content(Some(tilt_label));
         let _ = self
             .mobile_hud
             .tilt_button
@@ -1354,7 +1356,8 @@ impl WebApp {
     }
 
     fn process_mobile_tilt_events(&mut self) {
-        let permission_update = MOBILE_TILT_PERMISSION_QUEUE.with(|queue| queue.borrow_mut().take());
+        let permission_update =
+            MOBILE_TILT_PERMISSION_QUEUE.with(|queue| queue.borrow_mut().take());
         if let Some(permission) = permission_update {
             self.mobile_controls.tilt_permission = permission;
             match permission {
@@ -1365,14 +1368,13 @@ impl WebApp {
                                 Some(default_mobile_tilt_baseline(sample));
                         }
                     } else if self.mobile_controls.tilt_baseline.is_none() {
-                        self.mobile_controls.tilt_baseline = Some(default_mobile_tilt_baseline(
-                            MobileTiltSample {
+                        self.mobile_controls.tilt_baseline =
+                            Some(default_mobile_tilt_baseline(MobileTiltSample {
                                 alpha_deg: 0.0,
                                 beta_deg: 0.0,
                                 gamma_deg: 0.0,
                                 orientation: current_viewport_orientation(),
-                            },
-                        ));
+                            }));
                     }
                 }
                 MobileTiltPermissionState::Denied
@@ -1857,15 +1859,16 @@ impl WebApp {
 
     fn sync_hotbar_visibility(&self) {
         let mobile_active = self.is_mobile_active();
-        let _ = self.hotbar_root.set_attribute(
-            "style",
-            hotbar_root_style(mobile_active),
-        );
-        let _ = self.hotbar_toggle_button.set_text_content(Some(if self.hotbar_expanded {
-            "Hide Inventory"
-        } else {
-            "Inventory"
-        }));
+        let _ = self
+            .hotbar_root
+            .set_attribute("style", hotbar_root_style(mobile_active));
+        let _ = self
+            .hotbar_toggle_button
+            .set_text_content(Some(if self.hotbar_expanded {
+                "Hide Inventory"
+            } else {
+                "Inventory"
+            }));
         let label = if self.hotbar_expanded {
             "Hide inventory"
         } else {
@@ -1879,7 +1882,11 @@ impl WebApp {
         let _ = self.hotbar_toggle_button.set_attribute("aria-label", label);
         let _ = self.hotbar_toggle_button.set_attribute(
             "aria-pressed",
-            if self.hotbar_expanded { "true" } else { "false" },
+            if self.hotbar_expanded {
+                "true"
+            } else {
+                "false"
+            },
         );
         self.refresh_inventory_ui();
     }
@@ -3851,8 +3858,8 @@ impl WebApp {
         let mut base_yaw = self.camera.yaw - self.mobile_controls.applied_look_offset.x;
         let base_pitch = self.camera.pitch + self.mobile_controls.applied_look_offset.y;
         let base_roll = self.camera.roll - self.mobile_controls.applied_look_offset.z;
-        let yaw_delta = -self.mobile_controls.joystick_vector.x * MOBILE_JOYSTICK_TURN_SPEED
-            * dt_secs.max(0.0);
+        let yaw_delta =
+            -self.mobile_controls.joystick_vector.x * MOBILE_JOYSTICK_TURN_SPEED * dt_secs.max(0.0);
         base_yaw += yaw_delta;
 
         let target_offset = self.current_mobile_tilt_target();
@@ -7104,7 +7111,10 @@ fn create_hotbar() -> (Element, Element, Vec<Element>, Closure<dyn FnMut(WebEven
     let mut slots = Vec::new();
     for index in 0..INVENTORY_SLOT_COUNT {
         let slot = document.create_element("div").expect("hotbar slot");
-        let _ = slot.set_attribute("style", inventory_slot_style(false, false, false, index, true));
+        let _ = slot.set_attribute(
+            "style",
+            inventory_slot_style(false, false, false, index, true),
+        );
         slot.set_inner_html(&inventory_slot_markup(index, None));
         let slot_index = index;
         let onclick = Closure::wrap(Box::new(move |_event: WebEvent| {
@@ -7124,7 +7134,8 @@ fn create_hotbar() -> (Element, Element, Vec<Element>, Closure<dyn FnMut(WebEven
             *pending = pending.saturating_add(1);
         });
     }) as Box<dyn FnMut(WebEvent)>);
-    let _ = toggle_button.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
+    let _ =
+        toggle_button.add_event_listener_with_callback("click", onclick.as_ref().unchecked_ref());
 
     let _ = body.append_child(&root);
     let _ = body.append_child(&toggle_button);
@@ -7988,7 +7999,9 @@ fn inventory_slot_markup(index: usize, stack: Option<&InventoryStack>) -> String
     }
 }
 
-fn normalize_inventory_slots(mut slots: Vec<Option<InventoryStack>>) -> Vec<Option<InventoryStack>> {
+fn normalize_inventory_slots(
+    mut slots: Vec<Option<InventoryStack>>,
+) -> Vec<Option<InventoryStack>> {
     slots.truncate(INVENTORY_SLOT_COUNT);
     slots.resize(INVENTORY_SLOT_COUNT, None);
     slots
@@ -8004,10 +8017,18 @@ fn hotbar_root_style(mobile: bool) -> &'static str {
 
 fn hotbar_toggle_button_style(mobile: bool, expanded: bool) -> &'static str {
     match (mobile, expanded) {
-        (true, true) => "position:fixed;left:50%;bottom:max(92px,calc(env(safe-area-inset-bottom) + 92px));transform:translateX(-50%);min-width:116px;height:46px;padding:0 18px;border-radius:999px;border:1px solid rgba(248,225,153,0.42);background:linear-gradient(180deg,rgba(104,78,26,0.94),rgba(68,50,15,0.94));color:#fff4d8;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:31;backdrop-filter:blur(10px);",
-        (true, false) => "position:fixed;left:50%;bottom:max(92px,calc(env(safe-area-inset-bottom) + 92px));transform:translateX(-50%);min-width:116px;height:46px;padding:0 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:31;backdrop-filter:blur(10px);",
-        (false, true) => "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);min-width:116px;height:46px;padding:0 18px;border-radius:999px;border:1px solid rgba(248,225,153,0.42);background:linear-gradient(180deg,rgba(104,78,26,0.94),rgba(68,50,15,0.94));color:#fff4d8;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:31;backdrop-filter:blur(10px);",
-        (false, false) => "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);min-width:116px;height:46px;padding:0 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:31;backdrop-filter:blur(10px);",
+        (true, true) => {
+            "position:fixed;left:50%;bottom:max(92px,calc(env(safe-area-inset-bottom) + 92px));transform:translateX(-50%);min-width:116px;height:46px;padding:0 18px;border-radius:999px;border:1px solid rgba(248,225,153,0.42);background:linear-gradient(180deg,rgba(104,78,26,0.94),rgba(68,50,15,0.94));color:#fff4d8;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:31;backdrop-filter:blur(10px);"
+        }
+        (true, false) => {
+            "position:fixed;left:50%;bottom:max(92px,calc(env(safe-area-inset-bottom) + 92px));transform:translateX(-50%);min-width:116px;height:46px;padding:0 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:31;backdrop-filter:blur(10px);"
+        }
+        (false, true) => {
+            "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);min-width:116px;height:46px;padding:0 18px;border-radius:999px;border:1px solid rgba(248,225,153,0.42);background:linear-gradient(180deg,rgba(104,78,26,0.94),rgba(68,50,15,0.94));color:#fff4d8;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:31;backdrop-filter:blur(10px);"
+        }
+        (false, false) => {
+            "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);min-width:116px;height:46px;padding:0 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;font:700 13px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.08em;box-shadow:0 12px 28px rgba(0,0,0,0.35);cursor:pointer;z-index:31;backdrop-filter:blur(10px);"
+        }
     }
 }
 
@@ -8050,10 +8071,18 @@ fn mobile_hud_joystick_thumb_style(offset: Vec2) -> String {
 
 fn mobile_hud_action_button_style(active: bool, upper_button: bool) -> &'static str {
     match (active, upper_button) {
-        (true, true) => "position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(118px,calc(env(safe-area-inset-bottom) + 118px));width:84px;height:84px;border-radius:999px;border:1px solid rgba(247,215,148,0.50);background:linear-gradient(180deg,rgba(122,78,24,0.96),rgba(82,48,13,0.96));color:#fff4d8;display:flex;align-items:center;justify-content:center;font:800 28px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);",
-        (false, true) => "position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(118px,calc(env(safe-area-inset-bottom) + 118px));width:84px;height:84px;border-radius:999px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;display:flex;align-items:center;justify-content:center;font:800 28px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);",
-        (true, false) => "position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(18px,calc(env(safe-area-inset-bottom) + 18px));width:84px;height:84px;border-radius:999px;border:1px solid rgba(183,230,255,0.50);background:linear-gradient(180deg,rgba(26,82,112,0.96),rgba(13,54,78,0.96));color:#effaff;display:flex;align-items:center;justify-content:center;font:800 28px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);",
-        (false, false) => "position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(18px,calc(env(safe-area-inset-bottom) + 18px));width:84px;height:84px;border-radius:999px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;display:flex;align-items:center;justify-content:center;font:800 28px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);",
+        (true, true) => {
+            "position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(118px,calc(env(safe-area-inset-bottom) + 118px));width:84px;height:84px;border-radius:999px;border:1px solid rgba(247,215,148,0.50);background:linear-gradient(180deg,rgba(122,78,24,0.96),rgba(82,48,13,0.96));color:#fff4d8;display:flex;align-items:center;justify-content:center;font:800 28px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);"
+        }
+        (false, true) => {
+            "position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(118px,calc(env(safe-area-inset-bottom) + 118px));width:84px;height:84px;border-radius:999px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;display:flex;align-items:center;justify-content:center;font:800 28px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);"
+        }
+        (true, false) => {
+            "position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(18px,calc(env(safe-area-inset-bottom) + 18px));width:84px;height:84px;border-radius:999px;border:1px solid rgba(183,230,255,0.50);background:linear-gradient(180deg,rgba(26,82,112,0.96),rgba(13,54,78,0.96));color:#effaff;display:flex;align-items:center;justify-content:center;font:800 28px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);"
+        }
+        (false, false) => {
+            "position:fixed;right:max(18px,calc(env(safe-area-inset-right) + 18px));bottom:max(18px,calc(env(safe-area-inset-bottom) + 18px));width:84px;height:84px;border-radius:999px;border:1px solid rgba(255,255,255,0.20);background:rgba(18,24,32,0.88);color:#f6f8fb;display:flex;align-items:center;justify-content:center;font:800 28px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:0.06em;box-shadow:0 18px 44px rgba(0,0,0,0.32);backdrop-filter:blur(10px);"
+        }
     }
 }
 
@@ -8153,10 +8182,7 @@ fn mobile_pinch_target_zoom(
     (anchor_zoom + zoom_steps * THIRD_PERSON_SCROLL_STEP).clamp(0.0, THIRD_PERSON_MAX_ZOOM)
 }
 
-fn mobile_tilt_offset_from_samples(
-    sample: MobileTiltSample,
-    baseline: MobileTiltSample,
-) -> Vec3 {
+fn mobile_tilt_offset_from_samples(sample: MobileTiltSample, baseline: MobileTiltSample) -> Vec3 {
     let relative = mobile_tilt_quaternion(baseline).inverse() * mobile_tilt_quaternion(sample);
     let forward = relative * Vec3::Z;
     let up = relative * Vec3::Y;
@@ -8211,7 +8237,11 @@ fn camera_basis_from_forward_and_roll(forward: Vec3, roll: f32) -> (Vec3, Vec3) 
     if forward == Vec3::ZERO {
         return (Vec3::X, Vec3::Y);
     }
-    let reference_up = if forward.y.abs() > 0.999 { Vec3::Z } else { Vec3::Y };
+    let reference_up = if forward.y.abs() > 0.999 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
     let right = reference_up.cross(forward).normalize_or_zero();
     let up = forward.cross(right).normalize_or_zero();
     if roll.abs() <= f32::EPSILON {
@@ -8257,15 +8287,20 @@ fn browser_supports_touch_input() -> bool {
 }
 
 fn device_orientation_supported() -> bool {
-    js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("DeviceOrientationEvent"))
-        .ok()
-        .is_some_and(|value| !value.is_null() && !value.is_undefined())
+    js_sys::Reflect::get(
+        &js_sys::global(),
+        &JsValue::from_str("DeviceOrientationEvent"),
+    )
+    .ok()
+    .is_some_and(|value| !value.is_null() && !value.is_undefined())
 }
 
 async fn request_device_orientation_permission() -> Result<Option<bool>> {
-    let device_orientation =
-        js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("DeviceOrientationEvent"))
-            .map_err(|error| anyhow::anyhow!("resolve DeviceOrientationEvent: {error:?}"))?;
+    let device_orientation = js_sys::Reflect::get(
+        &js_sys::global(),
+        &JsValue::from_str("DeviceOrientationEvent"),
+    )
+    .map_err(|error| anyhow::anyhow!("resolve DeviceOrientationEvent: {error:?}"))?;
     if device_orientation.is_null() || device_orientation.is_undefined() {
         return Ok(Some(false));
     }
@@ -8947,10 +8982,7 @@ fn render_avatar_generation_modal(
     if active_task || has_selected_selfie {
         let _ = video.set_attribute("style", "display:none;");
     } else {
-        let _ = video.set_attribute(
-            "style",
-            &avatar_generation_square_media_style("block"),
-        );
+        let _ = video.set_attribute("style", &avatar_generation_square_media_style("block"));
     }
 
     set_button_disabled(capture_button, active_task || video.src_object().is_none());
@@ -9737,9 +9769,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
         let retake_button = retake_button_for_retake.clone();
         let submit_button = submit_button_for_retake.clone();
         spawn_local(async move {
-            if let Err(error) =
-                start_avatar_generation_camera(camera_video, status.clone()).await
-            {
+            if let Err(error) = start_avatar_generation_camera(camera_video, status.clone()).await {
                 status.set_text_content(Some(&format!(
                     "Camera unavailable. Upload a selfie file instead. {error}"
                 )));

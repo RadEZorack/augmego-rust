@@ -1587,11 +1587,7 @@ fn parse_ascii_tile_rgba(
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
     if rows.len() != TILE_SIZE as usize {
-        return Err(format!(
-            "expected {} rows, got {}",
-            TILE_SIZE,
-            rows.len()
-        ));
+        return Err(format!("expected {} rows, got {}", TILE_SIZE, rows.len()));
     }
 
     let mut pixels = Vec::with_capacity((TILE_SIZE * TILE_SIZE * 4) as usize);
@@ -1610,9 +1606,7 @@ fn parse_ascii_tile_rgba(
             let color = palette
                 .iter()
                 .find_map(|(key, color)| (*key == ch).then_some(*color))
-                .ok_or_else(|| {
-                format!("unknown palette key '{ch}' at column {x}, row {y}")
-                })?;
+                .ok_or_else(|| format!("unknown palette key '{ch}' at column {x}, row {y}"))?;
             pixels.extend_from_slice(&color);
         }
     }
@@ -1757,7 +1751,9 @@ mod tests {
                 definition.name
             );
             assert!(
-                pixels.chunks_exact(4).any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
+                pixels
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
                 "{} texture should include some color variation",
                 definition.name
             );

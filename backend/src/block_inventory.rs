@@ -139,7 +139,8 @@ impl BlockInventoryService {
         }
 
         let inventory = PlayerBlockInventory::starter();
-        self.save_user_inventory_by_uuid(user_id, &inventory).await?;
+        self.save_user_inventory_by_uuid(user_id, &inventory)
+            .await?;
         Ok(inventory)
     }
 
@@ -152,7 +153,10 @@ impl BlockInventoryService {
             .await
     }
 
-    async fn load_existing_user_inventory(&self, user_id: Uuid) -> Result<Option<PlayerBlockInventory>> {
+    async fn load_existing_user_inventory(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<PlayerBlockInventory>> {
         let rows = sqlx::query(
             "SELECT slot_index, block_id, stack_count
              FROM player_block_inventory_slots

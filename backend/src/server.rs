@@ -47,7 +47,7 @@ use shared_world::{BiomeId, BlockId, ChunkData, TerrainGenerator, Voxel};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -69,6 +69,8 @@ const WILD_PET_MIN_SPAWN_DISTANCE: f32 = 18.0;
 const WILD_PET_SPAWN_RADIUS: f32 = 56.0;
 const WILD_PET_MAX_HEALTH: u8 = 30;
 const WILD_PET_BOTTOM_DESPAWN_Y: f32 = 1.0;
+const WILD_PET_FAR_DESPAWN_DISTANCE: f32 = 100.0;
+const WILD_PET_FAR_DESPAWN_GRACE: Duration = Duration::from_secs(10);
 const WILD_WEAPON_PICKUP_DISTANCE: f32 = 3.8;
 const WILD_WEAPON_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 const WILD_WEAPON_TARGET_PER_PLAYER: usize = 6;
@@ -977,6 +979,7 @@ struct WildPet {
     health: u8,
     captured: bool,
     visible_viewers: HashSet<u64>,
+    far_from_players_started_at: Option<Instant>,
 }
 
 impl WildPet {
@@ -1035,7 +1038,7 @@ struct CompletedWildPetCapture {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BottomedOutWildPet {
+struct ReleasedWildPet {
     world_pet_id: u64,
     pet_identity_id: String,
 }
@@ -1181,10 +1184,10 @@ impl WildPetService {
             .retain(|_, target_pet_id| !pet_ids.contains(target_pet_id));
     }
 
-    async fn release_bottomed_out_pets(
+    async fn release_despawned_pets(
         &self,
         pet_registry: &PetRegistryClient,
-        pets: &[BottomedOutWildPet],
+        pets: &[ReleasedWildPet],
     ) {
         for pet in pets {
             if let Err(error) = pet_registry.release_spawned_pet(&pet.pet_identity_id).await {
@@ -1223,6 +1226,13 @@ impl WildPetService {
 
         let (despawn_dispatches, bottomed_out_pets) =
             drain_bottomed_out_wild_pets(&mut pets, connected_player_ids);
+        dispatches.extend(despawn_dispatches);
+        let (despawn_dispatches, far_despawned_pets) = drain_far_from_players_wild_pets(
+            &mut pets,
+            &active_players,
+            connected_player_ids,
+            Instant::now(),
+        );
         dispatches.extend(despawn_dispatches);
 
         let mut uncaptured_count = pets.values().filter(|pet| !pet.captured).count();
@@ -1267,13 +1277,17 @@ impl WildPetService {
         }
 
         drop(pets);
-        let bottomed_out_pet_ids = bottomed_out_pets
+        let despawned_pets = bottomed_out_pets
+            .into_iter()
+            .chain(far_despawned_pets)
+            .collect::<Vec<_>>();
+        let despawned_pet_ids = despawned_pets
             .iter()
             .map(|pet| pet.world_pet_id)
             .collect::<Vec<_>>();
-        self.clear_pet_combat_targets_for_pet_ids(&bottomed_out_pet_ids)
+        self.clear_pet_combat_targets_for_pet_ids(&despawned_pet_ids)
             .await;
-        self.release_bottomed_out_pets(pet_registry, &bottomed_out_pets)
+        self.release_despawned_pets(pet_registry, &despawned_pets)
             .await;
 
         Ok(dispatches)
@@ -1331,7 +1345,7 @@ impl WildPetService {
             .collect::<Vec<_>>();
         self.clear_pet_combat_targets_for_pet_ids(&bottomed_out_pet_ids)
             .await;
-        self.release_bottomed_out_pets(pet_registry, &bottomed_out_pets)
+        self.release_despawned_pets(pet_registry, &bottomed_out_pets)
             .await;
 
         dispatches
@@ -1566,6 +1580,7 @@ impl WildPetService {
                 health: WILD_PET_MAX_HEALTH,
                 captured: false,
                 visible_viewers: HashSet::new(),
+                far_from_players_started_at: None,
             };
             pets.insert(new_id, pet);
             return Ok(Some(new_id));
@@ -6142,9 +6157,9 @@ fn reconcile_pet_visibility(
 fn drain_bottomed_out_wild_pets(
     pets: &mut HashMap<u64, WildPet>,
     connected_player_ids: &HashSet<u64>,
-) -> (Vec<WildPetDispatch>, Vec<BottomedOutWildPet>) {
+) -> (Vec<WildPetDispatch>, Vec<ReleasedWildPet>) {
     let mut dispatches = Vec::new();
-    let mut bottomed_out_pets = Vec::new();
+    let mut released_pets = Vec::new();
 
     pets.retain(|_, pet| {
         if pet.captured || pet.position[1] > WILD_PET_BOTTOM_DESPAWN_Y {
@@ -6158,13 +6173,7 @@ fn drain_bottomed_out_wild_pets(
             "despawning wild pet after it fell to the bottom of the map"
         );
 
-        let mut viewer_ids = pet
-            .visible_viewers
-            .iter()
-            .copied()
-            .filter(|player_id| connected_player_ids.contains(player_id))
-            .collect::<Vec<_>>();
-        viewer_ids.sort_unstable();
+        let viewer_ids = connected_wild_pet_viewers(pet, connected_player_ids);
         if !viewer_ids.is_empty() {
             dispatches.push(WildPetDispatch::Unload {
                 player_ids: viewer_ids,
@@ -6172,14 +6181,85 @@ fn drain_bottomed_out_wild_pets(
             });
         }
 
-        bottomed_out_pets.push(BottomedOutWildPet {
+        released_pets.push(ReleasedWildPet {
             world_pet_id: pet.id,
             pet_identity_id: pet.pet_identity.id.clone(),
         });
         false
     });
 
-    (dispatches, bottomed_out_pets)
+    (dispatches, released_pets)
+}
+
+fn drain_far_from_players_wild_pets(
+    pets: &mut HashMap<u64, WildPet>,
+    active_players: &[Player],
+    connected_player_ids: &HashSet<u64>,
+    now: Instant,
+) -> (Vec<WildPetDispatch>, Vec<ReleasedWildPet>) {
+    let mut dispatches = Vec::new();
+    let mut released_pets = Vec::new();
+
+    pets.retain(|_, pet| {
+        if pet.captured {
+            pet.far_from_players_started_at = None;
+            return true;
+        }
+        if !wild_pet_is_far_from_players(pet, active_players) {
+            pet.far_from_players_started_at = None;
+            return true;
+        }
+
+        let Some(far_started_at) = pet.far_from_players_started_at.clone() else {
+            pet.far_from_players_started_at = Some(now.clone());
+            return true;
+        };
+        if now.duration_since(far_started_at) < WILD_PET_FAR_DESPAWN_GRACE {
+            return true;
+        }
+
+        tracing::info!(
+            pet_id = pet.id,
+            registry_pet_id = %pet.pet_identity.id,
+            distance = WILD_PET_FAR_DESPAWN_DISTANCE,
+            grace_secs = WILD_PET_FAR_DESPAWN_GRACE.as_secs_f32(),
+            "despawning wild pet after it stayed far from active players"
+        );
+
+        let viewer_ids = connected_wild_pet_viewers(pet, connected_player_ids);
+        if !viewer_ids.is_empty() {
+            dispatches.push(WildPetDispatch::Unload {
+                player_ids: viewer_ids,
+                pet_ids: vec![pet.id],
+            });
+        }
+
+        released_pets.push(ReleasedWildPet {
+            world_pet_id: pet.id,
+            pet_identity_id: pet.pet_identity.id.clone(),
+        });
+        false
+    });
+
+    (dispatches, released_pets)
+}
+
+fn connected_wild_pet_viewers(pet: &WildPet, connected_player_ids: &HashSet<u64>) -> Vec<u64> {
+    let mut viewer_ids = pet
+        .visible_viewers
+        .iter()
+        .copied()
+        .filter(|player_id| connected_player_ids.contains(player_id))
+        .collect::<Vec<_>>();
+    viewer_ids.sort_unstable();
+    viewer_ids
+}
+
+fn wild_pet_is_far_from_players(pet: &WildPet, active_players: &[Player]) -> bool {
+    let max_distance_squared = WILD_PET_FAR_DESPAWN_DISTANCE * WILD_PET_FAR_DESPAWN_DISTANCE;
+    active_players
+        .iter()
+        .all(|player| pet_distance_squared(player.position, pet.position) > max_distance_squared)
 }
 
 fn reconcile_weapon_visibility(
@@ -6420,6 +6500,7 @@ mod tests {
     use crate::persistence::InMemoryChunkStore;
     use serde_json::json;
     use shared_math::LocalVoxelPos;
+    use sqlx::Row;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -6597,6 +6678,7 @@ mod tests {
                 health,
                 captured: false,
                 visible_viewers: viewers.iter().copied().collect(),
+                far_from_players_started_at: None,
             },
         );
     }
@@ -6623,6 +6705,7 @@ mod tests {
                     health: WILD_PET_MAX_HEALTH,
                     captured: false,
                     visible_viewers: HashSet::from([7, 8]),
+                    far_from_players_started_at: None,
                 },
             ),
             (
@@ -6644,6 +6727,7 @@ mod tests {
                     health: WILD_PET_MAX_HEALTH,
                     captured: false,
                     visible_viewers: HashSet::from([7]),
+                    far_from_players_started_at: None,
                 },
             ),
             (
@@ -6665,6 +6749,7 @@ mod tests {
                     health: 0,
                     captured: true,
                     visible_viewers: HashSet::new(),
+                    far_from_players_started_at: None,
                 },
             ),
         ]);
@@ -6674,7 +6759,7 @@ mod tests {
 
         assert_eq!(
             bottomed_out_pets,
-            vec![BottomedOutWildPet {
+            vec![ReleasedWildPet {
                 world_pet_id: 1,
                 pet_identity_id: "00000000-0000-0000-0000-000000000001".to_string(),
             }]
@@ -6693,6 +6778,216 @@ mod tests {
             }
             WildPetDispatch::Snapshot { .. } => panic!("expected unload dispatch"),
         }
+    }
+
+    #[test]
+    fn drain_far_from_players_wild_pets_waits_for_grace_period_before_unloading() {
+        let mut pets = HashMap::from([(
+            1,
+            WildPet {
+                id: 1,
+                pet_identity: PetIdentity {
+                    id: "00000000-0000-0000-0000-000000000010".to_string(),
+                    display_name: "Far Away".to_string(),
+                    model_url: None,
+                    equipped_weapon: None,
+                },
+                tick: 0,
+                spawn_position: [250.0, 88.0, 0.5],
+                position: [250.0, 88.0, 0.5],
+                velocity: [0.0; 3],
+                yaw: 0.0,
+                host_player_id: Some(8),
+                health: WILD_PET_MAX_HEALTH,
+                captured: false,
+                visible_viewers: HashSet::from([7, 8]),
+                far_from_players_started_at: None,
+            },
+        )]);
+        let active_players = vec![Player {
+            position: [0.5, 88.0, 0.5],
+            ..test_player(8, Vec::new(), Vec::new())
+        }];
+        let connected_player_ids = HashSet::from([8, 9]);
+        let now = Instant::now();
+
+        let (initial_dispatches, initial_released) = drain_far_from_players_wild_pets(
+            &mut pets,
+            &active_players,
+            &connected_player_ids,
+            now,
+        );
+
+        assert!(initial_dispatches.is_empty());
+        assert!(initial_released.is_empty());
+        assert!(pets.contains_key(&1));
+        assert!(pets[&1].far_from_players_started_at.is_some());
+
+        let after_grace = now
+            .checked_add(WILD_PET_FAR_DESPAWN_GRACE + Duration::from_secs(1))
+            .expect("future instant");
+        let (dispatches, released_pets) = drain_far_from_players_wild_pets(
+            &mut pets,
+            &active_players,
+            &connected_player_ids,
+            after_grace,
+        );
+
+        assert!(pets.is_empty());
+        assert_eq!(
+            released_pets,
+            vec![ReleasedWildPet {
+                world_pet_id: 1,
+                pet_identity_id: "00000000-0000-0000-0000-000000000010".to_string(),
+            }]
+        );
+        assert_eq!(dispatches.len(), 1);
+        match &dispatches[0] {
+            WildPetDispatch::Unload {
+                player_ids,
+                pet_ids,
+            } => {
+                assert_eq!(player_ids, &vec![8]);
+                assert_eq!(pet_ids, &vec![1]);
+            }
+            WildPetDispatch::Snapshot { .. } => panic!("expected unload dispatch"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wild_pet_service_replaces_far_stale_pets_near_active_players() {
+        let (server, pool, base_database_url, schema_name) = landing_test_server().await;
+        let stale_registry_pet_id = Uuid::new_v4();
+        let replacement_registry_pet_id = Uuid::new_v4();
+        insert_landing_pet(&pool, stale_registry_pet_id, "Stale Pet").await;
+        insert_landing_pet(&pool, replacement_registry_pet_id, "Replacement Pet").await;
+        sqlx::query("UPDATE pets SET status = 'SPAWNED', spawned_at = NOW() WHERE id = $1")
+            .bind(stale_registry_pet_id)
+            .execute(&pool)
+            .await
+            .expect("mark stale pet as spawned");
+
+        let spawn = server.world_service.safe_spawn_position();
+        let player = server
+            .player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                None,
+                PlayerBlockInventory::starter(),
+                spawn,
+                None,
+                None,
+                None,
+            )
+            .await;
+        server
+            .player_service
+            .swap_subscriptions(
+                player.id,
+                desired_chunk_set(ChunkPos::from_world(spawn), 12),
+            )
+            .await;
+        let player = server
+            .player_service
+            .player(player.id)
+            .await
+            .expect("player with subscriptions");
+
+        let wild_pet_service = WildPetService::new();
+        let far_started_at = Instant::now()
+            .checked_sub(WILD_PET_FAR_DESPAWN_GRACE + Duration::from_secs(1))
+            .expect("past instant");
+        wild_pet_service.pets.lock().await.insert(
+            1,
+            WildPet {
+                id: 1,
+                pet_identity: PetIdentity {
+                    id: stale_registry_pet_id.to_string(),
+                    display_name: "Stale Pet".to_string(),
+                    model_url: None,
+                    equipped_weapon: None,
+                },
+                tick: 0,
+                spawn_position: [
+                    player.position[0] + 250.0,
+                    player.position[1],
+                    player.position[2],
+                ],
+                position: [
+                    player.position[0] + 250.0,
+                    player.position[1],
+                    player.position[2],
+                ],
+                velocity: [0.0; 3],
+                yaw: 0.0,
+                host_player_id: None,
+                health: WILD_PET_MAX_HEALTH,
+                captured: false,
+                visible_viewers: HashSet::from([player.id]),
+                far_from_players_started_at: Some(far_started_at),
+            },
+        );
+
+        let dispatches = wild_pet_service
+            .maintain(
+                &server.world_service,
+                &server.pet_registry,
+                &[player.clone()],
+                &HashSet::from([player.id]),
+            )
+            .await
+            .expect("maintain wild pets");
+
+        let pets = wild_pet_service.pets.lock().await;
+        assert_eq!(pets.len(), 1);
+        let respawned_pet = pets.values().next().expect("respawned pet");
+        assert_eq!(
+            respawned_pet.pet_identity.id,
+            replacement_registry_pet_id.to_string()
+        );
+        assert!(
+            pet_distance_squared(respawned_pet.position, player.position)
+                < WILD_PET_FAR_DESPAWN_DISTANCE * WILD_PET_FAR_DESPAWN_DISTANCE
+        );
+        drop(pets);
+
+        assert!(dispatches.iter().any(|dispatch| {
+            matches!(
+                dispatch,
+                WildPetDispatch::Unload { pet_ids, .. } if pet_ids == &vec![1]
+            )
+        }));
+        assert!(dispatches.iter().any(|dispatch| {
+            matches!(
+                dispatch,
+                WildPetDispatch::Snapshot { snapshot, player_ids }
+                    if snapshot.pet_identity.id == replacement_registry_pet_id.to_string()
+                        && player_ids.contains(&player.id)
+            )
+        }));
+
+        let stale_status: String = sqlx::query("SELECT status FROM pets WHERE id = $1")
+            .bind(stale_registry_pet_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load stale pet status")
+            .try_get("status")
+            .expect("status column");
+        let replacement_status: String = sqlx::query("SELECT status FROM pets WHERE id = $1")
+            .bind(replacement_registry_pet_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load replacement pet status")
+            .try_get("status")
+            .expect("status column");
+        assert_eq!(stale_status, "READY");
+        assert_eq!(replacement_status, "SPAWNED");
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
     }
 
     #[test]

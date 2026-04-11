@@ -1873,7 +1873,12 @@ impl SurfaceOreService {
         }
     }
 
-    async fn maintain(&self, world_service: &WorldService, players: &[Player], connected_player_ids: &HashSet<u64>) -> Result<Vec<ChunkData>> {
+    async fn maintain(
+        &self,
+        world_service: &WorldService,
+        players: &[Player],
+        connected_player_ids: &HashSet<u64>,
+    ) -> Result<Vec<ChunkData>> {
         let active_players = players
             .iter()
             .filter(|player| {
@@ -1985,10 +1990,10 @@ impl SurfaceOreService {
             if surface_ore_position_occupied(clusters, position) {
                 continue;
             }
-            let too_close = clusters
-                .values()
-                .any(|cluster| horizontal_world_distance_squared(cluster.anchor, position)
-                    < SURFACE_ORE_MIN_SPAWN_DISTANCE * SURFACE_ORE_MIN_SPAWN_DISTANCE);
+            let too_close = clusters.values().any(|cluster| {
+                horizontal_world_distance_squared(cluster.anchor, position)
+                    < SURFACE_ORE_MIN_SPAWN_DISTANCE * SURFACE_ORE_MIN_SPAWN_DISTANCE
+            });
             if too_close {
                 continue;
             }
@@ -2023,7 +2028,9 @@ impl SurfaceOreService {
             let mut placed_positions = Vec::new();
             let mut placement_failed = false;
             for cluster_position in &cluster_positions {
-                let (result, chunk) = world_service.apply_block_edit(*cluster_position, block).await?;
+                let (result, chunk) = world_service
+                    .apply_block_edit(*cluster_position, block)
+                    .await?;
                 if !result.accepted {
                     placement_failed = true;
                     break;
@@ -2036,7 +2043,9 @@ impl SurfaceOreService {
 
             if placement_failed {
                 for placed_position in placed_positions {
-                    let _ = world_service.apply_block_edit(placed_position, BlockId::Air).await;
+                    let _ = world_service
+                        .apply_block_edit(placed_position, BlockId::Air)
+                        .await;
                 }
                 continue;
             }
@@ -2221,7 +2230,11 @@ impl WorldService {
         }
     }
 
-    pub async fn find_surface_ore_spawn_position(&self, x: f32, z: f32) -> Result<Option<WorldPos>> {
+    pub async fn find_surface_ore_spawn_position(
+        &self,
+        x: f32,
+        z: f32,
+    ) -> Result<Option<WorldPos>> {
         let block_x = x.floor() as i32;
         let block_z = z.floor() as i32;
         let surface = self
@@ -3044,7 +3057,11 @@ impl VoxelServer {
             )
             .await;
         let block_inventory = match user_id.as_deref() {
-            Some(user_id) => match self.block_inventory.load_or_seed_user_inventory(user_id).await {
+            Some(user_id) => match self
+                .block_inventory
+                .load_or_seed_user_inventory(user_id)
+                .await
+            {
                 Ok(inventory) => inventory,
                 Err(error) => {
                     tracing::warn!(?error, %user_id, "failed to load websocket player block inventory");
@@ -3418,10 +3435,8 @@ impl VoxelServer {
         };
 
         let mut next_inventory = player.block_inventory.clone();
-        if !next_inventory.swap_slots(
-            usize::from(request.from_slot),
-            usize::from(request.to_slot),
-        ) {
+        if !next_inventory.swap_slots(usize::from(request.from_slot), usize::from(request.to_slot))
+        {
             let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
                 accepted: false,
                 reason: "inventory slot is out of range".to_string(),
@@ -3446,7 +3461,8 @@ impl VoxelServer {
             .set_block_inventory(player_id, next_inventory)
             .await
         else {
-            self.rollback_block_inventory_change(player_id, &player).await;
+            self.rollback_block_inventory_change(player_id, &player)
+                .await;
             return Ok(());
         };
 
@@ -3554,21 +3570,27 @@ impl VoxelServer {
             .set_block_inventory(player_id, next_inventory)
             .await
         else {
-            self.rollback_block_inventory_change(player_id, &player).await;
+            self.rollback_block_inventory_change(player_id, &player)
+                .await;
             return Ok(());
         };
 
-        let edit_result = self.world_service.apply_block_edit(position, next_world_block).await;
+        let edit_result = self
+            .world_service
+            .apply_block_edit(position, next_world_block)
+            .await;
         let (result, chunk) = match edit_result {
             Ok((result, chunk)) if result.accepted => (result, chunk),
             Ok((result, _)) => {
-                self.rollback_block_inventory_change(player_id, &player).await;
+                self.rollback_block_inventory_change(player_id, &player)
+                    .await;
                 let _ = sender.send(ServerMessage::BlockActionResult(result));
                 return Ok(());
             }
             Err(error) => {
                 tracing::warn!(?error, player_id, ?position, "failed to apply block edit");
-                self.rollback_block_inventory_change(player_id, &player).await;
+                self.rollback_block_inventory_change(player_id, &player)
+                    .await;
                 let _ = sender.send(ServerMessage::BlockActionResult(BlockActionResult {
                     accepted: false,
                     reason: "we could not update that block".to_string(),
@@ -6413,8 +6435,8 @@ async fn build_surface_ore_cluster_positions(
     anchor: WorldPos,
     seed: u64,
 ) -> Result<Option<Vec<WorldPos>>> {
-    let target_size =
-        SURFACE_ORE_NODE_MIN_BLOCKS + (seed as usize % (SURFACE_ORE_NODE_MAX_BLOCKS - SURFACE_ORE_NODE_MIN_BLOCKS + 1));
+    let target_size = SURFACE_ORE_NODE_MIN_BLOCKS
+        + (seed as usize % (SURFACE_ORE_NODE_MAX_BLOCKS - SURFACE_ORE_NODE_MIN_BLOCKS + 1));
     let mut positions = vec![anchor];
     let mut seen = HashSet::from([anchor]);
 
@@ -7363,10 +7385,7 @@ mod tests {
         assert!(drain_server_messages(&mut receiver).iter().any(|message| {
             matches!(
                 message,
-                ServerMessage::BlockActionResult(BlockActionResult {
-                    accepted: true,
-                    ..
-                })
+                ServerMessage::BlockActionResult(BlockActionResult { accepted: true, .. })
             )
         }));
 
@@ -7438,10 +7457,7 @@ mod tests {
         assert!(drain_server_messages(&mut receiver).iter().any(|message| {
             matches!(
                 message,
-                ServerMessage::BlockActionResult(BlockActionResult {
-                    accepted: true,
-                    ..
-                })
+                ServerMessage::BlockActionResult(BlockActionResult { accepted: true, .. })
             )
         }));
 
@@ -7493,7 +7509,10 @@ mod tests {
             .player(player.id)
             .await
             .expect("updated player");
-        assert_eq!(updated_player.block_inventory, PlayerBlockInventory::starter());
+        assert_eq!(
+            updated_player.block_inventory,
+            PlayerBlockInventory::starter()
+        );
         assert!(drain_server_messages(&mut receiver).iter().any(|message| {
             matches!(
                 message,
@@ -7540,7 +7559,10 @@ mod tests {
             .player(player.id)
             .await
             .expect("updated player");
-        assert_eq!(updated_player.block_inventory, full_inventory(BlockId::Stone));
+        assert_eq!(
+            updated_player.block_inventory,
+            full_inventory(BlockId::Stone)
+        );
         assert_eq!(
             server
                 .world_service
@@ -7608,7 +7630,10 @@ mod tests {
             .player(player.id)
             .await
             .expect("updated player");
-        assert_eq!(updated_player.block_inventory, PlayerBlockInventory::starter());
+        assert_eq!(
+            updated_player.block_inventory,
+            PlayerBlockInventory::starter()
+        );
         assert_eq!(
             server
                 .world_service
@@ -7651,7 +7676,8 @@ mod tests {
             )
             .await;
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let (target, occupied_block) = first_collectible_block_below(&server.world_service, spawn).await;
+        let (target, occupied_block) =
+            first_collectible_block_below(&server.world_service, spawn).await;
 
         server
             .handle_block_request_for_websocket(player.id, &sender, target, Some(BlockId::Grass))
@@ -7663,7 +7689,10 @@ mod tests {
             .player(player.id)
             .await
             .expect("updated player");
-        assert_eq!(updated_player.block_inventory, PlayerBlockInventory::starter());
+        assert_eq!(
+            updated_player.block_inventory,
+            PlayerBlockInventory::starter()
+        );
         assert_eq!(
             server
                 .world_service
@@ -7732,9 +7761,11 @@ mod tests {
                 count: 32,
             })
         );
-        assert!(drain_server_messages(&mut receiver).iter().any(|message| {
-            matches!(message, ServerMessage::InventorySnapshot(_))
-        }));
+        assert!(
+            drain_server_messages(&mut receiver)
+                .iter()
+                .any(|message| { matches!(message, ServerMessage::InventorySnapshot(_)) })
+        );
 
         db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
             .await
@@ -7802,9 +7833,11 @@ mod tests {
                 count: 32,
             })
         );
-        assert!(drain_server_messages(&mut receiver).iter().any(|message| {
-            matches!(message, ServerMessage::InventorySnapshot(_))
-        }));
+        assert!(
+            drain_server_messages(&mut receiver)
+                .iter()
+                .any(|message| { matches!(message, ServerMessage::InventorySnapshot(_)) })
+        );
 
         db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
             .await
@@ -7855,16 +7888,23 @@ mod tests {
                 cluster.block,
                 BlockId::CoalOre | BlockId::IronOre | BlockId::GoldOre
             ));
-            assert!((SURFACE_ORE_NODE_MIN_BLOCKS..=SURFACE_ORE_NODE_MAX_BLOCKS)
-                .contains(&cluster.positions.len()));
+            assert!(
+                (SURFACE_ORE_NODE_MIN_BLOCKS..=SURFACE_ORE_NODE_MAX_BLOCKS)
+                    .contains(&cluster.positions.len())
+            );
             for position in &cluster.positions {
                 assert_eq!(
-                    world.block_at(*position).await.expect("read spawned ore block"),
+                    world
+                        .block_at(*position)
+                        .await
+                        .expect("read spawned ore block"),
                     Some(cluster.block)
                 );
-                assert!(player
-                    .subscribed_chunks
-                    .contains(&ChunkPos::from_world(*position)));
+                assert!(
+                    player
+                        .subscribed_chunks
+                        .contains(&ChunkPos::from_world(*position))
+                );
             }
         }
     }
@@ -7906,7 +7946,8 @@ mod tests {
         let initial_clusters = surface_ore_service.clusters.lock().await.clone();
         let (_, mined_cluster) = initial_clusters.iter().next().expect("spawned node");
         for mined_position in &mined_cluster.positions {
-            world.apply_block_edit(*mined_position, BlockId::Air)
+            world
+                .apply_block_edit(*mined_position, BlockId::Air)
                 .await
                 .expect("mine runtime ore node");
         }
@@ -7916,11 +7957,13 @@ mod tests {
             .await
             .expect("prune runtime ore nodes");
 
-        assert!(!surface_ore_service
-            .clusters
-            .lock()
-            .await
-            .contains_key(&mined_cluster.anchor));
+        assert!(
+            !surface_ore_service
+                .clusters
+                .lock()
+                .await
+                .contains_key(&mined_cluster.anchor)
+        );
     }
 
     #[tokio::test]

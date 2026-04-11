@@ -23,6 +23,7 @@ const STATUS_QUEUED: &str = "QUEUED";
 const STATUS_PROCESSING: &str = "PROCESSING";
 const STATUS_READY: &str = "READY";
 const STATUS_FAILED: &str = "FAILED";
+const SUPERSEDED_TASK_REASON: &str = "Superseded by a newer selfie upload.";
 
 const PHASE_UPLOADED: &str = "UPLOADED";
 const PHASE_PORTRAIT_GENERATING: &str = "PORTRAIT_GENERATING";
@@ -35,7 +36,7 @@ const PHASE_FINALIZING: &str = "FINALIZING";
 const PHASE_READY: &str = "READY";
 const PHASE_FAILED: &str = "FAILED";
 
-const PORTRAIT_PROMPT: &str = "Create a realistic full-body studio portrait of the same person from the reference photo. Keep the facial features, hair, glasses, expression, and overall likeness consistent with the source image. Extrapolate a natural full body in believable proportion. Dress them in a tailored suit with a shirt and tie. Standing straight in a neutral front-facing pose, both arms fully visible and slightly away from the torso, hands visible, feet visible, centered composition, soft studio lighting, seamless white background, high detail, natural skin tones. Keep the silhouette unobstructed and limb boundaries clear for downstream 3D rigging.";
+const PORTRAIT_PROMPT: &str = "Create a realistic full-body studio portrait of the same primary subject from the reference photo. The subject may be a human, animal, mascot, plush, costume head, or anthropomorphic/fursuit character. Preserve the exact identity and likeness of that one subject, including the face, muzzle or snout, ears, eyes, fur or skin color, markings, hair, glasses, expression, and distinctive accessories. If the subject is non-human, keep the same species and design, and do not humanize it unless the reference already depicts an anthropomorphic character. Never blend traits from different faces or bodies, never swap identities, and never add extra people or animals; if multiple faces appear, use only the main centered subject. Extrapolate a believable full body in clean, consistent proportions for that same subject. Dress the subject in a tailored suit with a shirt and tie only when it fits the reference; otherwise keep the clothing or costume styling consistent with the source. Standing straight in a neutral front-facing pose, all limbs fully visible and slightly away from the torso when applicable, hands, paws, forelegs, or equivalent front limbs visible, feet, hind legs, or equivalent lower limbs visible, centered composition, soft studio lighting, seamless white background, high detail, natural colors. Keep the silhouette unobstructed and limb boundaries clear for downstream 3D rigging.";
 const DEFAULT_GENERATED_AVATAR_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 #[derive(Clone, Debug)]
@@ -291,9 +292,7 @@ impl AvatarGenerationClient {
     ) -> Result<AvatarGenerationTaskView> {
         let normalized_content_type = normalize_selfie_content_type(content_type)
             .ok_or_else(|| anyhow!("unsupported selfie content type"))?;
-        if let Some(task) = self.load_active_task_for_user(user_id).await? {
-            return self.map_task_view(task).await;
-        }
+        self.supersede_active_tasks_for_user(user_id).await?;
 
         let task_id = Uuid::new_v4();
         let selfie_storage_key = self.task_storage_key(
@@ -489,6 +488,7 @@ impl AvatarGenerationClient {
         &self,
         task: AvatarGenerationTaskRecord,
     ) -> Result<()> {
+        self.ensure_task_processing(task.id).await?;
         if self.config.openai_api_key.trim().is_empty() {
             bail!("OPENAI_API_KEY is not configured");
         }
@@ -528,7 +528,7 @@ impl AvatarGenerationClient {
             )
             .await?;
 
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE player_avatar_generation_tasks
              SET phase = $2,
                  progress_percent = $3,
@@ -539,7 +539,8 @@ impl AvatarGenerationClient {
                  portrait_content_type = $8,
                  meshy_model_task_id = $9,
                  updated_at = NOW()
-             WHERE id = $1",
+             WHERE id = $1
+               AND status = $10",
         )
         .bind(task.id)
         .bind(PHASE_MESH_GENERATING)
@@ -550,14 +551,17 @@ impl AvatarGenerationClient {
         .bind(&portrait_storage_key)
         .bind(&portrait_content_type)
         .bind(meshy_task_id)
+        .bind(STATUS_PROCESSING)
         .execute(&self.pool)
         .await
         .context("store portrait and meshy mesh task")?;
+        ensure_task_write_applied(updated.rows_affected())?;
 
         Ok(())
     }
 
     async fn poll_mesh_task(&self, task: AvatarGenerationTaskRecord) -> Result<()> {
+        self.ensure_task_processing(task.id).await?;
         let task_id = task
             .meshy_model_task_id
             .as_deref()
@@ -608,7 +612,7 @@ impl AvatarGenerationClient {
             .await?;
         let rigging_task_id = self.submit_meshy_rigging_task(&model_source).await?;
 
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE player_avatar_generation_tasks
              SET phase = $2,
                  progress_percent = $3,
@@ -617,7 +621,8 @@ impl AvatarGenerationClient {
                  raw_model_storage_key = $6,
                  meshy_rigging_task_id = $7,
                  updated_at = NOW()
-             WHERE id = $1",
+             WHERE id = $1
+               AND status = $8",
         )
         .bind(task.id)
         .bind(PHASE_RIGGING_GENERATING)
@@ -626,14 +631,17 @@ impl AvatarGenerationClient {
         .bind(message_for_phase(PHASE_RIGGING_GENERATING))
         .bind(&raw_model_storage_key)
         .bind(rigging_task_id)
+        .bind(STATUS_PROCESSING)
         .execute(&self.pool)
         .await
         .context("store raw model and rigging task")?;
+        ensure_task_write_applied(updated.rows_affected())?;
 
         Ok(())
     }
 
     async fn poll_rigging_task(&self, task: AvatarGenerationTaskRecord) -> Result<()> {
+        self.ensure_task_processing(task.id).await?;
         let rigging_task_id = task
             .meshy_rigging_task_id
             .as_deref()
@@ -687,7 +695,7 @@ impl AvatarGenerationClient {
             )
             .await?;
 
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE player_avatar_generation_tasks
              SET phase = $2,
                  progress_percent = $3,
@@ -696,7 +704,8 @@ impl AvatarGenerationClient {
                  rigged_model_storage_key = $6,
                  meshy_idle_animation_task_id = $7,
                  updated_at = NOW()
-             WHERE id = $1",
+             WHERE id = $1
+               AND status = $8",
         )
         .bind(task.id)
         .bind(PHASE_IDLE_ANIMATING)
@@ -705,14 +714,17 @@ impl AvatarGenerationClient {
         .bind(message_for_phase(PHASE_IDLE_ANIMATING))
         .bind(&rigged_model_storage_key)
         .bind(idle_task_id)
+        .bind(STATUS_PROCESSING)
         .execute(&self.pool)
         .await
         .context("store rigged model and idle animation task")?;
+        ensure_task_write_applied(updated.rows_affected())?;
 
         Ok(())
     }
 
     async fn poll_idle_animation_task(&self, task: AvatarGenerationTaskRecord) -> Result<()> {
+        self.ensure_task_processing(task.id).await?;
         let idle_task_id = task
             .meshy_idle_animation_task_id
             .as_deref()
@@ -751,7 +763,7 @@ impl AvatarGenerationClient {
         self.store_final_avatar_glb(&idle_storage_key, &idle_bytes)
             .await?;
 
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE player_avatar_generation_tasks
              SET phase = $2,
                  progress_percent = $3,
@@ -759,21 +771,25 @@ impl AvatarGenerationClient {
                  status_message = $4,
                  idle_model_storage_key = $5,
                  updated_at = NOW()
-             WHERE id = $1",
+             WHERE id = $1
+               AND status = $6",
         )
         .bind(task.id)
         .bind(PHASE_RUN_PREPARING)
         .bind(78_i32)
         .bind(message_for_phase(PHASE_RUN_PREPARING))
         .bind(&idle_storage_key)
+        .bind(STATUS_PROCESSING)
         .execute(&self.pool)
         .await
         .context("store idle animation output")?;
+        ensure_task_write_applied(updated.rows_affected())?;
 
         Ok(())
     }
 
     async fn prepare_run_and_submit_dance(&self, task: AvatarGenerationTaskRecord) -> Result<()> {
+        self.ensure_task_processing(task.id).await?;
         let rigging_task_id = task
             .meshy_rigging_task_id
             .as_deref()
@@ -798,7 +814,7 @@ impl AvatarGenerationClient {
             )
             .await?;
 
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE player_avatar_generation_tasks
              SET phase = $2,
                  progress_percent = $3,
@@ -807,7 +823,8 @@ impl AvatarGenerationClient {
                  run_model_storage_key = $6,
                  meshy_dance_animation_task_id = $7,
                  updated_at = NOW()
-             WHERE id = $1",
+             WHERE id = $1
+               AND status = $8",
         )
         .bind(task.id)
         .bind(PHASE_DANCE_ANIMATING)
@@ -816,14 +833,17 @@ impl AvatarGenerationClient {
         .bind(message_for_phase(PHASE_DANCE_ANIMATING))
         .bind(&run_storage_key)
         .bind(dance_task_id)
+        .bind(STATUS_PROCESSING)
         .execute(&self.pool)
         .await
         .context("store run animation output and dance task")?;
+        ensure_task_write_applied(updated.rows_affected())?;
 
         Ok(())
     }
 
     async fn poll_dance_animation_task(&self, task: AvatarGenerationTaskRecord) -> Result<()> {
+        self.ensure_task_processing(task.id).await?;
         let dance_task_id = task
             .meshy_dance_animation_task_id
             .as_deref()
@@ -863,7 +883,7 @@ impl AvatarGenerationClient {
         self.store_final_avatar_glb(&dance_storage_key, &dance_bytes)
             .await?;
 
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE player_avatar_generation_tasks
              SET phase = $2,
                  progress_percent = $3,
@@ -871,21 +891,25 @@ impl AvatarGenerationClient {
                  status_message = $4,
                  dance_model_storage_key = $5,
                  updated_at = NOW()
-             WHERE id = $1",
+             WHERE id = $1
+               AND status = $6",
         )
         .bind(task.id)
         .bind(PHASE_FINALIZING)
         .bind(96_i32)
         .bind(message_for_phase(PHASE_FINALIZING))
         .bind(&dance_storage_key)
+        .bind(STATUS_PROCESSING)
         .execute(&self.pool)
         .await
         .context("store dance animation output")?;
+        ensure_task_write_applied(updated.rows_affected())?;
 
         Ok(())
     }
 
     async fn finalize_task(&self, task: AvatarGenerationTaskRecord) -> Result<()> {
+        self.ensure_task_processing(task.id).await?;
         let idle_storage_key = task
             .idle_model_storage_key
             .as_deref()
@@ -908,7 +932,7 @@ impl AvatarGenerationClient {
             )
             .await?;
 
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE player_avatar_generation_tasks
              SET status = $2,
                  phase = $3,
@@ -917,21 +941,55 @@ impl AvatarGenerationClient {
                  status_message = $5,
                  completed_at = NOW(),
                  updated_at = NOW()
-             WHERE id = $1",
+             WHERE id = $1
+               AND status = $6",
         )
         .bind(task.id)
         .bind(STATUS_READY)
         .bind(PHASE_READY)
         .bind(100_i32)
         .bind(message_for_phase(PHASE_READY))
+        .bind(STATUS_PROCESSING)
         .execute(&self.pool)
         .await
         .context("mark avatar generation task ready")?;
+        ensure_task_write_applied(updated.rows_affected())?;
 
         Ok(())
     }
 
     async fn fail_task(&self, task: &AvatarGenerationTaskRecord, reason: &str) -> Result<()> {
+        let Some(current_status) = self.load_task_status(task.id).await? else {
+            return Ok(());
+        };
+        if !matches!(current_status.as_str(), STATUS_QUEUED | STATUS_PROCESSING) {
+            return Ok(());
+        }
+
+        if reason == SUPERSEDED_TASK_REASON {
+            sqlx::query(
+                "UPDATE player_avatar_generation_tasks
+                 SET status = $2,
+                     phase = $3,
+                     provider_progress = NULL,
+                     status_message = $4,
+                     failure_reason = $5,
+                     completed_at = NOW(),
+                     updated_at = NOW()
+                 WHERE id = $1
+                   AND status IN ('QUEUED', 'PROCESSING')",
+            )
+            .bind(task.id)
+            .bind(STATUS_FAILED)
+            .bind(PHASE_FAILED)
+            .bind(message_for_phase(PHASE_FAILED))
+            .bind(reason.to_string())
+            .execute(&self.pool)
+            .await
+            .context("mark superseded avatar generation task failed")?;
+            return Ok(());
+        }
+
         let attempts = task.attempts.max(1);
         if attempts < self.config.avatar_generation_max_attempts {
             let retry_message = format!(
@@ -944,7 +1002,8 @@ impl AvatarGenerationClient {
                      status_message = $3,
                      failure_reason = NULL,
                      updated_at = NOW()
-                 WHERE id = $1",
+                 WHERE id = $1
+                   AND status IN ('QUEUED', 'PROCESSING')",
             )
             .bind(task.id)
             .bind(STATUS_QUEUED)
@@ -963,7 +1022,8 @@ impl AvatarGenerationClient {
                  failure_reason = $5,
                  completed_at = NOW(),
                  updated_at = NOW()
-             WHERE id = $1",
+             WHERE id = $1
+               AND status IN ('QUEUED', 'PROCESSING')",
         )
         .bind(task.id)
         .bind(STATUS_FAILED)
@@ -984,23 +1044,26 @@ impl AvatarGenerationClient {
         provider_progress: Option<i32>,
         message: &str,
     ) -> Result<()> {
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE player_avatar_generation_tasks
              SET phase = $2,
                  progress_percent = $3,
                  provider_progress = $4,
                  status_message = $5,
                  updated_at = NOW()
-             WHERE id = $1",
+             WHERE id = $1
+               AND status = $6",
         )
         .bind(task_id)
         .bind(phase)
         .bind(progress_percent)
         .bind(provider_progress)
         .bind(message)
+        .bind(STATUS_PROCESSING)
         .execute(&self.pool)
         .await
         .context("update avatar generation task progress")?;
+        ensure_task_write_applied(updated.rows_affected())?;
         Ok(())
     }
 
@@ -1306,23 +1369,44 @@ impl AvatarGenerationClient {
             .ok_or_else(|| anyhow!("storage object {storage_key} is missing"))
     }
 
-    async fn load_active_task_for_user(
-        &self,
-        user_id: Uuid,
-    ) -> Result<Option<AvatarGenerationTaskRecord>> {
-        let row = sqlx::query(
-            "SELECT *
-             FROM player_avatar_generation_tasks
+    async fn load_task_status(&self, task_id: Uuid) -> Result<Option<String>> {
+        sqlx::query_scalar("SELECT status FROM player_avatar_generation_tasks WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("load avatar generation task status")
+    }
+
+    async fn ensure_task_processing(&self, task_id: Uuid) -> Result<()> {
+        match self.load_task_status(task_id).await?.as_deref() {
+            Some(STATUS_PROCESSING) => Ok(()),
+            Some(_) => bail!(SUPERSEDED_TASK_REASON),
+            None => bail!("avatar generation task is missing"),
+        }
+    }
+
+    async fn supersede_active_tasks_for_user(&self, user_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE player_avatar_generation_tasks
+             SET status = $2,
+                 phase = $3,
+                 provider_progress = NULL,
+                 status_message = $4,
+                 failure_reason = $5,
+                 completed_at = NOW(),
+                 updated_at = NOW()
              WHERE user_id = $1
-               AND status IN ('QUEUED', 'PROCESSING')
-             ORDER BY created_at DESC
-             LIMIT 1",
+               AND status IN ('QUEUED', 'PROCESSING')",
         )
         .bind(user_id)
-        .fetch_optional(&self.pool)
+        .bind(STATUS_FAILED)
+        .bind(PHASE_FAILED)
+        .bind(message_for_phase(PHASE_FAILED))
+        .bind(SUPERSEDED_TASK_REASON)
+        .execute(&self.pool)
         .await
-        .context("load active avatar generation task")?;
-        row.map(AvatarGenerationTaskRecord::from_row).transpose()
+        .context("supersede active avatar generation tasks")?;
+        Ok(())
     }
 
     async fn load_latest_task_for_user(
@@ -1539,6 +1623,13 @@ fn message_for_phase(phase: &str) -> &'static str {
     }
 }
 
+fn ensure_task_write_applied(rows_affected: u64) -> Result<()> {
+    if rows_affected == 0 {
+        bail!(SUPERSEDED_TASK_REASON);
+    }
+    Ok(())
+}
+
 fn meshy_task_error_message(task_error: Option<&MeshyTaskError>, fallback_status: &str) -> String {
     task_error
         .and_then(|value| value.message.as_deref())
@@ -1560,7 +1651,9 @@ mod tests {
 
     #[test]
     fn portrait_prompt_mentions_rigging_constraints() {
-        assert!(PORTRAIT_PROMPT.contains("both arms fully visible"));
+        assert!(PORTRAIT_PROMPT.contains("animal"));
+        assert!(PORTRAIT_PROMPT.contains("Never blend traits from different faces or bodies"));
+        assert!(PORTRAIT_PROMPT.contains("all limbs fully visible"));
         assert!(PORTRAIT_PROMPT.contains("downstream 3D rigging"));
     }
 
@@ -1586,7 +1679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_or_get_active_task_reuses_existing_active_task() {
+    async fn create_or_get_active_task_supersedes_existing_active_task() {
         let config = ServerConfig::default();
         let base_database_url = config.database_url.clone();
         let (pool, schema_name) = db::connect_isolated_test_pool(&base_database_url)
@@ -1669,9 +1762,25 @@ mod tests {
         let second = client
             .create_or_get_active_task(user_id, b"png-2", "image/png")
             .await
-            .expect("reuse active task");
+            .expect("create superseding task");
 
-        assert_eq!(first.id, second.id);
+        assert_ne!(first.id, second.id);
+
+        let first_status = sqlx::query(
+            "SELECT status, failure_reason
+             FROM player_avatar_generation_tasks
+             WHERE id = $1",
+        )
+        .bind(Uuid::parse_str(&first.id).expect("first task id"))
+        .fetch_one(&pool)
+        .await
+        .expect("load first task");
+        let status: String = first_status.try_get("status").expect("status");
+        let failure_reason: Option<String> = first_status
+            .try_get("failure_reason")
+            .expect("failure reason");
+        assert_eq!(status, STATUS_FAILED);
+        assert_eq!(failure_reason.as_deref(), Some(SUPERSEDED_TASK_REASON));
 
         db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
             .await

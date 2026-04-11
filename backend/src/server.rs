@@ -43,7 +43,7 @@ use shared_protocol::{
     UpdatePetPartyResult, WeaponIdentity, WildPetMotionSnapshot, WildPetSnapshot, WildPetUnload,
     WorldWeaponSnapshot, WorldWeaponUnload, decode, encode,
 };
-use shared_world::{BlockId, ChunkData, TerrainGenerator, Voxel};
+use shared_world::{BiomeId, BlockId, ChunkData, TerrainGenerator, Voxel};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,6 +74,9 @@ const WILD_WEAPON_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 const WILD_WEAPON_TARGET_PER_PLAYER: usize = 6;
 const WILD_WEAPON_GLOBAL_CAP: usize = 12;
 const WILD_WEAPON_MIN_SPAWN_DISTANCE: f32 = 12.0;
+const SURFACE_ORE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3);
+const SURFACE_ORE_TARGET_PER_PLAYER: usize = 5;
+const SURFACE_ORE_MIN_SPAWN_DISTANCE: f32 = 10.0;
 const PET_WEAPON_RANGE: f32 = 5.0;
 const PET_WEAPON_DAMAGE: u8 = 1;
 const PET_WEAPON_COOLDOWN_MS: u64 = 800;
@@ -1833,6 +1836,143 @@ impl WildWeaponService {
 }
 
 #[derive(Clone)]
+struct SurfaceOreService {
+    nodes: Arc<Mutex<HashMap<WorldPos, BlockId>>>,
+    spawn_nonce: Arc<Mutex<u64>>,
+}
+
+impl SurfaceOreService {
+    fn new() -> Self {
+        Self {
+            nodes: Arc::new(Mutex::new(HashMap::new())),
+            spawn_nonce: Arc::new(Mutex::new(1)),
+        }
+    }
+
+    async fn maintain(&self, world_service: &WorldService, players: &[Player], connected_player_ids: &HashSet<u64>) -> Result<Vec<ChunkData>> {
+        let active_players = players
+            .iter()
+            .filter(|player| {
+                connected_player_ids.contains(&player.id) && !player.subscribed_chunks.is_empty()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut nodes = self.nodes.lock().await.clone();
+        let stale_positions = nodes
+            .iter()
+            .map(|(&position, &block)| (position, block))
+            .collect::<Vec<_>>();
+        for (position, block) in stale_positions {
+            if world_service.block_at(position).await? != Some(block) {
+                nodes.remove(&position);
+            }
+        }
+
+        let mut chunk_updates = HashMap::<ChunkPos, ChunkData>::new();
+        for player in &active_players {
+            let mut nearby_count = nodes
+                .keys()
+                .filter(|position| {
+                    player
+                        .subscribed_chunks
+                        .contains(&ChunkPos::from_world(**position))
+                })
+                .count();
+
+            while nearby_count < SURFACE_ORE_TARGET_PER_PLAYER {
+                let Some((position, block, chunk)) = self
+                    .spawn_ore_for_player_locked(world_service, &nodes, player)
+                    .await?
+                else {
+                    break;
+                };
+                nodes.insert(position, block);
+                chunk_updates.insert(chunk.position, chunk);
+                nearby_count += 1;
+            }
+        }
+
+        *self.nodes.lock().await = nodes;
+        Ok(chunk_updates.into_values().collect())
+    }
+
+    async fn clear_node(&self, position: WorldPos) {
+        self.nodes.lock().await.remove(&position);
+    }
+
+    async fn spawn_ore_for_player_locked(
+        &self,
+        world_service: &WorldService,
+        nodes: &HashMap<WorldPos, BlockId>,
+        player: &Player,
+    ) -> Result<Option<(WorldPos, BlockId, ChunkData)>> {
+        let base_nonce = {
+            let mut nonce = self.spawn_nonce.lock().await;
+            let value = *nonce;
+            *nonce = (*nonce).wrapping_add(1);
+            value
+        };
+
+        for attempt in 0..32_u64 {
+            let sample = hashed_spawn_offset(
+                base_nonce ^ player.id ^ attempt,
+                player.position,
+                player.yaw,
+            );
+            let candidate_chunk = ChunkPos::from_world(WorldPos {
+                x: sample[0].floor() as i64,
+                y: 0,
+                z: sample[2].floor() as i64,
+            });
+            if !player.subscribed_chunks.contains(&candidate_chunk) {
+                continue;
+            }
+
+            let Some(position) = world_service
+                .find_surface_ore_spawn_position(sample[0], sample[2])
+                .await?
+            else {
+                continue;
+            };
+            if nodes.contains_key(&position) {
+                continue;
+            }
+            let too_close = nodes
+                .keys()
+                .any(|existing| horizontal_world_distance_squared(*existing, position)
+                    < SURFACE_ORE_MIN_SPAWN_DISTANCE * SURFACE_ORE_MIN_SPAWN_DISTANCE);
+            if too_close {
+                continue;
+            }
+            if world_service.block_at(position).await? != Some(BlockId::Air) {
+                continue;
+            }
+
+            let (biome, surface) = world_service.surface_profile(position.x, position.z);
+            let block = choose_surface_ore_block(
+                base_nonce
+                    ^ player.id
+                    ^ attempt
+                    ^ (position.x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ (position.z as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9),
+                biome,
+                surface,
+            );
+            let (result, chunk) = world_service.apply_block_edit(position, block).await?;
+            if !result.accepted {
+                continue;
+            }
+            if let Some(chunk) = chunk {
+                return Ok(Some((position, block, chunk)));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+#[derive(Clone)]
 pub struct WebSocketSessionService {
     sessions: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<ServerMessage>>>>,
 }
@@ -1983,6 +2123,12 @@ impl WorldService {
         self.chunk_store.runtime_status().await
     }
 
+    pub fn surface_profile(&self, x: i64, z: i64) -> (BiomeId, i32) {
+        let biome = self.generator.surface_biome(x, z);
+        let surface = self.generator.surface_height(x, z);
+        (biome, surface)
+    }
+
     pub fn safe_spawn_position(&self) -> WorldPos {
         let surface = self.generator.surface_height(0, 0);
         WorldPos {
@@ -1990,6 +2136,61 @@ impl WorldService {
             y: (surface + 3).min(CHUNK_HEIGHT - 1),
             z: 0,
         }
+    }
+
+    pub async fn find_surface_ore_spawn_position(&self, x: f32, z: f32) -> Result<Option<WorldPos>> {
+        let block_x = x.floor() as i32;
+        let block_z = z.floor() as i32;
+        let surface = self
+            .generator
+            .surface_height(i64::from(block_x), i64::from(block_z));
+        let min_ground = (surface - 2).max(0);
+        let max_ground = (surface + 2).min(CHUNK_HEIGHT - 3);
+
+        for ground_y in (min_ground..=max_ground).rev() {
+            let support = self
+                .block_at(WorldPos {
+                    x: i64::from(block_x),
+                    y: ground_y,
+                    z: i64::from(block_z),
+                })
+                .await?
+                .unwrap_or(BlockId::Air);
+            let target = self
+                .block_at(WorldPos {
+                    x: i64::from(block_x),
+                    y: ground_y + 1,
+                    z: i64::from(block_z),
+                })
+                .await?
+                .unwrap_or(BlockId::Air);
+            let above = self
+                .block_at(WorldPos {
+                    x: i64::from(block_x),
+                    y: ground_y + 2,
+                    z: i64::from(block_z),
+                })
+                .await?
+                .unwrap_or(BlockId::Air);
+            if matches!(
+                support,
+                BlockId::Grass
+                    | BlockId::Dirt
+                    | BlockId::Stone
+                    | BlockId::Sand
+                    | BlockId::Sandstone
+            ) && target.is_empty()
+                && above.is_empty()
+            {
+                return Ok(Some(WorldPos {
+                    x: i64::from(block_x),
+                    y: ground_y + 1,
+                    z: i64::from(block_z),
+                }));
+            }
+        }
+
+        Ok(None)
     }
 
     pub async fn find_wild_pet_spawn_position(&self, x: f32, z: f32) -> Result<Option<[f32; 3]>> {
@@ -2328,6 +2529,7 @@ pub struct VoxelServer {
     player_service: PlayerService,
     wild_pet_service: WildPetService,
     wild_weapon_service: WildWeaponService,
+    surface_ore_service: SurfaceOreService,
     world_service: WorldService,
     static_root: PathBuf,
 }
@@ -2465,6 +2667,7 @@ impl VoxelServer {
         let player_service = PlayerService::new();
         let wild_pet_service = WildPetService::new();
         let wild_weapon_service = WildWeaponService::new();
+        let surface_ore_service = SurfaceOreService::new();
 
         tracing::info!(
             blocks = block_definitions().len(),
@@ -2494,6 +2697,7 @@ impl VoxelServer {
             player_service,
             wild_pet_service,
             wild_weapon_service,
+            surface_ore_service,
             world_service,
         })
     }
@@ -2530,6 +2734,12 @@ impl VoxelServer {
         tokio::spawn(async move {
             if let Err(error) = wild_weapon_server.run_wild_weapon_loop().await {
                 tracing::error!(?error, "wild weapon loop failed");
+            }
+        });
+        let surface_ore_server = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = surface_ore_server.run_surface_ore_loop().await {
+                tracing::error!(?error, "surface ore loop failed");
             }
         });
 
@@ -2638,6 +2848,22 @@ impl VoxelServer {
                 )
                 .await?;
             self.dispatch_wild_weapon_updates(dispatches).await;
+        }
+    }
+
+    async fn run_surface_ore_loop(self) -> Result<()> {
+        let mut interval = tokio::time::interval(SURFACE_ORE_MAINTENANCE_INTERVAL);
+        loop {
+            interval.tick().await;
+            let players = self.player_service.players().await;
+            let connected_player_ids = self.websocket_sessions.connected_player_ids().await;
+            let chunk_updates = self
+                .surface_ore_service
+                .maintain(&self.world_service, &players, &connected_player_ids)
+                .await?;
+            for chunk in chunk_updates {
+                self.broadcast_chunk_update(Some(chunk)).await;
+            }
         }
     }
 
@@ -3268,6 +3494,7 @@ impl VoxelServer {
             }
         };
 
+        self.surface_ore_service.clear_node(position).await;
         let _ = sender.send(ServerMessage::InventorySnapshot(
             updated_player.block_inventory_snapshot(),
         ));
@@ -5735,6 +5962,7 @@ impl Clone for VoxelServer {
             player_service: self.player_service.clone(),
             wild_pet_service: self.wild_pet_service.clone(),
             wild_weapon_service: self.wild_weapon_service.clone(),
+            surface_ore_service: self.surface_ore_service.clone(),
             world_service: self.world_service.clone(),
             static_root: self.static_root.clone(),
         }
@@ -5940,6 +6168,53 @@ fn hashed_spawn_offset(seed: u64, player_position: [f32; 3], player_yaw: f32) ->
         0.0,
         player_position[2] + forward[1] * forward_distance + right[1] * lateral_offset,
     ]
+}
+
+fn choose_surface_ore_block(seed: u64, biome: BiomeId, surface: i32) -> BlockId {
+    let roll = pseudo_unit(seed ^ 0xA24B_AED4_0FBF_7A63);
+    match biome {
+        BiomeId::Alpine => {
+            if roll < 0.18 {
+                BlockId::GoldOre
+            } else if roll < 0.62 {
+                BlockId::IronOre
+            } else {
+                BlockId::CoalOre
+            }
+        }
+        BiomeId::Desert => {
+            if roll < 0.14 {
+                BlockId::GoldOre
+            } else if roll < 0.34 {
+                BlockId::IronOre
+            } else {
+                BlockId::CoalOre
+            }
+        }
+        BiomeId::Forest | BiomeId::Plains if surface >= 70 => {
+            if roll < 0.10 {
+                BlockId::GoldOre
+            } else if roll < 0.42 {
+                BlockId::IronOre
+            } else {
+                BlockId::CoalOre
+            }
+        }
+        _ if surface >= 62 => {
+            if roll < 0.24 {
+                BlockId::IronOre
+            } else {
+                BlockId::CoalOre
+            }
+        }
+        _ => BlockId::CoalOre,
+    }
+}
+
+fn horizontal_world_distance_squared(a: WorldPos, b: WorldPos) -> f32 {
+    let dx = a.x as f32 - b.x as f32;
+    let dz = a.z as f32 - b.z as f32;
+    dx * dx + dz * dz
 }
 
 fn pseudo_unit(seed: u64) -> f32 {
@@ -7078,6 +7353,113 @@ mod tests {
         db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
             .await
             .expect("cleanup isolated schema");
+    }
+
+    #[tokio::test]
+    async fn surface_ore_service_spawns_runtime_nodes_into_subscribed_chunks() {
+        let world = WorldService::new(7, Arc::new(InMemoryChunkStore::new(7)));
+        let player_service = PlayerService::new();
+        let surface_ore_service = SurfaceOreService::new();
+        let spawn = world.safe_spawn_position();
+        let player = player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                None,
+                PlayerBlockInventory::starter(),
+                spawn,
+                None,
+                None,
+                None,
+            )
+            .await;
+        player_service
+            .swap_subscriptions(
+                player.id,
+                desired_chunk_set(ChunkPos::from_world(spawn), 12),
+            )
+            .await;
+        let player = player_service
+            .player(player.id)
+            .await
+            .expect("player with subscriptions");
+        let player_id = player.id;
+
+        let chunk_updates = surface_ore_service
+            .maintain(&world, &[player.clone()], &HashSet::from([player_id]))
+            .await
+            .expect("spawn runtime ore nodes");
+
+        assert!(!chunk_updates.is_empty());
+        let nodes = surface_ore_service.nodes.lock().await.clone();
+        assert!(!nodes.is_empty());
+        for (position, block) in nodes {
+            assert!(matches!(
+                block,
+                BlockId::CoalOre | BlockId::IronOre | BlockId::GoldOre
+            ));
+            assert_eq!(
+                world.block_at(position).await.expect("read spawned ore block"),
+                Some(block)
+            );
+            assert!(player
+                .subscribed_chunks
+                .contains(&ChunkPos::from_world(position)));
+        }
+    }
+
+    #[tokio::test]
+    async fn surface_ore_service_prunes_mined_runtime_nodes() {
+        let world = WorldService::new(7, Arc::new(InMemoryChunkStore::new(7)));
+        let player_service = PlayerService::new();
+        let surface_ore_service = SurfaceOreService::new();
+        let spawn = world.safe_spawn_position();
+        let player = player_service
+            .login(
+                "guest".to_string(),
+                None,
+                None,
+                None,
+                PlayerBlockInventory::starter(),
+                spawn,
+                None,
+                None,
+                None,
+            )
+            .await;
+        player_service
+            .swap_subscriptions(
+                player.id,
+                desired_chunk_set(ChunkPos::from_world(spawn), 12),
+            )
+            .await;
+        let player = player_service
+            .player(player.id)
+            .await
+            .expect("player with subscriptions");
+
+        surface_ore_service
+            .maintain(&world, &[player.clone()], &HashSet::from([player.id]))
+            .await
+            .expect("spawn runtime ore nodes");
+        let initial_nodes = surface_ore_service.nodes.lock().await.clone();
+        let (&mined_position, _) = initial_nodes.iter().next().expect("spawned node");
+
+        world.apply_block_edit(mined_position, BlockId::Air)
+            .await
+            .expect("mine runtime ore node");
+
+        surface_ore_service
+            .maintain(&world, &[], &HashSet::new())
+            .await
+            .expect("prune runtime ore nodes");
+
+        assert!(!surface_ore_service
+            .nodes
+            .lock()
+            .await
+            .contains_key(&mined_position));
     }
 
     #[tokio::test]

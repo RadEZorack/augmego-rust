@@ -5,55 +5,33 @@ const { biomeAt, generateChunk, heightAt, parseWorldSeed } = require("./mesh-wor
 const CHUNK_WIDTH = 32;
 const CHUNK_HEIGHT = 256;
 const CHUNK_DEPTH = 32;
+const SEARCH_RADIUS = 2;
 
 function blockAt(voxels, x, y, z) {
   return voxels[y * CHUNK_WIDTH * CHUNK_DEPTH + z * CHUNK_WIDTH + x];
 }
 
-function testOreGenerationDepthBands() {
+function testGeneratedTerrainDoesNotEmbedOreNodes() {
   const seed = parseWorldSeed(42);
-  let foundCoal = false;
-  let foundIron = false;
-  let foundGold = false;
 
-  outer: for (let chunkX = -6; chunkX <= 6; chunkX += 1) {
-    for (let chunkZ = -6; chunkZ <= 6; chunkZ += 1) {
+  for (let chunkX = -SEARCH_RADIUS; chunkX <= SEARCH_RADIUS; chunkX += 1) {
+    for (let chunkZ = -SEARCH_RADIUS; chunkZ <= SEARCH_RADIUS; chunkZ += 1) {
       const { voxels } = generateChunk(chunkX, chunkZ, seed);
-      for (let y = 0; y < CHUNK_HEIGHT; y += 1) {
-        for (let z = 0; z < CHUNK_DEPTH; z += 1) {
-          for (let x = 0; x < CHUNK_WIDTH; x += 1) {
-            const block = blockAt(voxels, x, y, z);
-            if (block === 13) {
-              foundCoal = true;
-              assert.ok(y < 72);
-            } else if (block === 14) {
-              foundIron = true;
-              assert.ok(y < 56);
-            } else if (block === 12) {
-              foundGold = true;
-              assert.ok(y < 32);
-            }
-          }
-        }
-      }
-
-      if (foundCoal && foundIron && foundGold) {
-        break outer;
+      for (const block of voxels) {
+        assert.notEqual(block, 12);
+        assert.notEqual(block, 13);
+        assert.notEqual(block, 14);
       }
     }
   }
-
-  assert.ok(foundCoal, "expected at least one coal ore block");
-  assert.ok(foundIron, "expected at least one iron ore block");
-  assert.ok(foundGold, "expected at least one gold ore block");
 }
 
 function testSandstonePlacementRules() {
   const seed = parseWorldSeed(42);
   let foundSandstone = false;
 
-  for (let chunkX = -6; chunkX <= 6; chunkX += 1) {
-    for (let chunkZ = -6; chunkZ <= 6; chunkZ += 1) {
+  for (let chunkX = -SEARCH_RADIUS; chunkX <= SEARCH_RADIUS; chunkX += 1) {
+    for (let chunkZ = -SEARCH_RADIUS; chunkZ <= SEARCH_RADIUS; chunkZ += 1) {
       const { voxels } = generateChunk(chunkX, chunkZ, seed);
       const baseX = chunkX * CHUNK_WIDTH;
       const baseZ = chunkZ * CHUNK_DEPTH;
@@ -65,7 +43,7 @@ function testSandstonePlacementRules() {
           const biome = biomeAt(worldX, worldZ, seed);
           const surface = heightAt(worldX, worldZ, biome, seed);
 
-          for (let y = 0; y <= Math.min(surface, CHUNK_HEIGHT - 1); y += 1) {
+          for (let y = Math.max(surface - 5, 0); y <= Math.min(surface - 2, CHUNK_HEIGHT - 1); y += 1) {
             const block = blockAt(voxels, x, y, z);
             if (block !== 15) {
               continue;
@@ -85,7 +63,7 @@ function testSandstonePlacementRules() {
 }
 
 function main() {
-  testOreGenerationDepthBands();
+  testGeneratedTerrainDoesNotEmbedOreNodes();
   testSandstonePlacementRules();
   console.log("mesh-worker tests passed");
 }

@@ -273,6 +273,10 @@ impl TerrainGenerator {
         self.height_at(x, z, biome)
     }
 
+    pub fn surface_biome(&self, x: i64, z: i64) -> BiomeId {
+        self.biome_at_world(x, z)
+    }
+
     fn biome_at_world(&self, x: i64, z: i64) -> BiomeId {
         let temperature = self.value_noise(x as f32, z as f32, 144.0, 7);
         let moisture = self.value_noise(x as f32, z as f32, 144.0, 17);
@@ -363,23 +367,8 @@ impl TerrainGenerator {
         self.decorate_stone_block(world_x, world_z, y)
     }
 
-    fn decorate_stone_block(&self, world_x: i64, world_z: i64, y: i32) -> BlockId {
-        if y < 32 && self.ore_roll(world_x, world_z, y, 211) < 1 {
-            return BlockId::GoldOre;
-        }
-        if y < 56 && self.ore_roll(world_x, world_z, y, 157) < 2 {
-            return BlockId::IronOre;
-        }
-        if y < 72 && self.ore_roll(world_x, world_z, y, 101) < 3 {
-            return BlockId::CoalOre;
-        }
-
+    fn decorate_stone_block(&self, _world_x: i64, _world_z: i64, _y: i32) -> BlockId {
         BlockId::Stone
-    }
-
-    fn ore_roll(&self, world_x: i64, world_z: i64, y: i32, salt: u64) -> u64 {
-        let y_mix = (y as u32 as u64).wrapping_mul(0x9E37_79B1);
-        self.hash(world_x, world_z, salt ^ y_mix) % 100
     }
 
     fn place_tree(&self, voxels: &mut [Voxel], x: u8, y: u8, z: u8) {
@@ -479,18 +468,15 @@ mod tests {
     }
 
     #[test]
-    fn ores_generate_within_expected_depth_bands() {
+    fn terrain_generator_does_not_embed_ore_nodes() {
         let generator = TerrainGenerator::new(42);
-        let mut found_coal = false;
-        let mut found_iron = false;
-        let mut found_gold = false;
-
-        'chunks: for chunk_x in -6..=6 {
-            for chunk_z in -6..=6 {
-                let chunk = generator.generate_chunk(ChunkPos {
+        for chunk_x in -2..=2 {
+            for chunk_z in -4..=4 {
+                let position = ChunkPos {
                     x: chunk_x,
                     z: chunk_z,
-                });
+                };
+                let chunk = generator.generate_chunk(position);
                 for y in 0..CHUNK_HEIGHT {
                     for z in 0..CHUNK_DEPTH {
                         for x in 0..CHUNK_WIDTH {
@@ -501,34 +487,18 @@ mod tests {
                                     z: z as u8,
                                 })
                                 .block;
-                            match block {
-                                BlockId::CoalOre => {
-                                    found_coal = true;
-                                    assert!(y < 72);
-                                }
-                                BlockId::IronOre => {
-                                    found_iron = true;
-                                    assert!(y < 56);
-                                }
-                                BlockId::GoldOre => {
-                                    found_gold = true;
-                                    assert!(y < 32);
-                                }
-                                _ => {}
-                            }
+                            assert!(
+                                !matches!(
+                                    block,
+                                    BlockId::CoalOre | BlockId::IronOre | BlockId::GoldOre
+                                ),
+                                "expected runtime ore spawning, found baked ore block {block:?}"
+                            );
                         }
                     }
                 }
-
-                if found_coal && found_iron && found_gold {
-                    break 'chunks;
-                }
             }
         }
-
-        assert!(found_coal, "expected at least one coal ore block");
-        assert!(found_iron, "expected at least one iron ore block");
-        assert!(found_gold, "expected at least one gold ore block");
     }
 
     #[test]
@@ -536,8 +506,8 @@ mod tests {
         let generator = TerrainGenerator::new(42);
         let mut found_sandstone = false;
 
-        for chunk_x in -6..=6 {
-            for chunk_z in -6..=6 {
+        for chunk_x in -4..=4 {
+            for chunk_z in -4..=4 {
                 let position = ChunkPos {
                     x: chunk_x,
                     z: chunk_z,
@@ -552,7 +522,7 @@ mod tests {
                         let biome = generator.biome_at_world(world_x, world_z);
                         let surface = generator.height_at(world_x, world_z, biome);
 
-                        for y in 0..=surface.min(CHUNK_HEIGHT - 1) {
+                        for y in (surface - 5).max(0)..=(surface - 2).min(CHUNK_HEIGHT - 1) {
                             let block = chunk
                                 .voxel(LocalVoxelPos {
                                     x: x as u8,

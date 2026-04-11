@@ -136,22 +136,8 @@ function blockForColumn(worldX, worldZ, y, surface, biome, worldSeed) {
   return decorateStoneBlock(worldX, worldZ, y, worldSeed);
 }
 
-function decorateStoneBlock(worldX, worldZ, y, worldSeed) {
-  if (y < 32 && oreRoll(worldX, worldZ, y, 211, worldSeed) < 1) {
-    return 12;
-  }
-  if (y < 56 && oreRoll(worldX, worldZ, y, 157, worldSeed) < 2) {
-    return 14;
-  }
-  if (y < 72 && oreRoll(worldX, worldZ, y, 101, worldSeed) < 3) {
-    return 13;
-  }
+function decorateStoneBlock(_worldX, _worldZ, _y, _worldSeed) {
   return 3;
-}
-
-function oreRoll(worldX, worldZ, y, salt, worldSeed) {
-  const yMix = BigInt.asUintN(64, BigInt((y >>> 0)) * 0x9E3779B1n);
-  return Number(hash(worldSeed, worldX, worldZ, BigInt(salt) ^ yMix) % 100n);
 }
 
 function applyEdits(voxels, heights, edits) {

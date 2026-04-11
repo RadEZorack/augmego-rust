@@ -77,6 +77,8 @@ const WILD_WEAPON_MIN_SPAWN_DISTANCE: f32 = 12.0;
 const SURFACE_ORE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3);
 const SURFACE_ORE_TARGET_PER_PLAYER: usize = 5;
 const SURFACE_ORE_MIN_SPAWN_DISTANCE: f32 = 10.0;
+const SURFACE_ORE_NODE_MIN_BLOCKS: usize = 3;
+const SURFACE_ORE_NODE_MAX_BLOCKS: usize = 9;
 const PET_WEAPON_RANGE: f32 = 5.0;
 const PET_WEAPON_DAMAGE: u8 = 1;
 const PET_WEAPON_COOLDOWN_MS: u64 = 800;
@@ -1837,14 +1839,21 @@ impl WildWeaponService {
 
 #[derive(Clone)]
 struct SurfaceOreService {
-    nodes: Arc<Mutex<HashMap<WorldPos, BlockId>>>,
+    clusters: Arc<Mutex<HashMap<WorldPos, SurfaceOreCluster>>>,
     spawn_nonce: Arc<Mutex<u64>>,
+}
+
+#[derive(Clone, Debug)]
+struct SurfaceOreCluster {
+    anchor: WorldPos,
+    block: BlockId,
+    positions: Vec<WorldPos>,
 }
 
 impl SurfaceOreService {
     fn new() -> Self {
         Self {
-            nodes: Arc::new(Mutex::new(HashMap::new())),
+            clusters: Arc::new(Mutex::new(HashMap::new())),
             spawn_nonce: Arc::new(Mutex::new(1)),
         }
     }
@@ -1858,55 +1867,78 @@ impl SurfaceOreService {
             .cloned()
             .collect::<Vec<_>>();
 
-        let mut nodes = self.nodes.lock().await.clone();
-        let stale_positions = nodes
-            .iter()
-            .map(|(&position, &block)| (position, block))
-            .collect::<Vec<_>>();
-        for (position, block) in stale_positions {
-            if world_service.block_at(position).await? != Some(block) {
-                nodes.remove(&position);
+        let mut clusters = self.clusters.lock().await.clone();
+        let stale_anchors = clusters.keys().copied().collect::<Vec<_>>();
+        for anchor in stale_anchors {
+            let Some(existing_cluster) = clusters.get(&anchor).cloned() else {
+                continue;
+            };
+            let mut kept_positions = Vec::new();
+            for position in existing_cluster.positions {
+                if world_service.block_at(position).await? == Some(existing_cluster.block) {
+                    kept_positions.push(position);
+                }
+            }
+
+            if kept_positions.is_empty() {
+                clusters.remove(&anchor);
+            } else if let Some(cluster) = clusters.get_mut(&anchor) {
+                cluster.positions = kept_positions;
             }
         }
 
         let mut chunk_updates = HashMap::<ChunkPos, ChunkData>::new();
         for player in &active_players {
-            let mut nearby_count = nodes
-                .keys()
-                .filter(|position| {
-                    player
-                        .subscribed_chunks
-                        .contains(&ChunkPos::from_world(**position))
+            let mut nearby_count = clusters
+                .values()
+                .filter(|cluster| {
+                    cluster.positions.iter().any(|position| {
+                        player
+                            .subscribed_chunks
+                            .contains(&ChunkPos::from_world(*position))
+                    })
                 })
                 .count();
 
             while nearby_count < SURFACE_ORE_TARGET_PER_PLAYER {
-                let Some((position, block, chunk)) = self
-                    .spawn_ore_for_player_locked(world_service, &nodes, player)
+                let Some((cluster, updates)) = self
+                    .spawn_ore_for_player_locked(world_service, &clusters, player)
                     .await?
                 else {
                     break;
                 };
-                nodes.insert(position, block);
-                chunk_updates.insert(chunk.position, chunk);
+                for chunk in updates {
+                    chunk_updates.insert(chunk.position, chunk);
+                }
+                clusters.insert(cluster.anchor, cluster);
                 nearby_count += 1;
             }
         }
 
-        *self.nodes.lock().await = nodes;
+        *self.clusters.lock().await = clusters;
         Ok(chunk_updates.into_values().collect())
     }
 
     async fn clear_node(&self, position: WorldPos) {
-        self.nodes.lock().await.remove(&position);
+        let mut clusters = self.clusters.lock().await;
+        let anchors = clusters.keys().copied().collect::<Vec<_>>();
+        for anchor in anchors {
+            let Some(cluster) = clusters.get_mut(&anchor) else {
+                continue;
+            };
+            cluster.positions.retain(|candidate| *candidate != position);
+            if cluster.positions.is_empty() {
+                clusters.remove(&anchor);
+            }
+        }
     }
 
     async fn spawn_ore_for_player_locked(
         &self,
         world_service: &WorldService,
-        nodes: &HashMap<WorldPos, BlockId>,
+        clusters: &HashMap<WorldPos, SurfaceOreCluster>,
         player: &Player,
-    ) -> Result<Option<(WorldPos, BlockId, ChunkData)>> {
+    ) -> Result<Option<(SurfaceOreCluster, Vec<ChunkData>)>> {
         let base_nonce = {
             let mut nonce = self.spawn_nonce.lock().await;
             let value = *nonce;
@@ -1935,12 +1967,12 @@ impl SurfaceOreService {
             else {
                 continue;
             };
-            if nodes.contains_key(&position) {
+            if surface_ore_position_occupied(clusters, position) {
                 continue;
             }
-            let too_close = nodes
-                .keys()
-                .any(|existing| horizontal_world_distance_squared(*existing, position)
+            let too_close = clusters
+                .values()
+                .any(|cluster| horizontal_world_distance_squared(cluster.anchor, position)
                     < SURFACE_ORE_MIN_SPAWN_DISTANCE * SURFACE_ORE_MIN_SPAWN_DISTANCE);
             if too_close {
                 continue;
@@ -1959,13 +1991,49 @@ impl SurfaceOreService {
                 biome,
                 surface,
             );
-            let (result, chunk) = world_service.apply_block_edit(position, block).await?;
-            if !result.accepted {
+
+            let Some(cluster_positions) = build_surface_ore_cluster_positions(
+                world_service,
+                clusters,
+                player,
+                position,
+                base_nonce ^ player.id ^ attempt,
+            )
+            .await?
+            else {
+                continue;
+            };
+
+            let mut chunk_updates = HashMap::<ChunkPos, ChunkData>::new();
+            let mut placed_positions = Vec::new();
+            let mut placement_failed = false;
+            for cluster_position in &cluster_positions {
+                let (result, chunk) = world_service.apply_block_edit(*cluster_position, block).await?;
+                if !result.accepted {
+                    placement_failed = true;
+                    break;
+                }
+                placed_positions.push(*cluster_position);
+                if let Some(chunk) = chunk {
+                    chunk_updates.insert(chunk.position, chunk);
+                }
+            }
+
+            if placement_failed {
+                for placed_position in placed_positions {
+                    let _ = world_service.apply_block_edit(placed_position, BlockId::Air).await;
+                }
                 continue;
             }
-            if let Some(chunk) = chunk {
-                return Ok(Some((position, block, chunk)));
-            }
+
+            return Ok(Some((
+                SurfaceOreCluster {
+                    anchor: position,
+                    block,
+                    positions: cluster_positions,
+                },
+                chunk_updates.into_values().collect(),
+            )));
         }
 
         Ok(None)
@@ -6217,6 +6285,99 @@ fn horizontal_world_distance_squared(a: WorldPos, b: WorldPos) -> f32 {
     dx * dx + dz * dz
 }
 
+fn surface_ore_position_occupied(
+    clusters: &HashMap<WorldPos, SurfaceOreCluster>,
+    position: WorldPos,
+) -> bool {
+    clusters
+        .values()
+        .any(|cluster| cluster.positions.contains(&position))
+}
+
+fn surface_ore_cluster_offsets(seed: u64) -> Vec<(i32, i32)> {
+    let mut offsets: Vec<(i32, i32)> = vec![
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+        (1, 1),
+        (1, -1),
+        (-1, 1),
+        (-1, -1),
+        (2, 0),
+        (-2, 0),
+        (0, 2),
+        (0, -2),
+        (2, 1),
+        (2, -1),
+        (-2, 1),
+        (-2, -1),
+        (1, 2),
+        (-1, 2),
+        (1, -2),
+        (-1, -2),
+    ];
+    offsets.sort_by_key(|(dx, dz)| {
+        let ring = (*dx).abs().max((*dz).abs());
+        let salt = ((u64::from(*dx as u32)) << 32) | u64::from(*dz as u32);
+        let order = (pseudo_unit(seed ^ salt) * 10_000.0) as u32;
+        (ring, order)
+    });
+    offsets
+}
+
+async fn build_surface_ore_cluster_positions(
+    world_service: &WorldService,
+    clusters: &HashMap<WorldPos, SurfaceOreCluster>,
+    player: &Player,
+    anchor: WorldPos,
+    seed: u64,
+) -> Result<Option<Vec<WorldPos>>> {
+    let target_size =
+        SURFACE_ORE_NODE_MIN_BLOCKS + (seed as usize % (SURFACE_ORE_NODE_MAX_BLOCKS - SURFACE_ORE_NODE_MIN_BLOCKS + 1));
+    let mut positions = vec![anchor];
+    let mut seen = HashSet::from([anchor]);
+
+    for (dx, dz) in surface_ore_cluster_offsets(seed) {
+        if positions.len() >= target_size {
+            break;
+        }
+
+        let Some(position) = world_service
+            .find_surface_ore_spawn_position(
+                anchor.x as f32 + dx as f32 + 0.5,
+                anchor.z as f32 + dz as f32 + 0.5,
+            )
+            .await?
+        else {
+            continue;
+        };
+        if !seen.insert(position) {
+            continue;
+        }
+        if !player
+            .subscribed_chunks
+            .contains(&ChunkPos::from_world(position))
+        {
+            continue;
+        }
+        if surface_ore_position_occupied(clusters, position) {
+            continue;
+        }
+        if world_service.block_at(position).await? != Some(BlockId::Air) {
+            continue;
+        }
+
+        positions.push(position);
+    }
+
+    if positions.len() < SURFACE_ORE_NODE_MIN_BLOCKS {
+        return Ok(None);
+    }
+
+    Ok(Some(positions))
+}
+
 fn pseudo_unit(seed: u64) -> f32 {
     let mut value = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -7392,20 +7553,24 @@ mod tests {
             .expect("spawn runtime ore nodes");
 
         assert!(!chunk_updates.is_empty());
-        let nodes = surface_ore_service.nodes.lock().await.clone();
-        assert!(!nodes.is_empty());
-        for (position, block) in nodes {
+        let clusters = surface_ore_service.clusters.lock().await.clone();
+        assert!(!clusters.is_empty());
+        for cluster in clusters.values() {
             assert!(matches!(
-                block,
+                cluster.block,
                 BlockId::CoalOre | BlockId::IronOre | BlockId::GoldOre
             ));
-            assert_eq!(
-                world.block_at(position).await.expect("read spawned ore block"),
-                Some(block)
-            );
-            assert!(player
-                .subscribed_chunks
-                .contains(&ChunkPos::from_world(position)));
+            assert!((SURFACE_ORE_NODE_MIN_BLOCKS..=SURFACE_ORE_NODE_MAX_BLOCKS)
+                .contains(&cluster.positions.len()));
+            for position in &cluster.positions {
+                assert_eq!(
+                    world.block_at(*position).await.expect("read spawned ore block"),
+                    Some(cluster.block)
+                );
+                assert!(player
+                    .subscribed_chunks
+                    .contains(&ChunkPos::from_world(*position)));
+            }
         }
     }
 
@@ -7443,12 +7608,13 @@ mod tests {
             .maintain(&world, &[player.clone()], &HashSet::from([player.id]))
             .await
             .expect("spawn runtime ore nodes");
-        let initial_nodes = surface_ore_service.nodes.lock().await.clone();
-        let (&mined_position, _) = initial_nodes.iter().next().expect("spawned node");
-
-        world.apply_block_edit(mined_position, BlockId::Air)
-            .await
-            .expect("mine runtime ore node");
+        let initial_clusters = surface_ore_service.clusters.lock().await.clone();
+        let (_, mined_cluster) = initial_clusters.iter().next().expect("spawned node");
+        for mined_position in &mined_cluster.positions {
+            world.apply_block_edit(*mined_position, BlockId::Air)
+                .await
+                .expect("mine runtime ore node");
+        }
 
         surface_ore_service
             .maintain(&world, &[], &HashSet::new())
@@ -7456,10 +7622,10 @@ mod tests {
             .expect("prune runtime ore nodes");
 
         assert!(!surface_ore_service
-            .nodes
+            .clusters
             .lock()
             .await
-            .contains_key(&mined_position));
+            .contains_key(&mined_cluster.anchor));
     }
 
     #[tokio::test]

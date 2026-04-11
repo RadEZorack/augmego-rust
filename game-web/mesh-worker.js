@@ -5,7 +5,8 @@ const CHUNK_WORLD_RADIUS = CHUNK_WIDTH * 0.5;
 const DEFAULT_WORLD_SEED = 0xA66DE601n;
 const ATLAS_TILE_COUNT = 12;
 const ATLAS_UV_EPS = 0.001;
-const COAL_ORE_ATLAS_TILE = [9, 4];
+const TEXTURED_BLOCK_TILE_COLUMNS = 6;
+const TEXTURED_BLOCK_TILE_ROW_START = 8;
 
 if (typeof self !== "undefined") {
   self.onmessage = (event) => {
@@ -261,8 +262,9 @@ function placeTree(voxels, x, y, z) {
 
 function emitBlockFaces(voxels, vertices, indices, world, x, y, z, block) {
   const baseColor = blockBaseColor(block);
-  const shadeColor = block === 13 ? [1, 1, 1] : baseColor;
-  const faceUvs = block === 13 ? coalOreFaceUvs() : proceduralFaceUvs();
+  const atlasTile = texturedBlockAtlasTile(block);
+  const shadeColor = atlasTile ? [1, 1, 1] : baseColor;
+  const faceUvs = atlasTile ? atlasFaceUvs(atlasTile[0], atlasTile[1]) : proceduralFaceUvs();
   const faces = [
     { offset: [0, 0, -1], face: "north" },
     { offset: [0, 0, 1], face: "south" },
@@ -426,8 +428,16 @@ function proceduralFaceUvs() {
   return [[2, 2], [3, 2], [3, 3], [2, 3]];
 }
 
-function coalOreFaceUvs() {
-  return atlasFaceUvs(COAL_ORE_ATLAS_TILE[0], COAL_ORE_ATLAS_TILE[1]);
+function texturedBlockAtlasTile(block) {
+  if (block < 1 || block > 15) {
+    return null;
+  }
+
+  const index = block - 1;
+  return [
+    index % TEXTURED_BLOCK_TILE_COLUMNS,
+    TEXTURED_BLOCK_TILE_ROW_START + Math.floor(index / TEXTURED_BLOCK_TILE_COLUMNS),
+  ];
 }
 
 function atlasFaceUvs(tileX, tileY) {

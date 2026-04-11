@@ -1,0 +1,16 @@
+aaabbbcccbbaaaab
+aabcccdddccbbaaa
+bbccddeeedddccbb
+ccddeeffeedddccc
+ddeefffffeedddcc
+ccddeeffeedddccc
+bbccddeeedddccbb
+aabcccdddccbbaaa
+aaabbbcccbbaaaab
+aabcccdddccbbaaa
+bbccddeeedddccbb
+ccddeeffeedddccc
+ddeefffffeedddcc
+ccddeeffeedddccc
+bbccddeeedddccbb
+aabcccdddccbbaaa

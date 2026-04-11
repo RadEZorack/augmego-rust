@@ -9,11 +9,276 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 const TILE_SIZE: u32 = 16;
 const ATLAS_TILES: u32 = 12;
-const COAL_ORE_ATLAS_TILE: (u32, u32) = (9, 4);
+const TEXTURED_BLOCK_TILE_COLUMNS: u32 = 6;
+const TEXTURED_BLOCK_TILE_ROW_START: u32 = 8;
+const MOTTLE_DENSE_TEXTURE_ART: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/textures/mottle_dense_16x16.txt"
+));
+const MOTTLE_SOFT_TEXTURE_ART: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/textures/mottle_soft_16x16.txt"
+));
+const WATER_TEXTURE_ART: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/textures/water_16x16.txt"
+));
+const WOOD_BARK_TEXTURE_ART: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/textures/wood_bark_16x16.txt"
+));
+const LEAF_CANOPY_TEXTURE_ART: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/textures/leaf_canopy_16x16.txt"
+));
+const PLANKS_TEXTURE_ART: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/textures/planks_16x16.txt"
+));
+const GLASS_TEXTURE_ART: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/textures/glass_16x16.txt"
+));
+const LANTERN_TEXTURE_ART: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/textures/lantern_16x16.txt"
+));
+const CRATE_TEXTURE_ART: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/textures/crate_16x16.txt"
+));
+const ORE_TEXTURE_ART: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/textures/ore_16x16.txt"
+));
+const SANDSTONE_TEXTURE_ART: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/textures/sandstone_16x16.txt"
+));
 const COAL_ORE_TEXTURE_ART: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../assets/textures/coal_ore_16x16.txt"
 ));
+type PaletteEntry = (char, [u8; 4]);
+
+struct AsciiTextureDefinition {
+    name: &'static str,
+    block_id: u32,
+    art: &'static str,
+    palette: &'static [PaletteEntry],
+}
+
+const fn textured_block_tile(block_id: u32) -> (u32, u32) {
+    let index = block_id - 1;
+    (
+        index % TEXTURED_BLOCK_TILE_COLUMNS,
+        TEXTURED_BLOCK_TILE_ROW_START + index / TEXTURED_BLOCK_TILE_COLUMNS,
+    )
+}
+
+const GRASS_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [142, 184, 84, 255]),
+    ('b', [112, 164, 69, 255]),
+    ('c', [78, 132, 52, 255]),
+    ('d', [154, 163, 80, 255]),
+    ('e', [47, 96, 38, 255]),
+];
+const DIRT_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [157, 116, 81, 255]),
+    ('b', [134, 93, 61, 255]),
+    ('c', [112, 74, 47, 255]),
+    ('d', [90, 58, 36, 255]),
+    ('e', [67, 42, 27, 255]),
+];
+const STONE_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [182, 186, 194, 255]),
+    ('b', [152, 156, 165, 255]),
+    ('c', [126, 130, 139, 255]),
+    ('d', [97, 102, 112, 255]),
+    ('e', [74, 79, 88, 255]),
+];
+const SAND_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [244, 229, 184, 255]),
+    ('b', [230, 212, 154, 255]),
+    ('c', [214, 192, 129, 255]),
+    ('d', [189, 166, 107, 255]),
+];
+const WATER_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [197, 230, 247, 255]),
+    ('b', [128, 188, 230, 255]),
+    ('c', [90, 154, 214, 255]),
+    ('d', [53, 112, 184, 255]),
+    ('e', [33, 82, 154, 255]),
+    ('f', [224, 245, 255, 255]),
+];
+const LOG_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [198, 154, 96, 255]),
+    ('b', [182, 136, 84, 255]),
+    ('c', [159, 117, 70, 255]),
+    ('d', [132, 94, 56, 255]),
+    ('e', [103, 71, 42, 255]),
+    ('f', [78, 53, 31, 255]),
+];
+const LEAVES_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [140, 185, 84, 255]),
+    ('b', [108, 163, 70, 255]),
+    ('c', [79, 133, 54, 255]),
+    ('d', [56, 103, 42, 255]),
+    ('e', [158, 176, 76, 255]),
+];
+const PLANKS_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [210, 167, 109, 255]),
+    ('b', [183, 140, 89, 255]),
+    ('c', [155, 114, 68, 255]),
+    ('d', [125, 87, 49, 255]),
+    ('e', [95, 63, 35, 255]),
+];
+const GLASS_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [239, 250, 255, 255]),
+    ('b', [213, 239, 249, 255]),
+    ('c', [183, 223, 239, 255]),
+    ('d', [141, 191, 215, 255]),
+    ('e', [106, 161, 190, 255]),
+];
+const LANTERN_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [255, 243, 190, 255]),
+    ('b', [247, 210, 119, 255]),
+    ('c', [188, 142, 67, 255]),
+    ('d', [131, 92, 39, 255]),
+    ('e', [87, 60, 26, 255]),
+    ('f', [255, 229, 151, 255]),
+    ('g', [255, 248, 215, 255]),
+];
+const STORAGE_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [191, 145, 90, 255]),
+    ('b', [162, 117, 68, 255]),
+    ('c', [131, 90, 51, 255]),
+    ('d', [87, 96, 110, 255]),
+    ('e', [103, 68, 40, 255]),
+];
+const GOLD_ORE_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [182, 186, 194, 255]),
+    ('b', [149, 154, 164, 255]),
+    ('c', [119, 124, 133, 255]),
+    ('d', [228, 187, 63, 255]),
+    ('e', [186, 145, 39, 255]),
+    ('f', [93, 98, 107, 255]),
+];
+const COAL_ORE_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [149, 153, 161, 255]),
+    ('b', [126, 130, 138, 255]),
+    ('c', [99, 103, 111, 255]),
+    ('d', [20, 21, 26, 255]),
+    ('e', [44, 46, 53, 255]),
+    ('f', [78, 81, 92, 255]),
+];
+const IRON_ORE_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [180, 184, 191, 255]),
+    ('b', [149, 153, 161, 255]),
+    ('c', [119, 123, 131, 255]),
+    ('d', [173, 111, 78, 255]),
+    ('e', [136, 83, 55, 255]),
+    ('f', [94, 98, 106, 255]),
+];
+const SANDSTONE_TEXTURE_PALETTE: &[PaletteEntry] = &[
+    ('a', [236, 217, 173, 255]),
+    ('b', [216, 195, 141, 255]),
+    ('c', [194, 171, 118, 255]),
+    ('d', [166, 145, 98, 255]),
+    ('e', [129, 109, 71, 255]),
+];
+const VOXEL_TEXTURE_DEFINITIONS: &[AsciiTextureDefinition] = &[
+    AsciiTextureDefinition {
+        name: "Grass",
+        block_id: 1,
+        art: MOTTLE_DENSE_TEXTURE_ART,
+        palette: GRASS_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Dirt",
+        block_id: 2,
+        art: MOTTLE_DENSE_TEXTURE_ART,
+        palette: DIRT_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Stone",
+        block_id: 3,
+        art: MOTTLE_DENSE_TEXTURE_ART,
+        palette: STONE_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Sand",
+        block_id: 4,
+        art: MOTTLE_SOFT_TEXTURE_ART,
+        palette: SAND_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Water",
+        block_id: 5,
+        art: WATER_TEXTURE_ART,
+        palette: WATER_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Log",
+        block_id: 6,
+        art: WOOD_BARK_TEXTURE_ART,
+        palette: LOG_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Leaves",
+        block_id: 7,
+        art: LEAF_CANOPY_TEXTURE_ART,
+        palette: LEAVES_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Planks",
+        block_id: 8,
+        art: PLANKS_TEXTURE_ART,
+        palette: PLANKS_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Glass",
+        block_id: 9,
+        art: GLASS_TEXTURE_ART,
+        palette: GLASS_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Lantern",
+        block_id: 10,
+        art: LANTERN_TEXTURE_ART,
+        palette: LANTERN_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Storage",
+        block_id: 11,
+        art: CRATE_TEXTURE_ART,
+        palette: STORAGE_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Gold Ore",
+        block_id: 12,
+        art: ORE_TEXTURE_ART,
+        palette: GOLD_ORE_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Coal Ore",
+        block_id: 13,
+        art: COAL_ORE_TEXTURE_ART,
+        palette: COAL_ORE_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Iron Ore",
+        block_id: 14,
+        art: ORE_TEXTURE_ART,
+        palette: IRON_ORE_TEXTURE_PALETTE,
+    },
+    AsciiTextureDefinition {
+        name: "Sandstone",
+        block_id: 15,
+        art: SANDSTONE_TEXTURE_ART,
+        palette: SANDSTONE_TEXTURE_PALETTE,
+    },
+];
 pub const MAX_SKIN_JOINTS: usize = 128;
 
 #[repr(C)]
@@ -212,7 +477,7 @@ impl MaterialTarget {
                 );
             }
         }
-        fill_coal_ore_tile(&mut pixels, atlas_size);
+        fill_voxel_texture_tiles(&mut pixels, atlas_size);
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("material-atlas"),
@@ -1299,15 +1564,22 @@ fn fill_tile(pixels: &mut [u8], atlas_size: u32, tile_x: u32, tile_y: u32, base:
     fill_checker_tile(pixels, atlas_size, start_x, start_y, base);
 }
 
-fn fill_coal_ore_tile(pixels: &mut [u8], atlas_size: u32) {
-    let coal_pixels = parse_ascii_tile_rgba(COAL_ORE_TEXTURE_ART, coal_ore_texel)
-        .expect("coal ore texture asset should be a valid 16x16 sprite");
-    blit_tile_rgba(pixels, atlas_size, COAL_ORE_ATLAS_TILE, &coal_pixels);
+fn fill_voxel_texture_tiles(pixels: &mut [u8], atlas_size: u32) {
+    for definition in VOXEL_TEXTURE_DEFINITIONS {
+        let tile_pixels = parse_ascii_tile_rgba(definition.art, definition.palette)
+            .unwrap_or_else(|error| panic!("invalid {} texture asset: {error}", definition.name));
+        blit_tile_rgba(
+            pixels,
+            atlas_size,
+            textured_block_tile(definition.block_id),
+            &tile_pixels,
+        );
+    }
 }
 
 fn parse_ascii_tile_rgba(
     art: &str,
-    palette: fn(char) -> Option<[u8; 4]>,
+    palette: &[PaletteEntry],
 ) -> std::result::Result<Vec<u8>, String> {
     let rows = art
         .lines()
@@ -1335,9 +1607,12 @@ fn parse_ascii_tile_rgba(
         }
 
         for (x, ch) in chars.into_iter().enumerate() {
-            let color = palette(ch).ok_or_else(|| {
+            let color = palette
+                .iter()
+                .find_map(|(key, color)| (*key == ch).then_some(*color))
+                .ok_or_else(|| {
                 format!("unknown palette key '{ch}' at column {x}, row {y}")
-            })?;
+                })?;
             pixels.extend_from_slice(&color);
         }
     }
@@ -1362,18 +1637,6 @@ fn blit_tile_rgba(pixels: &mut [u8], atlas_size: u32, tile: (u32, u32), tile_pix
             pixels[dest_offset..dest_offset + 4]
                 .copy_from_slice(&tile_pixels[source_offset..source_offset + 4]);
         }
-    }
-}
-
-fn coal_ore_texel(ch: char) -> Option<[u8; 4]> {
-    match ch {
-        'a' => Some([149, 153, 161, 255]),
-        'b' => Some([126, 130, 138, 255]),
-        'c' => Some([99, 103, 111, 255]),
-        'd' => Some([20, 21, 26, 255]),
-        'e' => Some([44, 46, 53, 255]),
-        'f' => Some([78, 81, 92, 255]),
-        _ => None,
     }
 }
 
@@ -1476,12 +1739,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coal_ore_texture_asset_parses_to_full_rgba_tile() {
-        let pixels =
-            parse_ascii_tile_rgba(COAL_ORE_TEXTURE_ART, coal_ore_texel).expect("valid coal art");
+    fn voxel_texture_assets_parse_to_full_rgba_tiles() {
+        for definition in VOXEL_TEXTURE_DEFINITIONS {
+            let pixels = parse_ascii_tile_rgba(definition.art, definition.palette)
+                .unwrap_or_else(|error| panic!("invalid {} texture: {error}", definition.name));
+            let tile = textured_block_tile(definition.block_id);
 
-        assert_eq!(pixels.len(), (TILE_SIZE * TILE_SIZE * 4) as usize);
-        assert!(pixels.chunks_exact(4).any(|pixel| pixel[0] <= 24));
-        assert!(pixels.chunks_exact(4).any(|pixel| pixel[0] >= 140));
+            assert_eq!(
+                pixels.len(),
+                (TILE_SIZE * TILE_SIZE * 4) as usize,
+                "{} texture should fill one 16x16 tile",
+                definition.name
+            );
+            assert!(
+                tile.0 < ATLAS_TILES && tile.1 < ATLAS_TILES,
+                "{} texture tile should fit in atlas",
+                definition.name
+            );
+            assert!(
+                pixels.chunks_exact(4).any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
+                "{} texture should include some color variation",
+                definition.name
+            );
+        }
     }
 }

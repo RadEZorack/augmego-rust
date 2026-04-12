@@ -43,6 +43,7 @@ const PHASE_FAILED: &str = "FAILED";
 const PORTRAIT_PROMPT_IDENTITY: &str = "Create a realistic full-body studio portrait of the same primary subject from the reference photo. The subject may be a human, animal, mascot, plush, costume head, or anthropomorphic/fursuit character. Preserve the exact identity and likeness of that one subject, including the face, muzzle or snout, ears, eyes, fur or skin color, markings, hair, glasses, expression, and distinctive accessories. If the subject is non-human, keep the same species and design, and do not humanize it unless the reference already depicts an anthropomorphic character. Never blend traits from different faces or bodies, never swap identities, and never add extra people or animals; if multiple faces appear, use only the main centered subject. Extrapolate a believable full body in clean, consistent proportions for that same subject.";
 const PORTRAIT_PROMPT_TAIL: &str = "Standing straight in a neutral front-facing pose, all limbs fully visible and slightly away from the torso when applicable, hands, paws, forelegs, or equivalent front limbs visible, feet, hind legs, or equivalent lower limbs visible, centered composition, soft studio lighting, seamless white background, high detail, natural colors. Keep the silhouette unobstructed and limb boundaries clear for downstream 3D rigging.";
 const DEFAULT_GENERATED_AVATAR_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+pub const DEFAULT_AVATAR_MESH_TARGET_POLYCOUNT: i32 = 9000;
 
 #[derive(Clone, Debug)]
 pub struct AvatarGenerationConfig {
@@ -54,6 +55,7 @@ pub struct AvatarGenerationConfig {
     pub generated_avatar_texture_jpeg_quality: u8,
     pub meshy_api_base_url: String,
     pub meshy_api_key: String,
+    pub meshy_target_polycount: i32,
     pub avatar_generation_idle_action_id: i32,
     pub avatar_generation_dance_action_id: i32,
     pub avatar_generation_worker_interval: Duration,
@@ -1193,7 +1195,7 @@ impl AvatarGenerationClient {
                 "image_url": image_source,
                 "ai_model": "meshy-6",
                 "should_remesh": true,
-                "target_polycount": 3000,
+                "target_polycount": self.config.meshy_target_polycount,
                 "topology": "triangle",
                 "should_texture": true,
                 "enable_pbr": false,
@@ -1896,6 +1898,11 @@ mod tests {
     }
 
     #[test]
+    fn default_avatar_mesh_target_polycount_is_nine_thousand() {
+        assert_eq!(DEFAULT_AVATAR_MESH_TARGET_POLYCOUNT, 9000);
+    }
+
+    #[test]
     fn portrait_prompt_adds_selected_style_fragments() {
         let prompt = build_portrait_prompt(&AvatarStyleOptions {
             outfit_style: AvatarOutfitStyle::Suit,
@@ -2040,6 +2047,7 @@ mod tests {
                 generated_avatar_texture_jpeg_quality: 85,
                 meshy_api_base_url: "https://api.meshy.ai".to_string(),
                 meshy_api_key: "test".to_string(),
+                meshy_target_polycount: DEFAULT_AVATAR_MESH_TARGET_POLYCOUNT,
                 avatar_generation_idle_action_id: 0,
                 avatar_generation_dance_action_id: 22,
                 avatar_generation_worker_interval: Duration::from_secs(30),
@@ -2154,6 +2162,7 @@ mod tests {
                 generated_avatar_texture_jpeg_quality: 85,
                 meshy_api_base_url: "https://api.meshy.ai".to_string(),
                 meshy_api_key: "test".to_string(),
+                meshy_target_polycount: DEFAULT_AVATAR_MESH_TARGET_POLYCOUNT,
                 avatar_generation_idle_action_id: 0,
                 avatar_generation_dance_action_id: 22,
                 avatar_generation_worker_interval: Duration::from_secs(30),

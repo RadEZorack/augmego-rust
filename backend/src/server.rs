@@ -4,7 +4,7 @@ use crate::account::{
 use crate::auth::{SameSitePolicy, SessionCookieConfig};
 use crate::avatar_generation::{
     AvatarGenerationAssetKind, AvatarGenerationAssetResponse, AvatarGenerationClient,
-    AvatarGenerationConfig,
+    AvatarGenerationConfig, DEFAULT_AVATAR_MESH_TARGET_POLYCOUNT,
 };
 use crate::block_inventory::{BlockInventoryService, PlayerBlockInventory};
 use crate::db;
@@ -2737,6 +2737,9 @@ impl VoxelServer {
                 generated_avatar_texture_jpeg_quality: config.generated_avatar_texture_jpeg_quality,
                 meshy_api_base_url: config.meshy_api_base_url.clone(),
                 meshy_api_key: config.meshy_api_key.clone(),
+                meshy_target_polycount: config
+                    .meshy_text_to_3d_target_polycount
+                    .unwrap_or(DEFAULT_AVATAR_MESH_TARGET_POLYCOUNT),
                 avatar_generation_idle_action_id: config.avatar_generation_idle_action_id,
                 avatar_generation_dance_action_id: config.avatar_generation_dance_action_id,
                 avatar_generation_worker_interval: config.avatar_generation_worker_interval,

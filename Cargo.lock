@@ -997,6 +997,8 @@ dependencies = [
  "glam",
  "gltf",
  "js-sys",
+ "serde",
+ "serde_json",
  "shared_math",
  "shared_protocol",
  "shared_world",

@@ -1,4 +1,8 @@
-use crate::account::{AccountService, AvatarSelection};
+use crate::account::{
+    AccountService, AvatarBodyBuild, AvatarFitStyle, AvatarHeadwear, AvatarMaterialStyle,
+    AvatarNeckAccessory, AvatarOutfitStyle, AvatarPoseEnergy, AvatarSelection, AvatarSkinTone,
+    AvatarStyleOptions,
+};
 use crate::generated_asset::{downscale_glb_embedded_images, maybe_gzip_bytes};
 use crate::storage::{StorageObject, StorageService};
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,7 +13,7 @@ use reqwest::Client;
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{PgPool, Row, postgres::PgRow};
+use sqlx::{PgPool, Row, postgres::PgRow, types::Json};
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -36,7 +40,8 @@ const PHASE_FINALIZING: &str = "FINALIZING";
 const PHASE_READY: &str = "READY";
 const PHASE_FAILED: &str = "FAILED";
 
-const PORTRAIT_PROMPT: &str = "Create a realistic full-body studio portrait of the same primary subject from the reference photo. The subject may be a human, animal, mascot, plush, costume head, or anthropomorphic/fursuit character. Preserve the exact identity and likeness of that one subject, including the face, muzzle or snout, ears, eyes, fur or skin color, markings, hair, glasses, expression, and distinctive accessories. If the subject is non-human, keep the same species and design, and do not humanize it unless the reference already depicts an anthropomorphic character. Never blend traits from different faces or bodies, never swap identities, and never add extra people or animals; if multiple faces appear, use only the main centered subject. Extrapolate a believable full body in clean, consistent proportions for that same subject. Dress the subject in a tailored suit with a shirt and tie only when it fits the reference; otherwise keep the clothing or costume styling consistent with the source. Standing straight in a neutral front-facing pose, all limbs fully visible and slightly away from the torso when applicable, hands, paws, forelegs, or equivalent front limbs visible, feet, hind legs, or equivalent lower limbs visible, centered composition, soft studio lighting, seamless white background, high detail, natural colors. Keep the silhouette unobstructed and limb boundaries clear for downstream 3D rigging.";
+const PORTRAIT_PROMPT_IDENTITY: &str = "Create a realistic full-body studio portrait of the same primary subject from the reference photo. The subject may be a human, animal, mascot, plush, costume head, or anthropomorphic/fursuit character. Preserve the exact identity and likeness of that one subject, including the face, muzzle or snout, ears, eyes, fur or skin color, markings, hair, glasses, expression, and distinctive accessories. If the subject is non-human, keep the same species and design, and do not humanize it unless the reference already depicts an anthropomorphic character. Never blend traits from different faces or bodies, never swap identities, and never add extra people or animals; if multiple faces appear, use only the main centered subject. Extrapolate a believable full body in clean, consistent proportions for that same subject.";
+const PORTRAIT_PROMPT_TAIL: &str = "Standing straight in a neutral front-facing pose, all limbs fully visible and slightly away from the torso when applicable, hands, paws, forelegs, or equivalent front limbs visible, feet, hind legs, or equivalent lower limbs visible, centered composition, soft studio lighting, seamless white background, high detail, natural colors. Keep the silhouette unobstructed and limb boundaries clear for downstream 3D rigging.";
 const DEFAULT_GENERATED_AVATAR_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 #[derive(Clone, Debug)]
@@ -119,6 +124,8 @@ struct AvatarGenerationTaskRecord {
     provider_progress: Option<i32>,
     status_message: Option<String>,
     failure_reason: Option<String>,
+    style_options: Option<AvatarStyleOptions>,
+    effective_prompt: Option<String>,
     openai_response_id: Option<String>,
     meshy_model_task_id: Option<String>,
     meshy_rigging_task_id: Option<String>,
@@ -149,6 +156,10 @@ impl AvatarGenerationTaskRecord {
             provider_progress: row.try_get("provider_progress")?,
             status_message: row.try_get("status_message")?,
             failure_reason: row.try_get("failure_reason")?,
+            style_options: row
+                .try_get::<Option<Json<AvatarStyleOptions>>, _>("style_options")?
+                .map(|value| value.0),
+            effective_prompt: row.try_get("effective_prompt")?,
             openai_response_id: row.try_get("openai_response_id")?,
             meshy_model_task_id: row.try_get("meshy_model_task_id")?,
             meshy_rigging_task_id: row.try_get("meshy_rigging_task_id")?,
@@ -289,10 +300,13 @@ impl AvatarGenerationClient {
         user_id: Uuid,
         bytes: &[u8],
         content_type: &str,
+        style_options: &AvatarStyleOptions,
     ) -> Result<AvatarGenerationTaskView> {
         let normalized_content_type = normalize_selfie_content_type(content_type)
             .ok_or_else(|| anyhow!("unsupported selfie content type"))?;
         self.supersede_active_tasks_for_user(user_id).await?;
+        let style_options = style_options.clone();
+        let effective_prompt = build_portrait_prompt(&style_options);
 
         let task_id = Uuid::new_v4();
         let selfie_storage_key = self.task_storage_key(
@@ -318,11 +332,13 @@ impl AvatarGenerationClient {
                 phase,
                 progress_percent,
                 status_message,
+                style_options,
+                effective_prompt,
                 selfie_storage_key,
                 selfie_content_type,
                 created_at,
                 updated_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())",
         )
         .bind(task_id)
         .bind(user_id)
@@ -330,11 +346,16 @@ impl AvatarGenerationClient {
         .bind(PHASE_UPLOADED)
         .bind(5_i32)
         .bind(message_for_phase(PHASE_UPLOADED))
+        .bind(Json(style_options.clone()))
+        .bind(&effective_prompt)
         .bind(&selfie_storage_key)
         .bind(normalized_content_type)
         .execute(&self.pool)
         .await
         .context("insert player avatar generation task")?;
+        self.account_service
+            .save_avatar_generation_preferences(user_id, &style_options)
+            .await?;
 
         let task = self
             .load_task_by_id(task_id)
@@ -501,8 +522,11 @@ impl AvatarGenerationClient {
             .as_deref()
             .ok_or_else(|| anyhow!("task selfie storage key is missing"))?;
         let selfie = self.read_required_object(selfie_storage_key).await?;
+        let prompt = task.effective_prompt.clone().unwrap_or_else(|| {
+            build_portrait_prompt(&task.style_options.clone().unwrap_or_default())
+        });
         let (portrait_bytes, portrait_content_type, openai_response_id) =
-            self.generate_portrait_from_selfie(&selfie).await?;
+            self.generate_portrait_from_selfie(&selfie, &prompt).await?;
         let portrait_storage_key =
             self.task_storage_key(task.user_id, task.id, "portrait/full-body.png");
         self.storage
@@ -1070,6 +1094,7 @@ impl AvatarGenerationClient {
     async fn generate_portrait_from_selfie(
         &self,
         selfie: &StorageObject,
+        prompt: &str,
     ) -> Result<(Vec<u8>, String, Option<String>)> {
         let url = format!(
             "{}/images/edits",
@@ -1081,7 +1106,7 @@ impl AvatarGenerationClient {
             .context("set selfie multipart mime")?;
         let form = Form::new()
             .text("model", self.config.openai_avatar_image_model.clone())
-            .text("prompt", PORTRAIT_PROMPT.to_string())
+            .text("prompt", prompt.to_string())
             .text("size", "1024x1536".to_string())
             .text("quality", "high".to_string())
             .text("input_fidelity", "high".to_string())
@@ -1559,6 +1584,214 @@ fn data_uri(bytes: &[u8], content_type: &str) -> String {
     )
 }
 
+fn build_portrait_prompt(style_options: &AvatarStyleOptions) -> String {
+    let mut sections = vec![PORTRAIT_PROMPT_IDENTITY.to_string()];
+
+    if let Some(fragment) = outfit_style_fragment(style_options.outfit_style) {
+        sections.push(fragment.to_string());
+    }
+    if let Some(fragment) = fit_style_fragment(style_options.fit_style) {
+        sections.push(fragment.to_string());
+    }
+    if let Some(fragment) = neck_accessory_fragment(style_options.neck_accessory) {
+        sections.push(fragment.to_string());
+    }
+    if let Some(fragment) = headwear_fragment(style_options.headwear) {
+        sections.push(fragment.to_string());
+    }
+    if let Some(fragment) = body_build_fragment(style_options.body_build) {
+        sections.push(fragment);
+    }
+    if let Some(fragment) = skin_tone_fragment(style_options.skin_tone) {
+        sections.push(fragment);
+    }
+    if let Some(fragment) = pose_energy_fragment(style_options.pose_energy) {
+        sections.push(fragment.to_string());
+    }
+    if let Some(fragment) = material_style_fragment(style_options.material_style) {
+        sections.push(fragment.to_string());
+    }
+    if let Some(fragment) = accessory_fragment(style_options) {
+        sections.push(fragment);
+    }
+
+    sections.push(PORTRAIT_PROMPT_TAIL.to_string());
+    sections.join(" ")
+}
+
+fn outfit_style_fragment(style: AvatarOutfitStyle) -> Option<&'static str> {
+    match style {
+        AvatarOutfitStyle::MatchReference => None,
+        AvatarOutfitStyle::Suit => Some(
+            "Use a polished tailored suit that feels appropriate for the subject and preserves their identity.",
+        ),
+        AvatarOutfitStyle::Dress => Some(
+            "Use an elegant dress appropriate for the subject while preserving the same identity.",
+        ),
+        AvatarOutfitStyle::Casual => {
+            Some("Use clean casual clothing with believable everyday styling.")
+        }
+        AvatarOutfitStyle::Streetwear => {
+            Some("Use modern streetwear with layered styling and contemporary detail.")
+        }
+        AvatarOutfitStyle::Fantasy => {
+            Some("Use fantasy-inspired clothing with stylized but believable costume detail.")
+        }
+        AvatarOutfitStyle::Armor => Some(
+            "Use lightweight heroic armor or protective costume elements that still allow a clear silhouette.",
+        ),
+    }
+}
+
+fn fit_style_fragment(style: AvatarFitStyle) -> Option<&'static str> {
+    match style {
+        AvatarFitStyle::MatchReference => None,
+        AvatarFitStyle::Tailored => Some("Favor a tailored, fitted silhouette."),
+        AvatarFitStyle::Relaxed => Some("Favor a relaxed silhouette."),
+        AvatarFitStyle::Oversized => Some("Favor slightly oversized clothing proportions."),
+    }
+}
+
+fn neck_accessory_fragment(style: AvatarNeckAccessory) -> Option<&'static str> {
+    match style {
+        AvatarNeckAccessory::None => None,
+        AvatarNeckAccessory::Tie => Some("Add a tie if it fits the chosen outfit."),
+        AvatarNeckAccessory::BowTie => Some("Add a bow tie if it fits the chosen outfit."),
+        AvatarNeckAccessory::Necklace => Some("Add a necklace that complements the subject."),
+        AvatarNeckAccessory::Scarf => Some("Add a scarf that keeps the neck silhouette readable."),
+    }
+}
+
+fn headwear_fragment(style: AvatarHeadwear) -> Option<&'static str> {
+    match style {
+        AvatarHeadwear::None => None,
+        AvatarHeadwear::Hat => {
+            Some("Add a hat only if the face and defining features remain clearly visible.")
+        }
+        AvatarHeadwear::Beanie => {
+            Some("Add a beanie only if the face and defining features remain clearly visible.")
+        }
+        AvatarHeadwear::Hood => {
+            Some("Add a hood only if the face and defining features remain clearly visible.")
+        }
+        AvatarHeadwear::Crown => {
+            Some("Add a crown only if the face and defining features remain clearly visible.")
+        }
+    }
+}
+
+fn body_build_fragment(style: AvatarBodyBuild) -> Option<String> {
+    match style {
+        AvatarBodyBuild::MatchReference => None,
+        AvatarBodyBuild::Slim => Some(human_subject_guard(
+            "use a slim body build while preserving the subject's identity and proportions.",
+        )),
+        AvatarBodyBuild::Average => Some(human_subject_guard(
+            "use an average body build while preserving the subject's identity and proportions.",
+        )),
+        AvatarBodyBuild::Broad => Some(human_subject_guard(
+            "use a broad body build while preserving the subject's identity and proportions.",
+        )),
+        AvatarBodyBuild::Plus => Some(human_subject_guard(
+            "use a plus-size body build while preserving the subject's identity and proportions.",
+        )),
+    }
+}
+
+fn skin_tone_fragment(style: AvatarSkinTone) -> Option<String> {
+    match style {
+        AvatarSkinTone::MatchReference => None,
+        AvatarSkinTone::Fair => Some(human_subject_guard(
+            "use a fair skin tone while preserving the subject's identity.",
+        )),
+        AvatarSkinTone::Light => Some(human_subject_guard(
+            "use a light skin tone while preserving the subject's identity.",
+        )),
+        AvatarSkinTone::Medium => Some(human_subject_guard(
+            "use a medium skin tone while preserving the subject's identity.",
+        )),
+        AvatarSkinTone::Tan => Some(human_subject_guard(
+            "use a tan skin tone while preserving the subject's identity.",
+        )),
+        AvatarSkinTone::Deep => Some(human_subject_guard(
+            "use a deep skin tone while preserving the subject's identity.",
+        )),
+    }
+}
+
+fn pose_energy_fragment(style: AvatarPoseEnergy) -> Option<&'static str> {
+    match style {
+        AvatarPoseEnergy::Neutral => None,
+        AvatarPoseEnergy::Confident => Some(
+            "Give the pose a confident, poised energy while keeping it front-facing and rig-friendly.",
+        ),
+        AvatarPoseEnergy::Playful => {
+            Some("Give the pose a playful energy while keeping it front-facing and rig-friendly.")
+        }
+        AvatarPoseEnergy::Heroic => {
+            Some("Give the pose a heroic energy while keeping it front-facing and rig-friendly.")
+        }
+    }
+}
+
+fn material_style_fragment(style: AvatarMaterialStyle) -> Option<&'static str> {
+    match style {
+        AvatarMaterialStyle::Natural => None,
+        AvatarMaterialStyle::Glam => {
+            Some("Use slightly glam styling with polished finishes and subtle shine.")
+        }
+        AvatarMaterialStyle::SoftFabric => {
+            Some("Favor soft fabric textures and cozy material detail.")
+        }
+        AvatarMaterialStyle::FormalLuxury => {
+            Some("Favor premium formal materials with refined texture detail.")
+        }
+    }
+}
+
+fn accessory_fragment(style_options: &AvatarStyleOptions) -> Option<String> {
+    let mut accessories = Vec::new();
+    if style_options.ring {
+        accessories.push("add a ring when anatomically appropriate");
+    }
+    if style_options.earrings {
+        accessories.push("add earrings when anatomically appropriate");
+    }
+    if style_options.bracelet {
+        accessories.push("add a bracelet when anatomically appropriate");
+    }
+    if style_options.watch {
+        accessories.push("add a watch when anatomically appropriate");
+    }
+    if style_options.gloves {
+        accessories.push("add gloves if they do not hide the silhouette");
+    }
+    if style_options.cape {
+        accessories.push("add a cape that stays readable and does not block the limbs");
+    }
+
+    if accessories.is_empty() {
+        None
+    } else {
+        Some(format!("Also {}.", join_phrase_list(&accessories)))
+    }
+}
+
+fn human_subject_guard(instruction: &str) -> String {
+    format!(
+        "For clearly human or humanoid subjects only, {instruction} Otherwise keep the reference appearance unchanged."
+    )
+}
+
+fn join_phrase_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [single] => single.to_string(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
 fn extract_created_task_id(payload: MeshyCreateTaskResponse) -> Option<String> {
     payload
         .result
@@ -1642,7 +1875,11 @@ fn meshy_task_error_message(task_error: Option<&MeshyTaskError>, fallback_status
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::{AccountConfig, AccountService};
+    use crate::account::{
+        AccountConfig, AccountService, AvatarBodyBuild, AvatarFitStyle, AvatarHeadwear,
+        AvatarMaterialStyle, AvatarNeckAccessory, AvatarOutfitStyle, AvatarPoseEnergy,
+        AvatarSkinTone, AvatarStyleOptions,
+    };
     use crate::auth::{SameSitePolicy, SessionCookieConfig};
     use crate::db;
     use crate::server::ServerConfig;
@@ -1650,11 +1887,75 @@ mod tests {
     use std::env;
 
     #[test]
-    fn portrait_prompt_mentions_rigging_constraints() {
-        assert!(PORTRAIT_PROMPT.contains("animal"));
-        assert!(PORTRAIT_PROMPT.contains("Never blend traits from different faces or bodies"));
-        assert!(PORTRAIT_PROMPT.contains("all limbs fully visible"));
-        assert!(PORTRAIT_PROMPT.contains("downstream 3D rigging"));
+    fn default_portrait_prompt_mentions_identity_and_rigging_constraints() {
+        let prompt = build_portrait_prompt(&AvatarStyleOptions::default());
+        assert!(prompt.contains("animal"));
+        assert!(prompt.contains("Never blend traits from different faces or bodies"));
+        assert!(prompt.contains("all limbs fully visible"));
+        assert!(prompt.contains("downstream 3D rigging"));
+    }
+
+    #[test]
+    fn portrait_prompt_adds_selected_style_fragments() {
+        let prompt = build_portrait_prompt(&AvatarStyleOptions {
+            outfit_style: AvatarOutfitStyle::Suit,
+            fit_style: AvatarFitStyle::Tailored,
+            neck_accessory: AvatarNeckAccessory::Tie,
+            headwear: AvatarHeadwear::Hat,
+            body_build: AvatarBodyBuild::MatchReference,
+            skin_tone: AvatarSkinTone::MatchReference,
+            pose_energy: AvatarPoseEnergy::Confident,
+            material_style: AvatarMaterialStyle::FormalLuxury,
+            ring: false,
+            earrings: false,
+            bracelet: false,
+            watch: false,
+            gloves: false,
+            cape: false,
+        });
+
+        assert!(prompt.contains("Use a polished tailored suit"));
+        assert!(prompt.contains("Favor a tailored, fitted silhouette."));
+        assert!(prompt.contains("Add a tie"));
+        assert!(prompt.contains("Add a hat"));
+        assert!(prompt.contains("confident, poised energy"));
+        assert!(prompt.contains("premium formal materials"));
+        assert!(!prompt.contains("Add a necklace"));
+        assert!(!prompt.contains("Add a scarf"));
+    }
+
+    #[test]
+    fn portrait_prompt_stacks_accessories_in_one_clause() {
+        let prompt = build_portrait_prompt(&AvatarStyleOptions {
+            ring: true,
+            earrings: true,
+            bracelet: true,
+            watch: true,
+            gloves: true,
+            cape: true,
+            ..AvatarStyleOptions::default()
+        });
+
+        assert!(prompt.contains("Also add a ring when anatomically appropriate"));
+        assert!(prompt.contains("add earrings when anatomically appropriate"));
+        assert!(prompt.contains("add a bracelet when anatomically appropriate"));
+        assert!(prompt.contains("add a watch when anatomically appropriate"));
+        assert!(prompt.contains("add gloves if they do not hide the silhouette"));
+        assert!(prompt.contains("add a cape that stays readable and does not block the limbs"));
+    }
+
+    #[test]
+    fn portrait_prompt_guards_human_only_adjustments() {
+        let prompt = build_portrait_prompt(&AvatarStyleOptions {
+            body_build: AvatarBodyBuild::Slim,
+            skin_tone: AvatarSkinTone::Deep,
+            ..AvatarStyleOptions::default()
+        });
+
+        assert!(prompt.contains("For clearly human or humanoid subjects only"));
+        assert!(prompt.contains("use a slim body build"));
+        assert!(prompt.contains("use a deep skin tone"));
+        assert!(prompt.contains("Otherwise keep the reference appearance unchanged."));
     }
 
     #[test]
@@ -1756,11 +2057,16 @@ mod tests {
             .expect("insert user");
 
         let first = client
-            .create_or_get_active_task(user_id, b"png", "image/png")
+            .create_or_get_active_task(user_id, b"png", "image/png", &AvatarStyleOptions::default())
             .await
             .expect("create task");
         let second = client
-            .create_or_get_active_task(user_id, b"png-2", "image/png")
+            .create_or_get_active_task(
+                user_id,
+                b"png-2",
+                "image/png",
+                &AvatarStyleOptions::default(),
+            )
             .await
             .expect("create superseding task");
 
@@ -1781,6 +2087,134 @@ mod tests {
             .expect("failure reason");
         assert_eq!(status, STATUS_FAILED);
         assert_eq!(failure_reason.as_deref(), Some(SUPERSEDED_TASK_REASON));
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
+    }
+
+    #[tokio::test]
+    async fn create_or_get_active_task_persists_style_options_prompt_and_defaults() {
+        let config = ServerConfig::default();
+        let base_database_url = config.database_url.clone();
+        let (pool, schema_name) = db::connect_isolated_test_pool(&base_database_url)
+            .await
+            .expect("create isolated schema");
+        let storage_root =
+            env::temp_dir().join(format!("augmego-avatar-generation-style-{schema_name}"));
+        let storage = StorageService::new(StorageConfig {
+            provider: StorageProvider::Local,
+            root: storage_root,
+            namespace: "test-assets".to_string(),
+            spaces_bucket: String::new(),
+            spaces_endpoint: String::new(),
+            spaces_custom_domain: String::new(),
+            spaces_access_key_id: String::new(),
+            spaces_secret_access_key: String::new(),
+            spaces_region: String::new(),
+        })
+        .await
+        .expect("create storage");
+
+        let account_service = AccountService::new(
+            pool.clone(),
+            storage.clone(),
+            AccountConfig {
+                public_base_url: config.public_base_url.clone(),
+                session_cookie: SessionCookieConfig {
+                    name: "session".to_string(),
+                    secure: false,
+                    same_site: SameSitePolicy::Lax,
+                    ttl: Duration::from_secs(60),
+                },
+                apple_client_id: String::new(),
+                apple_scope: String::new(),
+                google_client_id: String::new(),
+                google_client_secret: String::new(),
+                google_scope: String::new(),
+                microsoft_client_id: String::new(),
+                microsoft_client_secret: String::new(),
+                microsoft_scope: String::new(),
+                microsoft_tenant: String::new(),
+                game_auth_secret: "test-secret".to_string(),
+                game_auth_ttl: Duration::from_secs(60),
+            },
+        );
+
+        let client = AvatarGenerationClient::new(
+            pool.clone(),
+            storage,
+            account_service.clone(),
+            AvatarGenerationConfig {
+                openai_api_base_url: "https://api.openai.com/v1".to_string(),
+                openai_api_key: "test".to_string(),
+                openai_avatar_image_model: "gpt-image-1.5".to_string(),
+                generated_avatar_cache_control: String::new(),
+                generated_avatar_texture_max_dimension: 1024,
+                generated_avatar_texture_jpeg_quality: 85,
+                meshy_api_base_url: "https://api.meshy.ai".to_string(),
+                meshy_api_key: "test".to_string(),
+                avatar_generation_idle_action_id: 0,
+                avatar_generation_dance_action_id: 22,
+                avatar_generation_worker_interval: Duration::from_secs(30),
+                avatar_generation_poll_interval: Duration::from_secs(15),
+                avatar_generation_max_attempts: 3,
+            },
+        );
+
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind("avatar-style@example.com")
+            .execute(&pool)
+            .await
+            .expect("insert user");
+
+        let style_options = AvatarStyleOptions {
+            outfit_style: AvatarOutfitStyle::Fantasy,
+            fit_style: AvatarFitStyle::Relaxed,
+            neck_accessory: AvatarNeckAccessory::Necklace,
+            headwear: AvatarHeadwear::Crown,
+            body_build: AvatarBodyBuild::MatchReference,
+            skin_tone: AvatarSkinTone::MatchReference,
+            pose_energy: AvatarPoseEnergy::Heroic,
+            material_style: AvatarMaterialStyle::Glam,
+            ring: true,
+            earrings: true,
+            bracelet: false,
+            watch: false,
+            gloves: false,
+            cape: true,
+        };
+        let expected_prompt = build_portrait_prompt(&style_options);
+
+        let task = client
+            .create_or_get_active_task(user_id, b"png", "image/png", &style_options)
+            .await
+            .expect("create task");
+
+        let task_row = sqlx::query(
+            "SELECT style_options, effective_prompt
+             FROM player_avatar_generation_tasks
+             WHERE id = $1",
+        )
+        .bind(Uuid::parse_str(&task.id).expect("task id"))
+        .fetch_one(&pool)
+        .await
+        .expect("load task row");
+        let saved_style_options: Json<AvatarStyleOptions> =
+            task_row.try_get("style_options").expect("style options");
+        let effective_prompt: String = task_row
+            .try_get("effective_prompt")
+            .expect("effective prompt");
+        assert_eq!(saved_style_options.0, style_options);
+        assert_eq!(effective_prompt, expected_prompt);
+
+        let saved_defaults = account_service
+            .load_avatar_generation_preferences(user_id)
+            .await
+            .expect("load saved defaults");
+        assert_eq!(saved_defaults, style_options);
 
         db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
             .await

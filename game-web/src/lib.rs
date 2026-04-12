@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use glam::{EulerRot, Mat4, Quat, Vec2, Vec3, Vec4};
+use serde::Serialize;
 use shared_math::{CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, ChunkPos, LocalVoxelPos, WorldPos};
 use shared_protocol::{
     BreakBlockRequest, CaptureWildPetResult, CaptureWildPetStatus, CapturedPet,
@@ -201,6 +202,24 @@ const REMOTE_AVATAR_RUN_SPEED_THRESHOLD: f32 = 0.15;
 const REMOTE_AVATAR_IDLE_DELAY_SECS: f32 = 0.35;
 const REMOTE_AVATAR_DANCE_DELAY_SECS: f32 = 10.0;
 const AUTH_STATUS_CHECKING: &str = "Checking your sign-in session...";
+const AVATAR_STYLE_OUTFIT_OPTIONS: &[&str] = &[
+    "match_reference",
+    "suit",
+    "dress",
+    "casual",
+    "streetwear",
+    "fantasy",
+    "armor",
+];
+const AVATAR_STYLE_FIT_OPTIONS: &[&str] = &["match_reference", "tailored", "relaxed", "oversized"];
+const AVATAR_STYLE_NECK_OPTIONS: &[&str] = &["none", "tie", "bow_tie", "necklace", "scarf"];
+const AVATAR_STYLE_HEADWEAR_OPTIONS: &[&str] = &["none", "hat", "beanie", "hood", "crown"];
+const AVATAR_STYLE_BODY_BUILD_OPTIONS: &[&str] =
+    &["match_reference", "slim", "average", "broad", "plus"];
+const AVATAR_STYLE_SKIN_TONE_OPTIONS: &[&str] =
+    &["match_reference", "fair", "light", "medium", "tan", "deep"];
+const AVATAR_STYLE_POSE_OPTIONS: &[&str] = &["neutral", "confident", "playful", "heroic"];
+const AVATAR_STYLE_MATERIAL_OPTIONS: &[&str] = &["natural", "glam", "soft_fabric", "formal_luxury"];
 
 #[derive(Clone, Debug)]
 struct AuthUser {
@@ -209,6 +228,111 @@ struct AuthUser {
     email: Option<String>,
     avatar_selection: Option<PlayerAvatarSelection>,
     game_auth_token: Option<String>,
+    avatar_customizer_access: AvatarCustomizerAccessClient,
+    avatar_generation_defaults: AvatarStyleOptionsClient,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AvatarCustomizerAccessSourceClient {
+    Beta,
+    Entitlement,
+    #[default]
+    None,
+}
+
+impl AvatarCustomizerAccessSourceClient {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Beta => "beta",
+            Self::Entitlement => "entitlement",
+            Self::None => "none",
+        }
+    }
+
+    fn from_value(value: Option<&str>) -> Self {
+        match value.unwrap_or_default() {
+            "beta" => Self::Beta,
+            "entitlement" => Self::Entitlement,
+            _ => Self::None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AvatarCustomizerAccessClient {
+    enabled: bool,
+    source: AvatarCustomizerAccessSourceClient,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AvatarStyleOptionsClient {
+    outfit_style: String,
+    fit_style: String,
+    neck_accessory: String,
+    headwear: String,
+    body_build: String,
+    skin_tone: String,
+    pose_energy: String,
+    material_style: String,
+    ring: bool,
+    earrings: bool,
+    bracelet: bool,
+    watch: bool,
+    gloves: bool,
+    cape: bool,
+}
+
+impl Default for AvatarStyleOptionsClient {
+    fn default() -> Self {
+        Self {
+            outfit_style: "match_reference".to_string(),
+            fit_style: "match_reference".to_string(),
+            neck_accessory: "none".to_string(),
+            headwear: "none".to_string(),
+            body_build: "match_reference".to_string(),
+            skin_tone: "match_reference".to_string(),
+            pose_energy: "neutral".to_string(),
+            material_style: "natural".to_string(),
+            ring: false,
+            earrings: false,
+            bracelet: false,
+            watch: false,
+            gloves: false,
+            cape: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AvatarStyleRadioOption {
+    value: &'static str,
+    input: HtmlInputElement,
+}
+
+#[derive(Clone)]
+struct AvatarStyleRadioGroup {
+    default_value: &'static str,
+    inputs: Vec<AvatarStyleRadioOption>,
+}
+
+#[derive(Clone)]
+struct AvatarStyleControlSet {
+    access_notice: Element,
+    outfit_style: AvatarStyleRadioGroup,
+    fit_style: AvatarStyleRadioGroup,
+    neck_accessory: AvatarStyleRadioGroup,
+    headwear: AvatarStyleRadioGroup,
+    body_build: AvatarStyleRadioGroup,
+    skin_tone: AvatarStyleRadioGroup,
+    pose_energy: AvatarStyleRadioGroup,
+    material_style: AvatarStyleRadioGroup,
+    ring: HtmlInputElement,
+    earrings: HtmlInputElement,
+    bracelet: HtmlInputElement,
+    watch: HtmlInputElement,
+    gloves: HtmlInputElement,
+    cape: HtmlInputElement,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -273,6 +397,8 @@ impl AuthUser {
             email: None,
             avatar_selection: None,
             game_auth_token: None,
+            avatar_customizer_access: AvatarCustomizerAccessClient::default(),
+            avatar_generation_defaults: AvatarStyleOptionsClient::default(),
         }
     }
 
@@ -315,6 +441,7 @@ struct AvatarGenerationModalState {
     selfie_object_url: Option<String>,
     selected_selfie_file: Option<web_sys::File>,
     active_task_id: Option<String>,
+    customizer_access: AvatarCustomizerAccessClient,
     polling: bool,
 }
 
@@ -3395,6 +3522,27 @@ impl WebApp {
     }
 
     fn sync_player_avatar_panel(&self) {
+        let (customizer_access, avatar_defaults) = self
+            .auth_user
+            .as_ref()
+            .map(|user| {
+                (
+                    user.avatar_customizer_access.clone(),
+                    user.avatar_generation_defaults.clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    AvatarCustomizerAccessClient::default(),
+                    AvatarStyleOptionsClient::default(),
+                )
+            });
+        set_avatar_panel_customizer_attributes(
+            &self.player_avatar_panel,
+            &customizer_access,
+            &avatar_defaults,
+        );
+
         let should_show = matches!(self.auth_status, AuthStatus::SignedIn)
             && self
                 .auth_user
@@ -8566,6 +8714,8 @@ fn parse_auth_user(body: &JsValue) -> Option<AuthUser> {
         email: js_get_string(&user, "email"),
         avatar_selection: parse_avatar_selection(&user),
         game_auth_token: js_get_string(&user, "gameAuthToken"),
+        avatar_customizer_access: parse_avatar_customizer_access(&user),
+        avatar_generation_defaults: parse_avatar_style_options(&user),
     })
 }
 
@@ -8576,6 +8726,85 @@ fn parse_avatar_selection(user: &JsValue) -> Option<PlayerAvatarSelection> {
         run_model_url: js_get_string(&avatar_selection, "moveModelUrl"),
         dance_model_url: js_get_string(&avatar_selection, "specialModelUrl"),
     })
+}
+
+fn parse_avatar_customizer_access(user: &JsValue) -> AvatarCustomizerAccessClient {
+    let Some(access) = js_get(user, "avatarCustomizerAccess") else {
+        return AvatarCustomizerAccessClient::default();
+    };
+    AvatarCustomizerAccessClient {
+        enabled: js_get_bool(&access, "enabled").unwrap_or(false),
+        source: AvatarCustomizerAccessSourceClient::from_value(
+            js_get_string(&access, "source").as_deref(),
+        ),
+    }
+}
+
+fn parse_avatar_style_options(user: &JsValue) -> AvatarStyleOptionsClient {
+    let Some(options) = js_get(user, "avatarGenerationDefaults") else {
+        return AvatarStyleOptionsClient::default();
+    };
+    AvatarStyleOptionsClient {
+        outfit_style: sanitize_avatar_style_choice(
+            js_get_string(&options, "outfitStyle"),
+            AVATAR_STYLE_OUTFIT_OPTIONS,
+            "match_reference",
+        ),
+        fit_style: sanitize_avatar_style_choice(
+            js_get_string(&options, "fitStyle"),
+            AVATAR_STYLE_FIT_OPTIONS,
+            "match_reference",
+        ),
+        neck_accessory: sanitize_avatar_style_choice(
+            js_get_string(&options, "neckAccessory"),
+            AVATAR_STYLE_NECK_OPTIONS,
+            "none",
+        ),
+        headwear: sanitize_avatar_style_choice(
+            js_get_string(&options, "headwear"),
+            AVATAR_STYLE_HEADWEAR_OPTIONS,
+            "none",
+        ),
+        body_build: sanitize_avatar_style_choice(
+            js_get_string(&options, "bodyBuild"),
+            AVATAR_STYLE_BODY_BUILD_OPTIONS,
+            "match_reference",
+        ),
+        skin_tone: sanitize_avatar_style_choice(
+            js_get_string(&options, "skinTone"),
+            AVATAR_STYLE_SKIN_TONE_OPTIONS,
+            "match_reference",
+        ),
+        pose_energy: sanitize_avatar_style_choice(
+            js_get_string(&options, "poseEnergy"),
+            AVATAR_STYLE_POSE_OPTIONS,
+            "neutral",
+        ),
+        material_style: sanitize_avatar_style_choice(
+            js_get_string(&options, "materialStyle"),
+            AVATAR_STYLE_MATERIAL_OPTIONS,
+            "natural",
+        ),
+        ring: js_get_bool(&options, "ring").unwrap_or(false),
+        earrings: js_get_bool(&options, "earrings").unwrap_or(false),
+        bracelet: js_get_bool(&options, "bracelet").unwrap_or(false),
+        watch: js_get_bool(&options, "watch").unwrap_or(false),
+        gloves: js_get_bool(&options, "gloves").unwrap_or(false),
+        cape: js_get_bool(&options, "cape").unwrap_or(false),
+    }
+}
+
+fn sanitize_avatar_style_choice(
+    value: Option<String>,
+    allowed_values: &[&str],
+    default_value: &str,
+) -> String {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| allowed_values.contains(value))
+        .unwrap_or(default_value)
+        .to_string()
 }
 
 fn js_get(value: &JsValue, key: &str) -> Option<JsValue> {
@@ -8595,6 +8824,10 @@ fn js_get_i32(value: &JsValue, key: &str) -> Option<i32> {
     js_get(value, key)?
         .as_f64()
         .map(|value| value.round() as i32)
+}
+
+fn js_get_bool(value: &JsValue, key: &str) -> Option<bool> {
+    js_get(value, key)?.as_bool()
 }
 
 fn queue_auth_refresh() {
@@ -8707,6 +8940,558 @@ fn set_button_disabled(button: &Element, disabled: bool) {
         let _ = button.set_attribute("disabled", "true");
     } else {
         let _ = button.remove_attribute("disabled");
+    }
+}
+
+fn set_avatar_panel_customizer_attributes(
+    panel: &Element,
+    access: &AvatarCustomizerAccessClient,
+    options: &AvatarStyleOptionsClient,
+) {
+    let _ = panel.set_attribute(
+        "data-avatar-customizer-enabled",
+        if access.enabled { "true" } else { "false" },
+    );
+    let _ = panel.set_attribute("data-avatar-customizer-source", access.source.as_str());
+    let _ = panel.set_attribute("data-avatar-style-outfit-style", &options.outfit_style);
+    let _ = panel.set_attribute("data-avatar-style-fit-style", &options.fit_style);
+    let _ = panel.set_attribute("data-avatar-style-neck-accessory", &options.neck_accessory);
+    let _ = panel.set_attribute("data-avatar-style-headwear", &options.headwear);
+    let _ = panel.set_attribute("data-avatar-style-body-build", &options.body_build);
+    let _ = panel.set_attribute("data-avatar-style-skin-tone", &options.skin_tone);
+    let _ = panel.set_attribute("data-avatar-style-pose-energy", &options.pose_energy);
+    let _ = panel.set_attribute("data-avatar-style-material-style", &options.material_style);
+    let _ = panel.set_attribute(
+        "data-avatar-style-ring",
+        if options.ring { "true" } else { "false" },
+    );
+    let _ = panel.set_attribute(
+        "data-avatar-style-earrings",
+        if options.earrings { "true" } else { "false" },
+    );
+    let _ = panel.set_attribute(
+        "data-avatar-style-bracelet",
+        if options.bracelet { "true" } else { "false" },
+    );
+    let _ = panel.set_attribute(
+        "data-avatar-style-watch",
+        if options.watch { "true" } else { "false" },
+    );
+    let _ = panel.set_attribute(
+        "data-avatar-style-gloves",
+        if options.gloves { "true" } else { "false" },
+    );
+    let _ = panel.set_attribute(
+        "data-avatar-style-cape",
+        if options.cape { "true" } else { "false" },
+    );
+}
+
+fn avatar_customizer_access_from_panel(panel: &Element) -> AvatarCustomizerAccessClient {
+    AvatarCustomizerAccessClient {
+        enabled: panel
+            .get_attribute("data-avatar-customizer-enabled")
+            .as_deref()
+            .is_some_and(|value| value == "true"),
+        source: AvatarCustomizerAccessSourceClient::from_value(
+            panel
+                .get_attribute("data-avatar-customizer-source")
+                .as_deref(),
+        ),
+    }
+}
+
+fn avatar_style_options_from_panel(panel: &Element) -> AvatarStyleOptionsClient {
+    AvatarStyleOptionsClient {
+        outfit_style: sanitize_avatar_style_choice(
+            panel.get_attribute("data-avatar-style-outfit-style"),
+            AVATAR_STYLE_OUTFIT_OPTIONS,
+            "match_reference",
+        ),
+        fit_style: sanitize_avatar_style_choice(
+            panel.get_attribute("data-avatar-style-fit-style"),
+            AVATAR_STYLE_FIT_OPTIONS,
+            "match_reference",
+        ),
+        neck_accessory: sanitize_avatar_style_choice(
+            panel.get_attribute("data-avatar-style-neck-accessory"),
+            AVATAR_STYLE_NECK_OPTIONS,
+            "none",
+        ),
+        headwear: sanitize_avatar_style_choice(
+            panel.get_attribute("data-avatar-style-headwear"),
+            AVATAR_STYLE_HEADWEAR_OPTIONS,
+            "none",
+        ),
+        body_build: sanitize_avatar_style_choice(
+            panel.get_attribute("data-avatar-style-body-build"),
+            AVATAR_STYLE_BODY_BUILD_OPTIONS,
+            "match_reference",
+        ),
+        skin_tone: sanitize_avatar_style_choice(
+            panel.get_attribute("data-avatar-style-skin-tone"),
+            AVATAR_STYLE_SKIN_TONE_OPTIONS,
+            "match_reference",
+        ),
+        pose_energy: sanitize_avatar_style_choice(
+            panel.get_attribute("data-avatar-style-pose-energy"),
+            AVATAR_STYLE_POSE_OPTIONS,
+            "neutral",
+        ),
+        material_style: sanitize_avatar_style_choice(
+            panel.get_attribute("data-avatar-style-material-style"),
+            AVATAR_STYLE_MATERIAL_OPTIONS,
+            "natural",
+        ),
+        ring: panel
+            .get_attribute("data-avatar-style-ring")
+            .as_deref()
+            .is_some_and(|value| value == "true"),
+        earrings: panel
+            .get_attribute("data-avatar-style-earrings")
+            .as_deref()
+            .is_some_and(|value| value == "true"),
+        bracelet: panel
+            .get_attribute("data-avatar-style-bracelet")
+            .as_deref()
+            .is_some_and(|value| value == "true"),
+        watch: panel
+            .get_attribute("data-avatar-style-watch")
+            .as_deref()
+            .is_some_and(|value| value == "true"),
+        gloves: panel
+            .get_attribute("data-avatar-style-gloves")
+            .as_deref()
+            .is_some_and(|value| value == "true"),
+        cape: panel
+            .get_attribute("data-avatar-style-cape")
+            .as_deref()
+            .is_some_and(|value| value == "true"),
+    }
+}
+
+fn set_radio_group_disabled(group: &AvatarStyleRadioGroup, disabled: bool) {
+    for option in &group.inputs {
+        option.input.set_disabled(disabled);
+    }
+}
+
+fn selected_radio_value(group: &AvatarStyleRadioGroup) -> String {
+    group
+        .inputs
+        .iter()
+        .find(|option| option.input.checked())
+        .map(|option| option.value.to_string())
+        .unwrap_or_else(|| group.default_value.to_string())
+}
+
+fn set_selected_radio_value(group: &AvatarStyleRadioGroup, value: &str) {
+    let resolved = group
+        .inputs
+        .iter()
+        .find(|option| option.value == value)
+        .map(|option| option.value)
+        .unwrap_or(group.default_value);
+    for option in &group.inputs {
+        option.input.set_checked(option.value == resolved);
+    }
+}
+
+fn collect_avatar_style_options_from_controls(
+    controls: &AvatarStyleControlSet,
+) -> AvatarStyleOptionsClient {
+    AvatarStyleOptionsClient {
+        outfit_style: selected_radio_value(&controls.outfit_style),
+        fit_style: selected_radio_value(&controls.fit_style),
+        neck_accessory: selected_radio_value(&controls.neck_accessory),
+        headwear: selected_radio_value(&controls.headwear),
+        body_build: selected_radio_value(&controls.body_build),
+        skin_tone: selected_radio_value(&controls.skin_tone),
+        pose_energy: selected_radio_value(&controls.pose_energy),
+        material_style: selected_radio_value(&controls.material_style),
+        ring: controls.ring.checked(),
+        earrings: controls.earrings.checked(),
+        bracelet: controls.bracelet.checked(),
+        watch: controls.watch.checked(),
+        gloves: controls.gloves.checked(),
+        cape: controls.cape.checked(),
+    }
+}
+
+fn apply_avatar_style_options_to_controls(
+    controls: &AvatarStyleControlSet,
+    options: &AvatarStyleOptionsClient,
+) {
+    set_selected_radio_value(&controls.outfit_style, &options.outfit_style);
+    set_selected_radio_value(&controls.fit_style, &options.fit_style);
+    set_selected_radio_value(&controls.neck_accessory, &options.neck_accessory);
+    set_selected_radio_value(&controls.headwear, &options.headwear);
+    set_selected_radio_value(&controls.body_build, &options.body_build);
+    set_selected_radio_value(&controls.skin_tone, &options.skin_tone);
+    set_selected_radio_value(&controls.pose_energy, &options.pose_energy);
+    set_selected_radio_value(&controls.material_style, &options.material_style);
+    controls.ring.set_checked(options.ring);
+    controls.earrings.set_checked(options.earrings);
+    controls.bracelet.set_checked(options.bracelet);
+    controls.watch.set_checked(options.watch);
+    controls.gloves.set_checked(options.gloves);
+    controls.cape.set_checked(options.cape);
+}
+
+fn set_avatar_style_controls_disabled(controls: &AvatarStyleControlSet, disabled: bool) {
+    set_radio_group_disabled(&controls.outfit_style, disabled);
+    set_radio_group_disabled(&controls.fit_style, disabled);
+    set_radio_group_disabled(&controls.neck_accessory, disabled);
+    set_radio_group_disabled(&controls.headwear, disabled);
+    set_radio_group_disabled(&controls.body_build, disabled);
+    set_radio_group_disabled(&controls.skin_tone, disabled);
+    set_radio_group_disabled(&controls.pose_energy, disabled);
+    set_radio_group_disabled(&controls.material_style, disabled);
+    controls.ring.set_disabled(disabled);
+    controls.earrings.set_disabled(disabled);
+    controls.bracelet.set_disabled(disabled);
+    controls.watch.set_disabled(disabled);
+    controls.gloves.set_disabled(disabled);
+    controls.cape.set_disabled(disabled);
+}
+
+fn apply_avatar_customizer_access_to_controls(
+    controls: &AvatarStyleControlSet,
+    access: &AvatarCustomizerAccessClient,
+    generation_active: bool,
+) {
+    let (message, style) = if access.enabled {
+        let message = match access.source {
+            AvatarCustomizerAccessSourceClient::Beta => {
+                "Premium beta is live for your account. Mix outfits, accessories, and pose energy before generating."
+            }
+            AvatarCustomizerAccessSourceClient::Entitlement => {
+                "Premium avatar customization is enabled on your account."
+            }
+            AvatarCustomizerAccessSourceClient::None => {
+                "Avatar customization is available for this session."
+            }
+        };
+        (
+            message,
+            "margin:10px 0 0 0;padding:10px 12px;border-radius:14px;border:1px solid rgba(19,33,42,0.10);background:rgba(255,255,255,0.74);color:rgba(19,33,42,0.78);font:600 12px/1.5 \"Avenir Next\",\"Segoe UI\",sans-serif;",
+        )
+    } else {
+        (
+            "Advanced style controls are part of premium avatar customization. You can still use the base photo-to-avatar flow without changing these options.",
+            "margin:10px 0 0 0;padding:10px 12px;border-radius:14px;border:1px solid rgba(133,75,36,0.16);background:rgba(255,248,238,0.92);color:rgba(120,69,33,0.9);font:600 12px/1.5 \"Avenir Next\",\"Segoe UI\",sans-serif;",
+        )
+    };
+    controls.access_notice.set_text_content(Some(message));
+    let _ = controls.access_notice.set_attribute("style", style);
+    set_avatar_style_controls_disabled(controls, generation_active || !access.enabled);
+}
+
+fn create_avatar_style_radio_group(
+    document: &Document,
+    root: &Element,
+    title: &str,
+    name: &str,
+    default_value: &'static str,
+    options: &[(&'static str, &'static str)],
+) -> AvatarStyleRadioGroup {
+    let wrapper = document
+        .create_element("div")
+        .expect("avatar style radio wrapper");
+    let _ = wrapper.set_attribute(
+        "style",
+        "display:grid;gap:8px;padding:12px;border-radius:16px;border:1px solid rgba(19,33,42,0.10);background:rgba(255,255,255,0.68);",
+    );
+
+    let heading = document
+        .create_element("p")
+        .expect("avatar style radio heading");
+    heading.set_text_content(Some(title));
+    let _ = heading.set_attribute(
+        "style",
+        "margin:0;color:#10202a;font:700 12px/1.2 \"Avenir Next\",\"Segoe UI\",sans-serif;letter-spacing:0.04em;text-transform:uppercase;",
+    );
+    let _ = wrapper.append_child(&heading);
+
+    let options_grid = document
+        .create_element("div")
+        .expect("avatar style radio option grid");
+    let _ = options_grid.set_attribute(
+        "style",
+        "display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;",
+    );
+    let group_name = format!("avatar-style-{name}");
+    let mut inputs = Vec::new();
+    for (value, label) in options {
+        let option_label = document
+            .create_element("label")
+            .expect("avatar style radio label");
+        let _ = option_label.set_attribute(
+            "style",
+            "display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:12px;border:1px solid rgba(19,33,42,0.10);background:rgba(250,244,234,0.9);color:#13212a;font:600 12px/1.35 \"Avenir Next\",\"Segoe UI\",sans-serif;cursor:pointer;",
+        );
+        let input = document
+            .create_element("input")
+            .expect("avatar style radio input")
+            .dyn_into::<HtmlInputElement>()
+            .expect("avatar style radio input cast");
+        input.set_type("radio");
+        input.set_name(&group_name);
+        input.set_value(value);
+        input.set_checked(*value == default_value);
+        let _ = input.set_attribute("style", "margin:0;accent-color:#c9753c;");
+        let _ = option_label.append_child(&input);
+        let label_text = document
+            .create_element("span")
+            .expect("avatar style radio text");
+        label_text.set_text_content(Some(label));
+        let _ = option_label.append_child(&label_text);
+        let _ = options_grid.append_child(&option_label);
+        inputs.push(AvatarStyleRadioOption { value, input });
+    }
+
+    let _ = wrapper.append_child(&options_grid);
+    let _ = root.append_child(&wrapper);
+    AvatarStyleRadioGroup {
+        default_value,
+        inputs,
+    }
+}
+
+fn create_avatar_style_checkbox(
+    document: &Document,
+    root: &Element,
+    value: &str,
+    label: &str,
+) -> HtmlInputElement {
+    let option_label = document
+        .create_element("label")
+        .expect("avatar style checkbox label");
+    let _ = option_label.set_attribute(
+        "style",
+        "display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:12px;border:1px solid rgba(19,33,42,0.10);background:rgba(250,244,234,0.9);color:#13212a;font:600 12px/1.35 \"Avenir Next\",\"Segoe UI\",sans-serif;cursor:pointer;",
+    );
+    let input = document
+        .create_element("input")
+        .expect("avatar style checkbox input")
+        .dyn_into::<HtmlInputElement>()
+        .expect("avatar style checkbox input cast");
+    input.set_type("checkbox");
+    input.set_value(value);
+    let _ = input.set_attribute("style", "margin:0;accent-color:#c9753c;");
+    let _ = option_label.append_child(&input);
+    let text = document
+        .create_element("span")
+        .expect("avatar style checkbox text");
+    text.set_text_content(Some(label));
+    let _ = option_label.append_child(&text);
+    let _ = root.append_child(&option_label);
+    input
+}
+
+fn create_avatar_style_controls(document: &Document, root: &Element) -> AvatarStyleControlSet {
+    let section = document
+        .create_element("section")
+        .expect("avatar style section");
+    let _ = section.set_attribute(
+        "style",
+        "display:grid;gap:12px;margin-top:18px;padding:16px;border-radius:20px;border:1px solid rgba(19,33,42,0.10);background:linear-gradient(180deg,rgba(255,250,243,0.92),rgba(245,233,219,0.92));",
+    );
+
+    let heading = document.create_element("h3").expect("avatar style heading");
+    heading.set_text_content(Some("Style Your Avatar"));
+    let _ = heading.set_attribute(
+        "style",
+        "margin:0;color:#13212a;font:700 18px/1.15 Georgia,\"Times New Roman\",serif;",
+    );
+    let _ = section.append_child(&heading);
+
+    let copy = document.create_element("p").expect("avatar style copy");
+    copy.set_text_content(Some(
+        "Keep the same subject, then nudge the outfit, accessories, and overall vibe with quick premium controls.",
+    ));
+    let _ = copy.set_attribute(
+        "style",
+        "margin:0;color:rgba(19,33,42,0.76);font:500 13px/1.5 \"Avenir Next\",\"Segoe UI\",sans-serif;",
+    );
+    let _ = section.append_child(&copy);
+
+    let access_notice = document
+        .create_element("p")
+        .expect("avatar style access notice");
+    let _ = section.append_child(&access_notice);
+
+    let group_grid = document
+        .create_element("div")
+        .expect("avatar style group grid");
+    let _ = group_grid.set_attribute(
+        "style",
+        "display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;",
+    );
+
+    let outfit_style = create_avatar_style_radio_group(
+        document,
+        &group_grid,
+        "Outfit",
+        "outfit-style",
+        "match_reference",
+        &[
+            ("match_reference", "Match photo"),
+            ("suit", "Suit"),
+            ("dress", "Dress"),
+            ("casual", "Casual"),
+            ("streetwear", "Streetwear"),
+            ("fantasy", "Fantasy"),
+            ("armor", "Armor"),
+        ],
+    );
+    let fit_style = create_avatar_style_radio_group(
+        document,
+        &group_grid,
+        "Fit",
+        "fit-style",
+        "match_reference",
+        &[
+            ("match_reference", "Match photo"),
+            ("tailored", "Tailored"),
+            ("relaxed", "Relaxed"),
+            ("oversized", "Oversized"),
+        ],
+    );
+    let neck_accessory = create_avatar_style_radio_group(
+        document,
+        &group_grid,
+        "Neck Detail",
+        "neck-accessory",
+        "none",
+        &[
+            ("none", "None"),
+            ("tie", "Tie"),
+            ("bow_tie", "Bow tie"),
+            ("necklace", "Necklace"),
+            ("scarf", "Scarf"),
+        ],
+    );
+    let headwear = create_avatar_style_radio_group(
+        document,
+        &group_grid,
+        "Headwear",
+        "headwear",
+        "none",
+        &[
+            ("none", "None"),
+            ("hat", "Hat"),
+            ("beanie", "Beanie"),
+            ("hood", "Hood"),
+            ("crown", "Crown"),
+        ],
+    );
+    let body_build = create_avatar_style_radio_group(
+        document,
+        &group_grid,
+        "Body Build",
+        "body-build",
+        "match_reference",
+        &[
+            ("match_reference", "Match photo"),
+            ("slim", "Slim"),
+            ("average", "Average"),
+            ("broad", "Broad"),
+            ("plus", "Plus"),
+        ],
+    );
+    let skin_tone = create_avatar_style_radio_group(
+        document,
+        &group_grid,
+        "Skin Tone",
+        "skin-tone",
+        "match_reference",
+        &[
+            ("match_reference", "Match photo"),
+            ("fair", "Fair"),
+            ("light", "Light"),
+            ("medium", "Medium"),
+            ("tan", "Tan"),
+            ("deep", "Deep"),
+        ],
+    );
+    let pose_energy = create_avatar_style_radio_group(
+        document,
+        &group_grid,
+        "Pose Energy",
+        "pose-energy",
+        "neutral",
+        &[
+            ("neutral", "Neutral"),
+            ("confident", "Confident"),
+            ("playful", "Playful"),
+            ("heroic", "Heroic"),
+        ],
+    );
+    let material_style = create_avatar_style_radio_group(
+        document,
+        &group_grid,
+        "Material Feel",
+        "material-style",
+        "natural",
+        &[
+            ("natural", "Natural"),
+            ("glam", "Glam"),
+            ("soft_fabric", "Soft fabric"),
+            ("formal_luxury", "Formal luxury"),
+        ],
+    );
+    let _ = section.append_child(&group_grid);
+
+    let accessory_wrapper = document
+        .create_element("div")
+        .expect("avatar style accessories");
+    let _ = accessory_wrapper.set_attribute(
+        "style",
+        "display:grid;gap:8px;padding:12px;border-radius:16px;border:1px solid rgba(19,33,42,0.10);background:rgba(255,255,255,0.68);",
+    );
+    let accessory_heading = document
+        .create_element("p")
+        .expect("avatar style accessories heading");
+    accessory_heading.set_text_content(Some("Accessory Extras"));
+    let _ = accessory_heading.set_attribute(
+        "style",
+        "margin:0;color:#10202a;font:700 12px/1.2 \"Avenir Next\",\"Segoe UI\",sans-serif;letter-spacing:0.04em;text-transform:uppercase;",
+    );
+    let _ = accessory_wrapper.append_child(&accessory_heading);
+    let accessory_grid = document
+        .create_element("div")
+        .expect("avatar style accessories grid");
+    let _ = accessory_grid.set_attribute(
+        "style",
+        "display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;",
+    );
+    let ring = create_avatar_style_checkbox(document, &accessory_grid, "ring", "Ring");
+    let earrings = create_avatar_style_checkbox(document, &accessory_grid, "earrings", "Earrings");
+    let bracelet = create_avatar_style_checkbox(document, &accessory_grid, "bracelet", "Bracelet");
+    let watch = create_avatar_style_checkbox(document, &accessory_grid, "watch", "Watch");
+    let gloves = create_avatar_style_checkbox(document, &accessory_grid, "gloves", "Gloves");
+    let cape = create_avatar_style_checkbox(document, &accessory_grid, "cape", "Cape");
+    let _ = accessory_wrapper.append_child(&accessory_grid);
+    let _ = section.append_child(&accessory_wrapper);
+
+    let _ = root.append_child(&section);
+    AvatarStyleControlSet {
+        access_notice,
+        outfit_style,
+        fit_style,
+        neck_accessory,
+        headwear,
+        body_build,
+        skin_tone,
+        pose_energy,
+        material_style,
+        ring,
+        earrings,
+        bracelet,
+        watch,
+        gloves,
+        cape,
     }
 }
 
@@ -8878,12 +9663,18 @@ async fn fetch_player_avatar_generation_task() -> Result<Option<AvatarGeneration
 async fn create_player_avatar_generation_task(
     selfie_blob: &Blob,
     file_name: &str,
+    style_options: &AvatarStyleOptionsClient,
 ) -> Result<AvatarGenerationTaskClient> {
     let form_data = FormData::new()
         .map_err(|error| anyhow::anyhow!("create generation form data: {error:?}"))?;
     form_data
         .append_with_blob_and_filename("selfie", selfie_blob, file_name)
         .map_err(|error| anyhow::anyhow!("append selfie to generation form: {error:?}"))?;
+    let style_options_json = serde_json::to_string(style_options)
+        .map_err(|error| anyhow::anyhow!("serialize avatar style options: {error}"))?;
+    form_data
+        .append_with_str("styleOptions", &style_options_json)
+        .map_err(|error| anyhow::anyhow!("append avatar style options: {error:?}"))?;
 
     let init = RequestInit::new();
     init.set_method("POST");
@@ -8924,6 +9715,7 @@ async fn create_player_avatar_generation_task(
 fn render_avatar_generation_modal(
     task: Option<&AvatarGenerationTaskClient>,
     state: &Rc<RefCell<AvatarGenerationModalState>>,
+    style_controls: &AvatarStyleControlSet,
     video: &HtmlVideoElement,
     selfie_preview: &Element,
     portrait_preview: &Element,
@@ -8935,11 +9727,12 @@ fn render_avatar_generation_modal(
     retake_button: &Element,
     submit_button: &Element,
 ) {
-    let (local_selfie_url, has_selected_selfie) = {
+    let (local_selfie_url, has_selected_selfie, customizer_access) = {
         let state = state.borrow();
         (
             state.selfie_preview_url.clone(),
             state.selfie_preview_url.is_some() || state.selected_selfie_file.is_some(),
+            state.customizer_access.clone(),
         )
     };
     let active_task = task.is_some_and(avatar_generation_task_is_active);
@@ -8988,10 +9781,12 @@ fn render_avatar_generation_modal(
     set_button_disabled(capture_button, active_task || video.src_object().is_none());
     set_button_disabled(retake_button, active_task || !has_selected_selfie);
     set_button_disabled(submit_button, active_task || !has_selected_selfie);
+    apply_avatar_customizer_access_to_controls(style_controls, &customizer_access, active_task);
 }
 
 fn start_avatar_generation_polling(
     state: Rc<RefCell<AvatarGenerationModalState>>,
+    style_controls: AvatarStyleControlSet,
     video: HtmlVideoElement,
     selfie_preview: Element,
     portrait_preview: Element,
@@ -9017,6 +9812,7 @@ fn start_avatar_generation_polling(
                         render_avatar_generation_modal(
                             Some(task),
                             &state,
+                            &style_controls,
                             &video,
                             &selfie_preview,
                             &portrait_preview,
@@ -9038,6 +9834,7 @@ fn start_avatar_generation_polling(
                         render_avatar_generation_modal(
                             None,
                             &state,
+                            &style_controls,
                             &video,
                             &selfie_preview,
                             &portrait_preview,
@@ -9259,8 +10056,6 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
     let _ = selfie_preview.set_attribute("alt", "Selected selfie preview");
     let _ = selfie_preview.set_attribute("style", "display:none;");
     let _ = selfie_column.append_child(&selfie_preview);
-    let _ = submit_button.set_attribute("style", "width:100%;margin-top:4px;padding:10px 12px;border-radius:14px;border:1px solid rgba(12,36,40,0.12);background:linear-gradient(180deg,#f4d58a,#efb96a);color:#13212a;font:700 13px/1.2 \"Avenir Next\",\"Segoe UI\",sans-serif;cursor:pointer;");
-    let _ = selfie_column.append_child(&submit_button);
     let _ = preview_grid.append_child(&selfie_column);
 
     let portrait_column = document
@@ -9284,6 +10079,14 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
     let _ = portrait_column.append_child(&portrait_preview);
     let _ = preview_grid.append_child(&portrait_column);
     let _ = generation_card.append_child(&preview_grid);
+
+    let style_controls = create_avatar_style_controls(&document, &generation_card);
+
+    let _ = submit_button.set_attribute(
+        "style",
+        "width:100%;margin-top:16px;padding:12px 14px;border-radius:16px;border:1px solid rgba(12,36,40,0.12);background:linear-gradient(180deg,#f4d58a,#efb96a);color:#13212a;font:700 14px/1.2 \"Avenir Next\",\"Segoe UI\",sans-serif;cursor:pointer;",
+    );
+    let _ = generation_card.append_child(&submit_button);
 
     let progress_row = document
         .create_element("div")
@@ -9507,8 +10310,10 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
 
     let generation_state = Rc::new(RefCell::new(AvatarGenerationModalState::default()));
 
+    let player_avatar_panel_for_open = root.clone();
     let generation_modal_for_open = generation_modal.clone();
     let generation_state_for_open = generation_state.clone();
+    let style_controls_for_open = style_controls.clone();
     let live_video_for_open = live_video.clone();
     let selfie_preview_for_open = selfie_preview.clone();
     let portrait_preview_for_open = portrait_preview.clone();
@@ -9520,6 +10325,19 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
     let retake_button_for_open = retake_button.clone();
     let submit_button_for_open = submit_button.clone();
     let open_generate_modal = Closure::wrap(Box::new(move |_event: WebEvent| {
+        let customizer_access = avatar_customizer_access_from_panel(&player_avatar_panel_for_open);
+        let style_defaults = if customizer_access.enabled {
+            avatar_style_options_from_panel(&player_avatar_panel_for_open)
+        } else {
+            AvatarStyleOptionsClient::default()
+        };
+        generation_state_for_open.borrow_mut().customizer_access = customizer_access.clone();
+        apply_avatar_style_options_to_controls(&style_controls_for_open, &style_defaults);
+        apply_avatar_customizer_access_to_controls(
+            &style_controls_for_open,
+            &customizer_access,
+            false,
+        );
         let _ = generation_modal_for_open.set_attribute(
             "style",
             "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(245,239,225,0.72);backdrop-filter:blur(12px);z-index:65;",
@@ -9527,6 +10345,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
         render_avatar_generation_modal(
             None,
             &generation_state_for_open,
+            &style_controls_for_open,
             &live_video_for_open,
             &selfie_preview_for_open,
             &portrait_preview_for_open,
@@ -9556,6 +10375,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
             let capture_button = capture_button_for_open.clone();
             let retake_button = retake_button_for_open.clone();
             let submit_button = submit_button_for_open.clone();
+            let style_controls = style_controls_for_open.clone();
             spawn_local(async move {
                 if let Err(error) =
                     start_avatar_generation_camera(camera_video, status.clone()).await
@@ -9567,6 +10387,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
                     render_avatar_generation_modal(
                         None,
                         &state,
+                        &style_controls,
                         &video,
                         &selfie_preview,
                         &portrait_preview,
@@ -9593,6 +10414,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
         let capture_button = capture_button_for_open.clone();
         let retake_button = retake_button_for_open.clone();
         let submit_button = submit_button_for_open.clone();
+        let style_controls = style_controls_for_open.clone();
         spawn_local(async move {
             match fetch_player_avatar_generation_task().await {
                 Ok(task) => {
@@ -9604,6 +10426,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
                         render_avatar_generation_modal(
                             Some(task),
                             &state,
+                            &style_controls,
                             &video,
                             &selfie_preview,
                             &portrait_preview,
@@ -9618,6 +10441,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
                         if avatar_generation_task_is_active(task) {
                             start_avatar_generation_polling(
                                 state,
+                                style_controls,
                                 video,
                                 selfie_preview,
                                 portrait_preview,
@@ -9634,6 +10458,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
                         render_avatar_generation_modal(
                             None,
                             &state,
+                            &style_controls,
                             &video,
                             &selfie_preview,
                             &portrait_preview,
@@ -9686,6 +10511,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
     let progress_label_for_capture = progress_label.clone();
     let step_list_for_capture = step_list.clone();
     let generation_status_for_capture = generation_status.clone();
+    let style_controls_for_capture = style_controls.clone();
     let capture_button_for_capture = capture_button.clone();
     let retake_button_for_capture = retake_button.clone();
     let submit_button_for_capture = submit_button.clone();
@@ -9702,6 +10528,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
                 render_avatar_generation_modal(
                     None,
                     &generation_state_for_capture,
+                    &style_controls_for_capture,
                     &live_video_for_capture,
                     &selfie_preview_for_capture,
                     &portrait_preview_for_capture,
@@ -9735,6 +10562,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
     let progress_label_for_retake = progress_label.clone();
     let step_list_for_retake = step_list.clone();
     let generation_status_for_retake = generation_status.clone();
+    let style_controls_for_retake = style_controls.clone();
     let capture_button_for_retake = capture_button.clone();
     let retake_button_for_retake = retake_button.clone();
     let submit_button_for_retake = submit_button.clone();
@@ -9745,6 +10573,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
         render_avatar_generation_modal(
             None,
             &generation_state_for_retake,
+            &style_controls_for_retake,
             &live_video_for_retake,
             &selfie_preview_for_retake,
             &portrait_preview_for_retake,
@@ -9768,6 +10597,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
         let capture_button = capture_button_for_retake.clone();
         let retake_button = retake_button_for_retake.clone();
         let submit_button = submit_button_for_retake.clone();
+        let style_controls = style_controls_for_retake.clone();
         spawn_local(async move {
             if let Err(error) = start_avatar_generation_camera(camera_video, status.clone()).await {
                 status.set_text_content(Some(&format!(
@@ -9777,6 +10607,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
                 render_avatar_generation_modal(
                     None,
                     &state,
+                    &style_controls,
                     &video,
                     &selfie_preview,
                     &portrait_preview,
@@ -9803,6 +10634,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
     let progress_label_for_file = progress_label.clone();
     let step_list_for_file = step_list.clone();
     let generation_status_for_file = generation_status.clone();
+    let style_controls_for_file = style_controls.clone();
     let capture_button_for_file = capture_button.clone();
     let retake_button_for_file = retake_button.clone();
     let submit_button_for_file = submit_button.clone();
@@ -9825,6 +10657,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
                 render_avatar_generation_modal(
                     None,
                     &generation_state_for_file,
+                    &style_controls_for_file,
                     &live_video_for_file,
                     &selfie_preview_for_file,
                     &portrait_preview_for_file,
@@ -9857,6 +10690,8 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
     let progress_label_for_submit = progress_label.clone();
     let step_list_for_submit = step_list.clone();
     let generation_status_for_submit = generation_status.clone();
+    let player_avatar_panel_for_submit = root.clone();
+    let style_controls_for_submit = style_controls.clone();
     let capture_button_for_submit = capture_button.clone();
     let retake_button_for_submit = retake_button.clone();
     let submit_button_for_submit = submit_button.clone();
@@ -9869,6 +10704,8 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
         let progress_label = progress_label_for_submit.clone();
         let step_list = step_list_for_submit.clone();
         let status = generation_status_for_submit.clone();
+        let player_avatar_panel = player_avatar_panel_for_submit.clone();
+        let style_controls = style_controls_for_submit.clone();
         let capture_button = capture_button_for_submit.clone();
         let retake_button = retake_button_for_submit.clone();
         let submit_button = submit_button_for_submit.clone();
@@ -9878,6 +10715,12 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
 
             let selected_file = state.borrow().selected_selfie_file.clone();
             let selected_preview_url = state.borrow().selfie_preview_url.clone();
+            let customizer_access = state.borrow().customizer_access.clone();
+            let style_options = if customizer_access.enabled {
+                collect_avatar_style_options_from_controls(&style_controls)
+            } else {
+                AvatarStyleOptionsClient::default()
+            };
             let generation_input = if let Some(file) = selected_file {
                 let file_name = file.name();
                 let blob: Blob = file.unchecked_into();
@@ -9892,18 +10735,24 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
 
             let task_result = match generation_input {
                 Ok((blob, file_name)) => {
-                    create_player_avatar_generation_task(&blob, &file_name).await
+                    create_player_avatar_generation_task(&blob, &file_name, &style_options).await
                 }
                 Err(error) => Err(error),
             };
 
             match task_result {
                 Ok(task) => {
+                    set_avatar_panel_customizer_attributes(
+                        &player_avatar_panel,
+                        &customizer_access,
+                        &style_options,
+                    );
                     state.borrow_mut().active_task_id = Some(task.id.clone());
                     stop_video_stream(&video);
                     render_avatar_generation_modal(
                         Some(&task),
                         &state,
+                        &style_controls,
                         &video,
                         &selfie_preview,
                         &portrait_preview,
@@ -9917,6 +10766,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
                     );
                     start_avatar_generation_polling(
                         state,
+                        style_controls,
                         video,
                         selfie_preview,
                         portrait_preview,
@@ -9936,6 +10786,7 @@ fn create_player_avatar_panel() -> (Element, Element, Element, Closure<dyn FnMut
                     render_avatar_generation_modal(
                         None,
                         &state,
+                        &style_controls,
                         &video,
                         &selfie_preview,
                         &portrait_preview,

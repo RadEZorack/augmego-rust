@@ -30,7 +30,7 @@ shared_content = { path = "../shared_content" }
 shared_math = { path = "../shared_math" }
 shared_protocol = { path = "../shared_protocol" }
 shared_world = { path = "../shared_world" }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
 tokio.workspace = true
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 tracing.workspace = true

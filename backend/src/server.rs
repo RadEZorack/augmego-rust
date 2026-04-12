@@ -1,4 +1,6 @@
-use crate::account::{AccountConfig, AccountService, AvatarFileResponse, PlayerAvatarSlot};
+use crate::account::{
+    AccountConfig, AccountService, AvatarFileResponse, AvatarStyleOptions, PlayerAvatarSlot,
+};
 use crate::auth::{SameSitePolicy, SessionCookieConfig};
 use crate::avatar_generation::{
     AvatarGenerationAssetKind, AvatarGenerationAssetResponse, AvatarGenerationClient,
@@ -5642,24 +5644,36 @@ async fn player_avatar_generation_post(
     };
 
     let mut selfie: Option<(Vec<u8>, String)> = None;
+    let mut style_options = AvatarStyleOptions::default();
     while let Ok(Some(field)) = multipart.next_field().await {
         let field_name = field.name().unwrap_or_default();
-        if !matches!(field_name, "selfie" | "file") {
-            continue;
-        }
-
-        let content_type = field
-            .content_type()
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        match field.bytes().await {
-            Ok(bytes) => {
-                selfie = Some((bytes.to_vec(), content_type));
+        match field_name {
+            "selfie" | "file" => {
+                let content_type = field
+                    .content_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                match field.bytes().await {
+                    Ok(bytes) => {
+                        selfie = Some((bytes.to_vec(), content_type));
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, user_id = %session_user.id, "failed to read selfie upload field");
+                        return api_error(StatusCode::BAD_REQUEST, "INVALID_SELFIE_FILE");
+                    }
+                }
             }
-            Err(error) => {
-                tracing::warn!(?error, user_id = %session_user.id, "failed to read selfie upload field");
-                return api_error(StatusCode::BAD_REQUEST, "INVALID_SELFIE_FILE");
-            }
+            "styleOptions" => match field.text().await {
+                Ok(value) => match parse_avatar_style_options_field(&value) {
+                    Ok(parsed) => style_options = parsed,
+                    Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+                },
+                Err(error) => {
+                    tracing::warn!(?error, user_id = %session_user.id, "failed to read avatar style options field");
+                    return api_error(StatusCode::BAD_REQUEST, "INVALID_AVATAR_STYLE_OPTIONS");
+                }
+            },
+            _ => {}
         }
     }
 
@@ -5670,9 +5684,27 @@ async fn player_avatar_generation_post(
         return api_error(StatusCode::BAD_REQUEST, "INVALID_SELFIE_FILE");
     }
 
+    let customizer_access = match server
+        .account_service
+        .load_avatar_customizer_access(session_user.id)
+        .await
+    {
+        Ok(access) => access,
+        Err(error) => {
+            tracing::warn!(?error, user_id = %session_user.id, "failed to resolve avatar customizer access");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AVATAR_CUSTOMIZER_ACCESS_LOOKUP_FAILED",
+            );
+        }
+    };
+    if !customizer_access.enabled && !style_options.is_default() {
+        return api_error(StatusCode::FORBIDDEN, "AVATAR_CUSTOMIZER_PREMIUM_REQUIRED");
+    }
+
     match server
         .avatar_generation
-        .create_or_get_active_task(session_user.id, &bytes, &content_type)
+        .create_or_get_active_task(session_user.id, &bytes, &content_type, &style_options)
         .await
     {
         Ok(task) => Json(json!({ "task": task })).into_response(),
@@ -6027,6 +6059,16 @@ fn parse_optional_url_field(
         }
         _ => Err("INVALID_AVATAR_URL"),
     }
+}
+
+fn parse_avatar_style_options_field(
+    value: &str,
+) -> std::result::Result<AvatarStyleOptions, &'static str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(AvatarStyleOptions::default());
+    }
+    serde_json::from_str(trimmed).map_err(|_| "INVALID_AVATAR_STYLE_OPTIONS")
 }
 
 fn first_present_value<'a>(
@@ -6569,6 +6611,56 @@ mod tests {
             pets: Vec::new(),
             active_pets: Vec::new(),
         }
+    }
+
+    #[test]
+    fn parse_avatar_style_options_field_accepts_valid_json() {
+        let parsed = parse_avatar_style_options_field(
+            r#"{
+                "outfitStyle":"suit",
+                "fitStyle":"tailored",
+                "neckAccessory":"tie",
+                "headwear":"hat",
+                "bodyBuild":"average",
+                "skinTone":"medium",
+                "poseEnergy":"confident",
+                "materialStyle":"formal_luxury",
+                "ring":true,
+                "earrings":false,
+                "bracelet":false,
+                "watch":true,
+                "gloves":false,
+                "cape":false
+            }"#,
+        )
+        .expect("parse avatar style options");
+        let value = serde_json::to_value(parsed).expect("serialize parsed style options");
+
+        assert_eq!(value["outfitStyle"], "suit");
+        assert_eq!(value["fitStyle"], "tailored");
+        assert_eq!(value["neckAccessory"], "tie");
+        assert_eq!(value["headwear"], "hat");
+        assert_eq!(value["ring"], true);
+        assert_eq!(value["watch"], true);
+    }
+
+    #[test]
+    fn parse_avatar_style_options_field_defaults_for_empty_payload() {
+        let parsed = parse_avatar_style_options_field("   ").expect("parse empty style options");
+
+        assert_eq!(parsed, AvatarStyleOptions::default());
+    }
+
+    #[test]
+    fn parse_avatar_style_options_field_rejects_invalid_json() {
+        assert_eq!(
+            parse_avatar_style_options_field(r#"{"outfitStyle":"spacesuit"}"#),
+            Err("INVALID_AVATAR_STYLE_OPTIONS")
+        );
+        assert_eq!(
+            parse_avatar_style_options_field("{not-json"),
+            Err("INVALID_AVATAR_STYLE_OPTIONS")
+        );
     }
 
     fn empty_weapon_collection() -> PlayerWeaponCollection {

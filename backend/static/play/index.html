@@ -9,8 +9,8 @@
     <title>Augmego Voxel Sandbox Web</title>
     
 <script type="module">
-import init, * as bindings from '/play/game-web-9c73f7a4cb624695.js';
-const wasm = await init({ module_or_path: '/play/game-web-9c73f7a4cb624695_bg.wasm' });
+import init, * as bindings from '/play/game-web-4535cba26ae085ef.js';
+const wasm = await init({ module_or_path: '/play/game-web-4535cba26ae085ef_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -44,6 +44,6 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       }
 
     </style>
-  <link rel="modulepreload" href="/play/game-web-9c73f7a4cb624695.js" crossorigin="anonymous" integrity="sha384-yT1+llXMJUkfZHIQUWxucoKUQBhu1Sww19NgNJb4M49Wn+zaJK24hq2RZHkUCz/E"><link rel="preload" href="/play/game-web-9c73f7a4cb624695_bg.wasm" crossorigin="anonymous" integrity="sha384-CTVR6Iq9yiuTP2v5dX47ENiY/f1WPf68znxSwoAo+WjYRET/OvYeng5LaEnxBOYp" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/play/game-web-4535cba26ae085ef.js" crossorigin="anonymous" integrity="sha384-vxp9kf7JUbuA/Ifrhu4vkwsLY15G8w7WK91G7/h5LORyg1o+GBHRLc9lx4CKs6Pn"><link rel="preload" href="/play/game-web-4535cba26ae085ef_bg.wasm" crossorigin="anonymous" integrity="sha384-1AuruQHwPeT9DUVeFGZ4StDNdgfhL8CZiHWEemBaX2iI9W+/NLGtDhKUJIPxLS7m" as="fetch" type="application/wasm"></head>
   <body></body>
 </html>

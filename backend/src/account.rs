@@ -9,7 +9,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Row, types::Json};
 use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -29,6 +29,7 @@ const MICROSOFT_DEFAULT_TENANT: &str = "common";
 const MICROSOFT_SCOPE_DEFAULT: &str = "openid profile email";
 const MICROSOFT_STATE_COOKIE_NAME: &str = "oauth_state_microsoft";
 const PLAYER_AVATAR_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+const AVATAR_CUSTOMIZER_BETA_ENABLED: bool = true;
 
 #[derive(Clone, Debug)]
 pub struct AccountConfig {
@@ -71,7 +72,158 @@ pub struct AuthUserResponse {
     pub email: Option<String>,
     pub avatar_url: Option<String>,
     pub avatar_selection: AvatarSelection,
+    pub avatar_customizer_access: AvatarCustomizerAccess,
+    pub avatar_generation_defaults: AvatarStyleOptions,
     pub game_auth_token: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AvatarStyleOptions {
+    pub outfit_style: AvatarOutfitStyle,
+    pub fit_style: AvatarFitStyle,
+    pub neck_accessory: AvatarNeckAccessory,
+    pub headwear: AvatarHeadwear,
+    pub body_build: AvatarBodyBuild,
+    pub skin_tone: AvatarSkinTone,
+    pub pose_energy: AvatarPoseEnergy,
+    pub material_style: AvatarMaterialStyle,
+    pub ring: bool,
+    pub earrings: bool,
+    pub bracelet: bool,
+    pub watch: bool,
+    pub gloves: bool,
+    pub cape: bool,
+}
+
+impl Default for AvatarStyleOptions {
+    fn default() -> Self {
+        Self {
+            outfit_style: AvatarOutfitStyle::MatchReference,
+            fit_style: AvatarFitStyle::MatchReference,
+            neck_accessory: AvatarNeckAccessory::None,
+            headwear: AvatarHeadwear::None,
+            body_build: AvatarBodyBuild::MatchReference,
+            skin_tone: AvatarSkinTone::MatchReference,
+            pose_energy: AvatarPoseEnergy::Neutral,
+            material_style: AvatarMaterialStyle::Natural,
+            ring: false,
+            earrings: false,
+            bracelet: false,
+            watch: false,
+            gloves: false,
+            cape: false,
+        }
+    }
+}
+
+impl AvatarStyleOptions {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarOutfitStyle {
+    #[default]
+    MatchReference,
+    Suit,
+    Dress,
+    Casual,
+    Streetwear,
+    Fantasy,
+    Armor,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarFitStyle {
+    #[default]
+    MatchReference,
+    Tailored,
+    Relaxed,
+    Oversized,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarNeckAccessory {
+    #[default]
+    None,
+    Tie,
+    BowTie,
+    Necklace,
+    Scarf,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarHeadwear {
+    #[default]
+    None,
+    Hat,
+    Beanie,
+    Hood,
+    Crown,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarBodyBuild {
+    #[default]
+    MatchReference,
+    Slim,
+    Average,
+    Broad,
+    Plus,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarSkinTone {
+    #[default]
+    MatchReference,
+    Fair,
+    Light,
+    Medium,
+    Tan,
+    Deep,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarPoseEnergy {
+    #[default]
+    Neutral,
+    Confident,
+    Playful,
+    Heroic,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarMaterialStyle {
+    #[default]
+    Natural,
+    Glam,
+    SoftFabric,
+    FormalLuxury,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarCustomizerAccessSource {
+    Beta,
+    Entitlement,
+    None,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AvatarCustomizerAccess {
+    pub enabled: bool,
+    pub source: AvatarCustomizerAccessSource,
 }
 
 #[derive(Clone, Debug)]
@@ -798,6 +950,62 @@ impl AccountService {
         false
     }
 
+    pub async fn load_avatar_generation_preferences(
+        &self,
+        user_id: Uuid,
+    ) -> Result<AvatarStyleOptions> {
+        let value: Option<Json<AvatarStyleOptions>> = sqlx::query_scalar(
+            "SELECT style_options
+             FROM avatar_generation_preferences
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load avatar generation preferences")?;
+        Ok(value.map(|value| value.0).unwrap_or_default())
+    }
+
+    pub async fn save_avatar_generation_preferences(
+        &self,
+        user_id: Uuid,
+        style_options: &AvatarStyleOptions,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO avatar_generation_preferences (user_id, style_options, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (user_id)
+             DO UPDATE SET style_options = EXCLUDED.style_options,
+                           updated_at = NOW()",
+        )
+        .bind(user_id)
+        .bind(Json(style_options.clone()))
+        .execute(&self.pool)
+        .await
+        .context("save avatar generation preferences")?;
+        Ok(())
+    }
+
+    pub async fn load_avatar_customizer_access(
+        &self,
+        user_id: Uuid,
+    ) -> Result<AvatarCustomizerAccess> {
+        let has_entitlement = sqlx::query_scalar::<_, bool>(
+            "SELECT avatar_customizer_premium
+             FROM account_entitlements
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load avatar customizer entitlement")?
+        .unwrap_or(false);
+        Ok(resolve_avatar_customizer_access(
+            AVATAR_CUSTOMIZER_BETA_ENABLED,
+            has_entitlement,
+        ))
+    }
+
     pub async fn build_auth_user(&self, user: SessionUser) -> Result<AuthUserResponse> {
         Ok(AuthUserResponse {
             id: user.id.to_string(),
@@ -805,6 +1013,8 @@ impl AccountService {
             email: user.email,
             avatar_url: user.avatar_url,
             avatar_selection: self.load_avatar_selection(user.id).await?,
+            avatar_customizer_access: self.load_avatar_customizer_access(user.id).await?,
+            avatar_generation_defaults: self.load_avatar_generation_preferences(user.id).await?,
             game_auth_token: sign_game_auth_token(
                 &self.config.game_auth_secret,
                 &user.id.to_string(),
@@ -1203,4 +1413,151 @@ fn url_encode(value: &str) -> String {
             _ => format!("%{byte:02X}").chars().collect::<Vec<_>>(),
         })
         .collect()
+}
+
+fn resolve_avatar_customizer_access(
+    beta_enabled: bool,
+    has_entitlement: bool,
+) -> AvatarCustomizerAccess {
+    if beta_enabled {
+        return AvatarCustomizerAccess {
+            enabled: true,
+            source: AvatarCustomizerAccessSource::Beta,
+        };
+    }
+    if has_entitlement {
+        return AvatarCustomizerAccess {
+            enabled: true,
+            source: AvatarCustomizerAccessSource::Entitlement,
+        };
+    }
+    AvatarCustomizerAccess {
+        enabled: false,
+        source: AvatarCustomizerAccessSource::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{SameSitePolicy, SessionCookieConfig};
+    use crate::db;
+    use crate::server::ServerConfig;
+    use crate::storage::{StorageConfig, StorageProvider};
+    use std::env;
+
+    fn test_account_config(config: &ServerConfig) -> AccountConfig {
+        AccountConfig {
+            public_base_url: config.public_base_url.clone(),
+            session_cookie: SessionCookieConfig {
+                name: "session".to_string(),
+                secure: false,
+                same_site: SameSitePolicy::Lax,
+                ttl: Duration::from_secs(60),
+            },
+            apple_client_id: String::new(),
+            apple_scope: String::new(),
+            google_client_id: String::new(),
+            google_client_secret: String::new(),
+            google_scope: String::new(),
+            microsoft_client_id: String::new(),
+            microsoft_client_secret: String::new(),
+            microsoft_scope: String::new(),
+            microsoft_tenant: String::new(),
+            game_auth_secret: "test-secret".to_string(),
+            game_auth_ttl: Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn resolve_avatar_customizer_access_prefers_beta_then_entitlement() {
+        let beta = resolve_avatar_customizer_access(true, false);
+        assert!(beta.enabled);
+        assert_eq!(beta.source, AvatarCustomizerAccessSource::Beta);
+
+        let entitlement = resolve_avatar_customizer_access(false, true);
+        assert!(entitlement.enabled);
+        assert_eq!(
+            entitlement.source,
+            AvatarCustomizerAccessSource::Entitlement
+        );
+
+        let none = resolve_avatar_customizer_access(false, false);
+        assert!(!none.enabled);
+        assert_eq!(none.source, AvatarCustomizerAccessSource::None);
+    }
+
+    #[tokio::test]
+    async fn build_auth_user_includes_avatar_customizer_defaults() {
+        let config = ServerConfig::default();
+        let base_database_url = config.database_url.clone();
+        let (pool, schema_name) = db::connect_isolated_test_pool(&base_database_url)
+            .await
+            .expect("create isolated schema");
+        let storage_root = env::temp_dir().join(format!("augmego-account-test-{schema_name}"));
+        let storage = StorageService::new(StorageConfig {
+            provider: StorageProvider::Local,
+            root: storage_root,
+            namespace: "test-assets".to_string(),
+            spaces_bucket: String::new(),
+            spaces_endpoint: String::new(),
+            spaces_custom_domain: String::new(),
+            spaces_access_key_id: String::new(),
+            spaces_secret_access_key: String::new(),
+            spaces_region: String::new(),
+        })
+        .await
+        .expect("create storage");
+        let service = AccountService::new(pool.clone(), storage, test_account_config(&config));
+
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind("stylist@example.com")
+            .execute(&pool)
+            .await
+            .expect("insert user");
+
+        let saved_defaults = AvatarStyleOptions {
+            outfit_style: AvatarOutfitStyle::Streetwear,
+            fit_style: AvatarFitStyle::Oversized,
+            neck_accessory: AvatarNeckAccessory::Scarf,
+            headwear: AvatarHeadwear::Beanie,
+            body_build: AvatarBodyBuild::MatchReference,
+            skin_tone: AvatarSkinTone::MatchReference,
+            pose_energy: AvatarPoseEnergy::Playful,
+            material_style: AvatarMaterialStyle::SoftFabric,
+            ring: false,
+            earrings: true,
+            bracelet: false,
+            watch: true,
+            gloves: true,
+            cape: false,
+        };
+        service
+            .save_avatar_generation_preferences(user_id, &saved_defaults)
+            .await
+            .expect("save avatar generation preferences");
+
+        let auth_user = service
+            .build_auth_user(SessionUser {
+                id: user_id,
+                name: Some("Stylist".to_string()),
+                email: Some("stylist@example.com".to_string()),
+                avatar_url: None,
+            })
+            .await
+            .expect("build auth user");
+
+        assert!(auth_user.avatar_customizer_access.enabled);
+        assert_eq!(
+            auth_user.avatar_customizer_access.source,
+            AvatarCustomizerAccessSource::Beta
+        );
+        assert_eq!(auth_user.avatar_generation_defaults, saved_defaults);
+
+        db::cleanup_isolated_test_schema(&base_database_url, &schema_name)
+            .await
+            .expect("cleanup isolated schema");
+    }
 }
